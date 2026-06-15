@@ -26,7 +26,7 @@ const (
 //
 // On EndFrame, ProcessFrame blocks until runPlayback has drained the
 // queue, written the silence tail, and forwarded EndFrame downstream,
-// so the base's auto-shutdown does not cancel ctx mid-drain.
+// so task cleanup cannot cancel ctx mid-drain.
 type PlaybackSinkProcessor struct {
 	*BaseProcessor
 	taskCtx          *TaskContext
@@ -136,7 +136,7 @@ func (p *PlaybackSinkProcessor) ProcessFrame(ctx context.Context, frame Frame, d
 	switch frame.(type) {
 	case EndFrame:
 		// EndFrame must drain through runPlayback (audio tail + silence)
-		// before the base auto-cancels b.ctx.
+		// before task cleanup stops the processor.
 		select {
 		case p.queueCh <- frame:
 		case <-p.ctx.Done():
@@ -222,19 +222,28 @@ func (p *PlaybackSinkProcessor) handleQueueFrame(f Frame) {
 		p.playbackQueue = nil
 	case InterruptFrame:
 		p.interrupted = true
-		// EndFrame and any other !IsInterruptible() frames survive the purge.
+		// Only shutdown survives the playback queue purge. Queued
+		// WordTimestampFrame/TTSDoneFrame values are still future output here:
+		// if they have not left PlaybackSink yet, their audio was not played.
 		kept := p.playbackQueue[:0]
 		for _, qf := range p.playbackQueue {
-			if !qf.IsInterruptible() {
+			if survivesPlaybackInterrupt(qf) {
 				kept = append(kept, qf)
 			}
 		}
+		dropped := len(p.playbackQueue) - len(kept)
 		p.playbackQueue = kept
 		if p.taskCtx != nil && p.taskCtx.Room != nil {
 			p.taskCtx.Room.ClearAudioBuffer()
 		}
-		p.taskCtx.Logger.Printf("Playback interrupted (kept %d uninterruptible frames)\n", len(kept))
+		p.taskCtx.Logger.Printf("Playback interrupted (dropped %d queued playback frames, kept %d EndFrames)\n", dropped, len(kept))
+		p.PushFrame(v, Downstream)
 	}
+}
+
+func survivesPlaybackInterrupt(f Frame) bool {
+	_, ok := f.(EndFrame)
+	return ok
 }
 
 // tick advances playback by one 20ms frame. Returns true iff an
@@ -264,15 +273,16 @@ func (p *PlaybackSinkProcessor) tick() bool {
 			p.playbackQueue = p.playbackQueue[1:]
 			goto mix
 		case WordTimestampFrame:
-			p.PushFrame(f, Upstream)
+			p.PushFrame(f, Downstream)
 			p.playbackQueue = p.playbackQueue[1:]
 		case TTSDoneFrame:
 			p.taskCtx.Logger.Println("Playback complete")
 			p.taskCtx.UIEvents.BotStoppedSpeaking(time.Now())
-			p.PushFrame(f, Upstream)
-			// Broadcast: upstream tells ContextAggregator/UserIdle that
-			// the bot finished speaking; downstream copy is for parity
-			// with Pipecat (no consumer today).
+			p.PushFrame(f, Downstream)
+			// Broadcast: upstream tells UserContextAggregator/UserIdle that
+			// the bot finished speaking; downstream tells the assistant
+			// context aggregator to commit the played words before EndFrame
+			// can reach PipelineSink.
 			p.Broadcast(NewBotStoppedSpeakingFrame())
 			p.playbackQueue = p.playbackQueue[1:]
 		case EndFrame:

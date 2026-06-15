@@ -260,12 +260,11 @@ func (t *PipelineTask) currentEndReason() EndReason {
 // processLoop goroutine — a goroutine tracked by t.wg. If we ran the
 // cleanup synchronously, t.wg.Wait() below would deadlock waiting for
 // the very goroutine it's running in to call Done() (which only fires
-// when ProcessFrame returns).
+// after the task stops the pipeline).
 //
 // Fix: dispatch the body to a separate, untracked goroutine and return
-// immediately. The sink's processLoop then sees ProcessFrame return,
-// auto-cancels b.ctx (per its EndFrame handler), and its deferred
-// Done() fires — allowing the wg drain to make progress.
+// immediately. Cleanup then stops the pipeline, allowing the sink
+// processLoop's deferred Done() to fire and the wg drain to make progress.
 //
 // cleanupOnce still gates re-entry, so even if CompleteEnd is invoked
 // multiple times, runCleanup runs exactly once.

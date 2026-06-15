@@ -56,11 +56,11 @@ func newFrameMeta(name string) FrameMeta {
 // (they bypass the per-processor data queue). System frames are handled
 // inline by BaseProcessor's input loop, before any pending data frames.
 //
-// IsInterruptible returns false for frames that must survive the queue
-// purge that happens when InterruptFrame is processed. Only EndFrame
-// needs this today; other data frames return true so they get dropped on
-// interrupt. System frames are never enqueued in the purgeable queue, so
-// their value is conventional (false).
+// IsInterruptible returns false for frames that must survive
+// BaseProcessor's procCh purge when InterruptFrame is processed. Do not
+// use it as a playback-queue policy: PlaybackSink's queue can contain
+// future, unplayed reconciliation frames, so it has its own stricter
+// interrupt purge.
 type Frame interface {
 	ID() int64
 	Name() string
@@ -215,9 +215,14 @@ func NewWordTimestampFrame(words []string) WordTimestampFrame {
 	return WordTimestampFrame{FrameBase: FrameBase{Meta: newFrameMeta("WordTimestampFrame")}, Words: words}
 }
 
-func (f WordTimestampFrame) FrameType() FrameType  { return WordTimestamp }
-func (f WordTimestampFrame) IsSystem() bool        { return false }
-func (f WordTimestampFrame) IsInterruptible() bool { return true }
+func (f WordTimestampFrame) FrameType() FrameType { return WordTimestamp }
+
+// WordTimestampFrame is emitted only after the corresponding audio has
+// actually played. Treat it as system-priority so an InterruptFrame cannot
+// overtake or purge already-played assistant words before
+// AssistantContextAggregator reconciles them.
+func (f WordTimestampFrame) IsSystem() bool        { return true }
+func (f WordTimestampFrame) IsInterruptible() bool { return false }
 
 type TTSDoneFrame struct {
 	FrameBase
@@ -227,9 +232,13 @@ func NewTTSDoneFrame() TTSDoneFrame {
 	return TTSDoneFrame{FrameBase: FrameBase{Meta: newFrameMeta("TTSDoneFrame")}}
 }
 
-func (f TTSDoneFrame) FrameType() FrameType  { return TTSDone }
-func (f TTSDoneFrame) IsSystem() bool        { return false }
-func (f TTSDoneFrame) IsInterruptible() bool { return true }
+func (f TTSDoneFrame) FrameType() FrameType { return TTSDone }
+
+// TTSDoneFrame is a post-playback structural signal. Keep it in the same
+// priority class as WordTimestampFrame/BotStoppedSpeakingFrame so the played
+// completion sequence preserves order at post-playback processors.
+func (f TTSDoneFrame) IsSystem() bool        { return true }
+func (f TTSDoneFrame) IsInterruptible() bool { return false }
 
 type TTSSpeakFrame struct {
 	FrameBase
@@ -252,9 +261,11 @@ func NewBotStartedSpeakingFrame() BotStartedSpeakingFrame {
 	return BotStartedSpeakingFrame{FrameBase: FrameBase{Meta: newFrameMeta("BotStartedSpeakingFrame")}}
 }
 
-func (f BotStartedSpeakingFrame) FrameType() FrameType  { return BotStartedSpeaking }
-func (f BotStartedSpeakingFrame) IsSystem() bool        { return false }
-func (f BotStartedSpeakingFrame) IsInterruptible() bool { return true }
+func (f BotStartedSpeakingFrame) FrameType() FrameType { return BotStartedSpeaking }
+
+// Pipecat models bot-speaking notifications as SystemFrame.
+func (f BotStartedSpeakingFrame) IsSystem() bool        { return true }
+func (f BotStartedSpeakingFrame) IsInterruptible() bool { return false }
 func (f BotStartedSpeakingFrame) Clone() Frame          { return NewBotStartedSpeakingFrame() }
 
 type BotStoppedSpeakingFrame struct {
@@ -265,9 +276,12 @@ func NewBotStoppedSpeakingFrame() BotStoppedSpeakingFrame {
 	return BotStoppedSpeakingFrame{FrameBase: FrameBase{Meta: newFrameMeta("BotStoppedSpeakingFrame")}}
 }
 
-func (f BotStoppedSpeakingFrame) FrameType() FrameType  { return BotStoppedSpeaking }
-func (f BotStoppedSpeakingFrame) IsSystem() bool        { return false }
-func (f BotStoppedSpeakingFrame) IsInterruptible() bool { return true }
+func (f BotStoppedSpeakingFrame) FrameType() FrameType { return BotStoppedSpeaking }
+
+// Pipecat models bot-speaking notifications as SystemFrame. This also keeps
+// assistant commit timing ordered relative to played word timestamps.
+func (f BotStoppedSpeakingFrame) IsSystem() bool        { return true }
+func (f BotStoppedSpeakingFrame) IsInterruptible() bool { return false }
 func (f BotStoppedSpeakingFrame) Clone() Frame          { return NewBotStoppedSpeakingFrame() }
 
 type LLMMessagesFrame struct {
@@ -313,7 +327,7 @@ func (f ErrorFrame) IsInterruptible() bool { return false }
 
 // LLMMessagesAppendFrame appends messages to the conversation context and
 // optionally runs the LLM. Mirrors Pipecat's LLMMessagesAppendFrame.
-// ContextAggregator handles it: it appends Messages (if any) to its
+// UserContextAggregator handles it: it appends Messages (if any) to its
 // context, and when RunLLM is set it emits an LLMMessagesFrame for the
 // current context. Pushing one with no Messages and RunLLM=true is how
 // the bot takes the first turn (greet-first) from the initial context.

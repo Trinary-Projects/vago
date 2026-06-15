@@ -483,7 +483,7 @@ func (r *DailyRoom) markUserJoined(participantID string) {
 	}
 	// The user is present; the bot always speaks first. Queue an
 	// LLMMessagesAppendFrame (no new messages, run the LLM) so
-	// ContextAggregator runs the first turn from the initial context.
+	// UserContextAggregator runs the first turn from the initial context.
 	// Fires once per call. Mirrors Pipecat's on_client_connected ->
 	// queue_frames([... run_llm ...]).
 	//

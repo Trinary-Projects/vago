@@ -68,7 +68,7 @@ func (p *TalkTimeMonitoringProcessor) runTimer() {
 	p.PushFrame(NewTTSSpeakFrame(talkTimeExceededPrompt), Downstream)
 	// Route EndFrame through the task source instead of pushing it
 	// downstream directly. This way upstream processors (STT,
-	// AudioSource, UserIdle, ContextAggregator) also see the EndFrame
+	// AudioSource, UserIdle, UserContextAggregator) also see the EndFrame
 	// in pipeline order, matching Pipecat's source-driven lifecycle.
 	if p.taskCtx.EndTask != nil {
 		p.taskCtx.EndTask(EndReasonTalkTimeExhausted)
@@ -87,7 +87,7 @@ func (p *TalkTimeMonitoringProcessor) ProcessFrame(ctx context.Context, frame Fr
 		}
 		p.PushFrame(f, dir)
 	case LLMMessagesFrame:
-		// ContextAggregator only emits LLMMessagesFrame after a committed
+		// UserContextAggregator only emits LLMMessagesFrame after a committed
 		// user turn (post-`<end>`), so this is the cleanest equivalent
 		// of Pipecat's UserStartedSpeakingFrame for arming the budget.
 		p.armOnFirstSpeech()

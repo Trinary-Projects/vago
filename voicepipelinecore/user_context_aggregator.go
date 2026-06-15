@@ -5,103 +5,57 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
-const minBargeInWords = 3
-
-type ContextAggregator struct {
+type UserContextAggregator struct {
 	*BaseProcessor
-	taskCtx                          *TaskContext
-	messages                         []Message
-	currentTranscript                string
-	spokenWords                      []string
-	interimTranscript                string
-	interimResponseID                int
-	interruptSent                    bool
-	botSpeaking                      bool
-	useDefaultPrompt                 bool
-	mainAgentSystemPromptLangfuseKey string
+	mu                sync.Mutex
+	taskCtx           *TaskContext
+	state             *aggregatorSharedState
+	currentTranscript string
+	interimTranscript string
+	interimResponseID int
+	interruptSent     bool
+	botSpeaking       bool
 }
 
-func NewContextAggregator(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *ContextAggregator {
-	useDefaultPrompt := initialMessages == nil
-	messages := []Message{}
-	if !useDefaultPrompt {
-		messages = messagesFromInitial(initialMessages)
+func NewUserContextAggregator(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *UserContextAggregator {
+	return newUserContextAggregatorWithState(taskCtx, newAggregatorSharedState(taskCtx, initialMessages, mainAgentSystemPromptLangfuseKey))
+}
+
+func newUserContextAggregatorWithState(taskCtx *TaskContext, state *aggregatorSharedState) *UserContextAggregator {
+	a := &UserContextAggregator{
+		taskCtx: taskCtx,
+		state:   state,
 	}
-	a := &ContextAggregator{
-		taskCtx:                          taskCtx,
-		messages:                         messages,
-		useDefaultPrompt:                 useDefaultPrompt,
-		mainAgentSystemPromptLangfuseKey: mainAgentSystemPromptLangfuseKey,
-	}
-	a.BaseProcessor = NewBaseProcessor("ContextAggregator", a, taskCtx)
+	a.BaseProcessor = NewBaseProcessor("UserContextAggregator", a, taskCtx)
 	return a
 }
 
-func messagesFromInitial(initial []Message) []Message {
-	out := make([]Message, 0, len(initial))
-	for _, msg := range initial {
-		if msg.Role == "" {
-			continue
-		}
-		if msg.Content == "" && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
-			continue
-		}
-		out = append(out, msg)
-	}
-	return out
+func (a *UserContextAggregator) messagesForTest() []Message {
+	return a.state.messagesForTest()
 }
 
-func cloneMessages(messages []Message) []Message {
-	out := make([]Message, len(messages))
-	for i, msg := range messages {
-		out[i] = msg
-		if len(msg.ToolCalls) > 0 {
-			out[i].ToolCalls = append([]ToolCall(nil), msg.ToolCalls...)
-		}
-	}
-	return out
-}
-
-func (a *ContextAggregator) appendWords(words []string) {
-	for _, w := range words {
-		if len(a.spokenWords) > 0 && len(w) > 0 && w[0] != '.' && w[0] != ',' && w[0] != '!' && w[0] != '?' && w[0] != ';' && w[0] != ':' {
-			a.spokenWords = append(a.spokenWords, " "+w)
-		} else {
-			a.spokenWords = append(a.spokenWords, w)
-		}
-	}
-}
-
-func (a *ContextAggregator) spokenSoFar() string {
-	var spoken string
-	for _, w := range a.spokenWords {
-		spoken += w
-	}
-	a.spokenWords = nil
-	return spoken
-}
-
-func (a *ContextAggregator) resetFinalTranscript() {
+func (a *UserContextAggregator) resetFinalTranscript() {
 	a.currentTranscript = ""
 }
 
-func (a *ContextAggregator) resetInterimTranscript() {
+func (a *UserContextAggregator) resetInterimTranscript() {
 	a.interimTranscript = ""
 	a.interimResponseID = 0
 }
 
-func (a *ContextAggregator) sendLiveTranscript(text string) {
+func (a *UserContextAggregator) sendLiveTranscript(text string) {
 	// Interim user transcription events are intentionally suppressed.
 	// They are high-frequency diagnostics/UI traffic and final RTVI
 	// user-transcription events are still emitted from addUserMessage.
 }
 
-func (a *ContextAggregator) updateInterimTranscript(f TranscriptFrame) string {
+func (a *UserContextAggregator) updateInterimTranscript(f TranscriptFrame) string {
 	if f.IsFinal && f.Text == "<end>" {
 		a.sendLiveTranscript("")
 		a.resetInterimTranscript()
@@ -123,7 +77,7 @@ func (a *ContextAggregator) updateInterimTranscript(f TranscriptFrame) string {
 	return a.interimTranscript
 }
 
-func (a *ContextAggregator) updateFinalTranscript(f TranscriptFrame) (string, bool) {
+func (a *UserContextAggregator) updateFinalTranscript(f TranscriptFrame) (string, bool) {
 	if !f.IsFinal {
 		return "", false
 	}
@@ -137,46 +91,47 @@ func (a *ContextAggregator) updateFinalTranscript(f TranscriptFrame) (string, bo
 	return "", false
 }
 
-func (a *ContextAggregator) commitSpokenText(interrupted bool) {
-	spoken := a.spokenSoFar()
-	if spoken != "" {
-		a.taskCtx.Logger.Printf("Committing to history (interrupted=%v): %s\n", interrupted, spoken)
-		a.messages = append(a.messages, Message{Role: "assistant", Content: spoken})
-		metrics := TurnMetrics{}
-		if a.taskCtx.metrics != nil {
-			metrics = a.taskCtx.metrics.snapshotAndReset()
-		}
-		if a.taskCtx.callEvents != nil {
-			a.taskCtx.callEvents.fireAssistantTurnCommitted(spoken, time.Now(), metrics, a.mainAgentSystemPromptLangfuseKey)
-		}
-		if interrupted {
-			a.taskCtx.UIEvents.BotStoppedSpeaking(time.Now())
-		}
-	} else if interrupted {
-		a.taskCtx.Logger.Println("Barge-in interrupted bot before any assistant words were committed")
-		a.taskCtx.UIEvents.BotStoppedSpeaking(time.Now())
+func (a *UserContextAggregator) appendMessages(messages []Message) {
+	added := messagesFromInitial(messages)
+	if len(added) == 0 {
+		return
 	}
+	a.state.mu.Lock()
+	a.state.messages = append(a.state.messages, added...)
+	a.state.mu.Unlock()
 }
 
-func (a *ContextAggregator) lastMessageRole() string {
-	if len(a.messages) == 0 {
-		return ""
-	}
-	return a.messages[len(a.messages)-1].Role
+func (a *UserContextAggregator) snapshotMessages() []Message {
+	a.state.mu.Lock()
+	defer a.state.mu.Unlock()
+	return cloneMessages(a.state.messages)
 }
 
-func (a *ContextAggregator) addUserMessage(text string) {
-	at := time.Now()
-	if a.lastMessageRole() == "user" {
-		last := &a.messages[len(a.messages)-1]
+func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Message, promptKey string, concatenated string) {
+	a.state.mu.Lock()
+	defer a.state.mu.Unlock()
+
+	if len(a.state.messages) > 0 && a.state.messages[len(a.state.messages)-1].Role == "user" {
+		last := &a.state.messages[len(a.state.messages)-1]
 		last.Content += " " + text
-		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", last.Content)
+		concatenated = last.Content
 	} else {
-		a.messages = append(a.messages, Message{Role: "user", Content: text})
+		a.state.messages = append(a.state.messages, Message{Role: "user", Content: text})
+	}
+	promptKey = a.state.mainAgentSystemPromptLangfuseKey
+	snapshot = cloneMessages(a.state.messages)
+	return snapshot, promptKey, concatenated
+}
+
+func (a *UserContextAggregator) addUserMessage(text string) {
+	at := time.Now()
+	_, promptKey, concatenated := a.recordUserMessage(text)
+	if concatenated != "" {
+		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
 	}
 	a.taskCtx.UIEvents.UserTranscription(text, true, at)
 	if a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireUserTurnCommitted(text, at, a.mainAgentSystemPromptLangfuseKey)
+		a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
 	}
 }
 
@@ -208,17 +163,19 @@ func assistantToolCallMessageFromFrame(functionName, toolCallID string, argument
 	}
 }
 
-func (a *ContextAggregator) addFunctionCallInProgress(f FunctionCallInProgressFrame) {
+func (a *UserContextAggregator) addFunctionCallInProgress(f FunctionCallInProgressFrame) {
 	assistantToolCall := assistantToolCallMessageFromFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments)
 	toolMessage := Message{
 		Role:       "tool",
 		Content:    "IN_PROGRESS",
 		ToolCallID: f.ToolCallID,
 	}
-	a.messages = append(a.messages, assistantToolCall, toolMessage)
+	a.state.mu.Lock()
+	a.state.messages = append(a.state.messages, assistantToolCall, toolMessage)
+	a.state.mu.Unlock()
 }
 
-func (a *ContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (Message, Message) {
+func (a *UserContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (Message, Message) {
 	result := strings.TrimSpace(f.Result)
 	if result == "" {
 		err := errors.New("empty tool result")
@@ -226,7 +183,7 @@ func (a *ContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (
 		sentryutil.Capture(sentryutil.Event{
 			Err: err,
 			Tags: map[string]string{
-				"component": "context_aggregator",
+				"component": "user_context_aggregator",
 				"operation": "tool_result",
 			},
 			Details: map[string]any{
@@ -242,40 +199,46 @@ func (a *ContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (
 		Content:    result,
 		ToolCallID: f.ToolCallID,
 	}
-	for i := len(a.messages) - 1; i >= 0; i-- {
-		msg := &a.messages[i]
+	a.state.mu.Lock()
+	defer a.state.mu.Unlock()
+	for i := len(a.state.messages) - 1; i >= 0; i-- {
+		msg := &a.state.messages[i]
 		if msg.Role == "tool" && msg.ToolCallID == f.ToolCallID {
 			msg.Content = result
 			return assistantToolCall, toolResult
 		}
 	}
-	a.messages = append(a.messages, toolResult)
+	a.state.messages = append(a.state.messages, toolResult)
 	return assistantToolCall, toolResult
 }
 
-func (a *ContextAggregator) submitUserMessage(text string) {
+func (a *UserContextAggregator) submitUserMessage(text string) {
 	a.taskCtx.Logger.Printf("Final transcript received: %s\n", text)
-	if len(a.messages) == 0 && a.useDefaultPrompt {
-		a.messages = append(a.messages, Message{Role: "system", Content: `You are an expert health coach named Disha. You have deep experience in chronic care management and behavioral change. You are a master influencer and help the users achieve their health goals with the power of conversation.
-You have been trained by master clinicians at a company called Curelink.
-
-You are conducting your first telephonic consultation with a new client. You are talking with the user via an audio call on the Disha Health App. Always respond in exactly 2 sentences. Never respond with just 1 sentence.`})
-	}
 	if a.taskCtx.callEvents != nil {
 		a.taskCtx.callEvents.fireUserFirstSpeech(time.Now())
 	}
-	a.addUserMessage(text)
+	at := time.Now()
+	messages, promptKey, concatenated := a.recordUserMessage(text)
+	if concatenated != "" {
+		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
+	}
+	a.taskCtx.UIEvents.UserTranscription(text, true, at)
+	if a.taskCtx.callEvents != nil {
+		a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
+	}
 	a.interruptSent = false
-	a.spokenWords = nil
 	a.resetInterimTranscript()
 	a.resetFinalTranscript()
-	a.PushFrame(NewLLMMessagesFrame(cloneMessages(a.messages)), Downstream)
+	a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
 }
 
-func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
+func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	switch f := frame.(type) {
 	case EndFrame:
-		a.taskCtx.Logger.Printf("EndFrame at ContextAggregator: reason=%q\n", f.Reason)
+		a.taskCtx.Logger.Printf("EndFrame at UserContextAggregator: reason=%q\n", f.Reason)
 		a.PushFrame(f, dir)
 	case LLMMessagesAppendFrame:
 		// Append any provided messages to the context, then (if RunLLM)
@@ -284,15 +247,16 @@ func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir D
 		// context (system prompt + "hello?" for a fresh call, or prior
 		// chunks + resume note). Consumed here, not forwarded.
 		if len(f.Messages) > 0 {
-			a.messages = append(a.messages, messagesFromInitial(f.Messages)...)
+			a.appendMessages(f.Messages)
 		}
 		if f.RunLLM {
-			if len(a.messages) == 0 {
+			messages := a.snapshotMessages()
+			if len(messages) == 0 {
 				a.taskCtx.Logger.Println("LLMMessagesAppend run skipped: empty context")
 				return
 			}
 			a.taskCtx.Logger.Println("Running LLM turn from appended context (greet-first / injected)")
-			a.PushFrame(NewLLMMessagesFrame(cloneMessages(a.messages)), Downstream)
+			a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
 		}
 	case FunctionCallInProgressFrame:
 		a.taskCtx.Logger.Printf("Function call in progress: %s tool_call_id=%s\n", f.FunctionName, f.ToolCallID)
@@ -306,7 +270,7 @@ func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir D
 		}
 		a.PushFrame(f, Upstream)
 		if f.RunLLM {
-			a.PushFrame(NewLLMMessagesFrame(cloneMessages(a.messages)), Downstream)
+			a.PushFrame(NewLLMMessagesFrame(a.snapshotMessages()), Downstream)
 		}
 	case TranscriptFrame:
 		interimTranscript := a.updateInterimTranscript(f)
@@ -320,7 +284,6 @@ func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir D
 				a.PushFrame(NewInterruptFrame(), Downstream)
 				a.interruptSent = true
 				a.botSpeaking = false
-				a.commitSpokenText(true)
 			}
 		}
 		if text, finished := a.updateFinalTranscript(f); finished {
@@ -336,23 +299,20 @@ func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir D
 				}
 			}
 		}
-	case WordTimestampFrame:
-		// Upstream — record what the bot has actually spoken.
-		a.appendWords(f.Words)
 	case TTSDoneFrame:
-		// Upstream — turn finished cleanly, commit assistant message.
-		a.commitSpokenText(false)
+		a.PushFrame(f, dir)
+	case BotStartedSpeakingFrame:
+		a.botSpeaking = true
+		a.PushFrame(f, dir) // continue upstream to UserIdle
+	case BotStoppedSpeakingFrame:
 		a.botSpeaking = false
 		// Mirror Pipecat's reset_aggregation behavior at the bot-turn
 		// boundary: any user speech that didn't trigger barge-in
 		// during this turn was back-channeling and must not become a
 		// user message. Without this, a Soniox <end> arriving a few
-		// hundred ms AFTER TTSDone (bot already silent) would fall
-		// into the submitUserMessage branch — the LLM would then
-		// "acknowledge" 2 words of unrelated speech. The
-		// in-progress-discard branch on TranscriptFrame only catches
-		// the case where <end> arrives WHILE botSpeaking is still
-		// true; this handles the racing case after.
+		// hundred ms AFTER the bot stops would fall into the
+		// submitUserMessage branch and make the next LLM turn respond
+		// to a short unrelated acknowledgment.
 		if !a.interruptSent {
 			if a.interimTranscript != "" || a.currentTranscript != "" {
 				a.taskCtx.Logger.Printf("Discarding back-channel speech after bot turn: interim=%q final=%q\n", a.interimTranscript, a.currentTranscript)
@@ -361,11 +321,6 @@ func (a *ContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir D
 				a.sendLiveTranscript("")
 			}
 		}
-	case BotStartedSpeakingFrame:
-		a.botSpeaking = true
-		a.PushFrame(f, dir) // continue upstream to UserIdle
-	case BotStoppedSpeakingFrame:
-		a.botSpeaking = false
 		a.PushFrame(f, dir) // continue upstream to UserIdle
 	default:
 		a.PushFrame(frame, dir)

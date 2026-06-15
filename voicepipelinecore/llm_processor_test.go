@@ -108,9 +108,8 @@ func TestLLM_InterruptCancelsClientStream(t *testing.T) {
 
 	// Clean shutdown.
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	got := sink.Captured()
 	textCount := countFrames[TextFrame](got)
@@ -166,10 +165,8 @@ func TestLLM_EndFrameCancelsInFlight(t *testing.T) {
 
 	// EndFrame should cancel the in-flight request.
 	source.QueueFrame(EndFrame{Reason: "test"}, Downstream)
-
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	// Verify EndFrame reached the sink.
 	got := sink.Captured()
@@ -180,7 +177,7 @@ func TestLLM_EndFrameCancelsInFlight(t *testing.T) {
 
 // TestLLM_PassesThroughOtherFrames verifies the default-forward
 // behaviour for frames LLM doesn't specifically handle (e.g., upstream
-// frames going back to ContextAggregator).
+// frames going back to UserContextAggregator).
 func TestLLM_PassesThroughOtherFrames(t *testing.T) {
 	fix := newTestFixture(t)
 	p := NewLLMProcessorWithClient(fix.TaskCtx, &stubLLMClient{model: "test-model"})
@@ -199,9 +196,7 @@ func TestLLM_PassesThroughOtherFrames(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	if c := countFrames[TTSDoneFrame](source.Captured()); c != 1 {
 		t.Errorf("expected TTSDoneFrame to pass through upstream, got %d", c)

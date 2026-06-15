@@ -59,13 +59,7 @@ func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
 	source.QueueFrame(InterruptFrame{}, Downstream)
 	time.Sleep(100 * time.Millisecond)
 
-	source.Stop()
-	p.Stop()
-	sink.Stop()
-
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	if c := countFrames[InterruptFrame](sink.Captured()); c != 1 {
 		t.Errorf("expected InterruptFrame forwarded downstream, got %d in %s", c, describeFrameTypes(sink.Captured()))
@@ -95,13 +89,7 @@ func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 	sink.QueueFrame(BotStoppedSpeakingFrame{}, Upstream)
 	time.Sleep(100 * time.Millisecond)
 
-	source.Stop()
-	p.Stop()
-	sink.Stop()
-
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	up := source.Captured()
 	if c := countFrames[WordTimestampFrame](up); c != 1 {
@@ -115,6 +103,34 @@ func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 	}
 	if c := countFrames[BotStoppedSpeakingFrame](up); c != 1 {
 		t.Errorf("expected BotStoppedSpeakingFrame to pass upstream, got %d", c)
+	}
+}
+
+func TestTTS_CloseConnectionKeepsUpstreamPassThroughAlive(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewTTSProcessor(fix.TaskCtx, nil)
+
+	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	source.Link(p)
+	p.Link(sink)
+	source.Start(fix.RootCtx)
+	p.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	p.closeTTSConnection()
+	sink.QueueFrame(NewWordTimestampFrame([]string{"goodbye"}), Upstream)
+	sink.QueueFrame(NewTTSDoneFrame(), Upstream)
+	time.Sleep(100 * time.Millisecond)
+
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
+
+	up := source.Captured()
+	if c := countFrames[WordTimestampFrame](up); c != 1 {
+		t.Errorf("expected WordTimestampFrame to pass upstream after TTS connection close, got %d in %s", c, describeFrameTypes(up))
+	}
+	if c := countFrames[TTSDoneFrame](up); c != 1 {
+		t.Errorf("expected TTSDoneFrame to pass upstream after TTS connection close, got %d in %s", c, describeFrameTypes(up))
 	}
 }
 

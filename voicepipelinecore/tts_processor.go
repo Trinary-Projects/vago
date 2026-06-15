@@ -67,7 +67,9 @@ var ttsDialURL = "wss://api.cartesia.ai/tts/websocket?cartesia_version=2025-04-1
 //   - orchestrator goroutine: owns ALL TTS state (aggregation, synthesis,
 //     shutdown). It drives Cartesia (send text, reset, cancel) and
 //     emits downstream frames (AudioFrame, WordTimestampFrame,
-//     TTSDoneFrame, deferred EndFrame).
+//     TTSDoneFrame, deferred EndFrame). After forwarding EndFrame it
+//     closes the Cartesia connection and exits, but leaves the base
+//     processor queues alive until PipelineTask cleanup stops them.
 //   - ProcessFrame: thin relay. For EndFrame it blocks until the
 //     orchestrator confirms the EndFrame has been forwarded; for
 //     InterruptFrame it forwards downstream immediately and signals the
@@ -174,6 +176,10 @@ func (t *TTSProcessor) Start(ctx context.Context) {
 // Idempotent via BaseProcessor's cancelling flag + closeOnce.
 func (t *TTSProcessor) Stop() {
 	t.BaseProcessor.Stop()
+	t.closeTTSConnection()
+}
+
+func (t *TTSProcessor) closeTTSConnection() {
 	t.activeContextId.Store("")
 	t.closeOnce.Do(func() {
 		if t.websocketConn != nil {
@@ -290,7 +296,7 @@ func (t *TTSProcessor) orchestrator() {
 			pendingEndDone = nil
 		}
 		pendingEnd = nil
-		t.Stop()
+		t.closeTTSConnection()
 		return true
 	}
 
@@ -330,7 +336,7 @@ func (t *TTSProcessor) orchestrator() {
 		if doneCh != nil {
 			close(doneCh)
 		}
-		t.Stop()
+		t.closeTTSConnection()
 		return true
 	}
 

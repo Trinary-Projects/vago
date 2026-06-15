@@ -20,9 +20,9 @@ import (
 // processor under test; any upstream pushes from the processor are
 // captured by the source, downstream pushes by the sink.
 //
-// At end-of-test we queue an EndFrame which auto-shuts down every
-// processor via BaseProcessor's EndFrame handling. We then wait on the
-// shared WaitGroup with a timeout and inspect the captured slices.
+// At end-of-test we queue an EndFrame through the processor under test,
+// then explicitly Stop the isolated test chain and wait on the shared
+// WaitGroup before inspecting captured slices.
 
 // SleepFrame is a synthetic frame interpreted by runProcessorTest: when
 // the send loop encounters one, it sleeps for the given duration before
@@ -153,13 +153,8 @@ type runConfig struct {
 // from the returned downstream slice if sendEndFrame was true.
 //
 // After the send loop finishes we always call Stop() on all three
-// processors. For sendEndFrame=true this is a no-op (EndFrame's
-// auto-cancel already cancelled b.ctx); for sendEndFrame=false (used
-// when the processor under test emits its own EndFrame from a side
-// goroutine, e.g. a timer) this is what shuts down the source/sink
-// whose base goroutines wouldn't otherwise see the EndFrame. This
-// mirrors PipelineTask.completeEnd calling pipeline.Stop() in
-// production.
+// processors. This mirrors PipelineTask.completeEnd calling
+// pipeline.Stop() in production after EndFrame reaches the sink.
 func runProcessorTest(t *testing.T, fix *testFixture, cfg runConfig) (downstream, upstream []Frame) {
 	t.Helper()
 	if cfg.timeout == 0 {
@@ -214,8 +209,8 @@ func runProcessorTest(t *testing.T, fix *testFixture, cfg runConfig) (downstream
 	// Give in-flight frames a chance to propagate before forcing cleanup.
 	time.Sleep(50 * time.Millisecond)
 
-	// Force shutdown. Idempotent: if EndFrame propagation already
-	// cancelled b.ctx, Stop is a no-op.
+	// Force shutdown after the test chain had a chance to process
+	// EndFrame and any immediately-following frames.
 	source.Stop()
 	cfg.processor.Stop()
 	sink.Stop()
@@ -254,6 +249,18 @@ func waitForWG(wg *sync.WaitGroup, timeout time.Duration) error {
 		return nil
 	case <-time.After(timeout):
 		return fmt.Errorf("timeout after %s waiting for goroutines", timeout)
+	}
+}
+
+func stopProcessorsAndWait(t *testing.T, fix *testFixture, timeout time.Duration, processors ...Processor) {
+	t.Helper()
+	for _, p := range processors {
+		if p != nil {
+			p.Stop()
+		}
+	}
+	if err := waitForWG(fix.WG, timeout); err != nil {
+		t.Fatalf("waitForWG: %v", err)
 	}
 }
 

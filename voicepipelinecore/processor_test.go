@@ -80,10 +80,8 @@ func TestBaseProcessor_BasicForward(t *testing.T) {
 // TestBaseProcessor_UpstreamForward verifies a processor's upstream
 // PushFrame reaches the source.
 //
-// We need a settleDelay between the trigger frame and the EndFrame
-// because the upstream push happens in pe's processLoop, while EndFrame
-// is being pushed by source's processLoop. Without a delay, source can
-// auto-cancel on EndFrame before the upstream frame arrives.
+// We use a settleDelay between the trigger frame and shutdown so the
+// upstream push has time to reach the source before the test chain stops.
 func TestBaseProcessor_UpstreamForward(t *testing.T) {
 	fix := newTestFixture(t)
 	pe := &upstreamEmitter{emitted: &atomic.Bool{}}
@@ -114,23 +112,42 @@ func (e *upstreamEmitter) ProcessFrame(ctx context.Context, frame Frame, dir Dir
 	e.PushFrame(frame, dir)
 }
 
-// TestBaseProcessor_EndFrameAutoCancel verifies the base auto-cancels
-// b.ctx after the user's ProcessFrame(EndFrame) returns, so the input
-// loop and user-spawned goroutines unwind without an explicit Stop.
-func TestBaseProcessor_EndFrameAutoCancel(t *testing.T) {
+// TestBaseProcessor_EndFrameDoesNotAutoCancel verifies the base keeps a
+// processor alive after EndFrame passes through. PipelineTask cleanup is
+// responsible for stopping processors once EndFrame reaches the sink, which
+// leaves post-playback processors able to flush state during graceful shutdown.
+func TestBaseProcessor_EndFrameDoesNotAutoCancel(t *testing.T) {
 	fix := newTestFixture(t)
 	pt := newTrackedProcessor(fix.TaskCtx)
 
-	_, _ = runProcessorTest(t, fix, runConfig{
-		processor:    pt,
-		framesToSend: []Frame{TextFrame{Text: "hi"}},
-		sendEndFrame: true,
-	})
+	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	source.Link(pt)
+	pt.Link(sink)
+	source.Start(fix.RootCtx)
+	pt.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	source.QueueFrame(EndFrame{}, Downstream)
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-pt.exited:
+		t.Fatal("background goroutine exited after EndFrame before explicit Stop")
+	default:
+	}
+
+	source.Stop()
+	pt.Stop()
+	sink.Stop()
+	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
 
 	select {
 	case <-pt.exited:
 	case <-time.After(time.Second):
-		t.Fatal("background goroutine did not exit after EndFrame auto-cancel")
+		t.Fatal("background goroutine did not exit after explicit Stop")
 	}
 }
 
@@ -228,28 +245,17 @@ func TestBaseProcessor_SystemPriority(t *testing.T) {
 	// trigger handleSystem (which cancels procCtx → unblocks blocking
 	// ProcessFrame).
 	source.QueueFrame(InterruptFrame{}, Downstream)
+	if !waitForSeen(bp.seen, "interrupt", 2*time.Second) {
+		t.Fatal("InterruptFrame was not processed within 2s")
+	}
 
 	// Now release any blocked ProcessFrame calls so they can return.
 	close(bp.release)
 
-	source.QueueFrame(EndFrame{}, Downstream)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, bp, sink)
 
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
-
-	// Verify the interrupt was seen by the blocking processor's
-	// ProcessFrame (proves the base dispatched it before more data
-	// frames queued in procCh — those would have been purged by interrupt).
-	gotInterrupt := false
-	for _, s := range drain(bp.seen) {
-		if s == "interrupt" {
-			gotInterrupt = true
-		}
-	}
-	if !gotInterrupt {
-		t.Fatal("InterruptFrame was not delivered to ProcessFrame")
-	}
+	// waitForSeen above proves the base dispatched the interrupt before
+	// more data frames queued in procCh.
 }
 
 type blockingProcessor struct {
@@ -360,9 +366,15 @@ func TestBaseProcessor_InterruptPurgesProcCh(t *testing.T) {
 	}
 	close(bp.release)
 
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := sink.Captured()
+		if countFrames[EndFrame](got) == 1 && countFrames[InterruptFrame](got) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, bp, sink)
 
 	got := sink.Captured()
 	// "blocked" TextFrame survives — already in flight. The 5 "queued"
@@ -401,7 +413,7 @@ func TestBaseProcessor_QueueFrameDirectionRouting(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	pt.QueueFrame(EndFrame{}, Downstream)
+	pt.Stop()
 	if err := waitForWG(fix.WG, 2*time.Second); err != nil {
 		t.Fatalf("waitForWG: %v", err)
 	}

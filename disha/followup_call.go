@@ -150,7 +150,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 
 	stt := voicepipelinecore.NewSTTProcessor(taskCtx) // Soniox only, by design.
 	userIdle := voicepipelinecore.NewUserIdleProcessor(taskCtx)
-	contextAggregator := voicepipelinecore.NewContextAggregator(taskCtx, pl.InitialMessages, pl.PromptKey)
+	contextAggregators := voicepipelinecore.NewContextAggregatorPair(taskCtx, pl.InitialMessages, pl.PromptKey)
 	llmClient, err := newFollowUpLLMClient(deps, pl)
 	if err != nil {
 		task.Abort()
@@ -169,10 +169,11 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		audioSource,
 		stt,
 		userIdle,
-		contextAggregator,
+		contextAggregators.User(),
 		llm,
 		tts,
 		playback,
+		contextAggregators.Assistant(),
 		sink,
 	})
 	task.SetPipeline(source, pipeline)

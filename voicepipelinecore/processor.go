@@ -78,6 +78,12 @@ const (
 //     IsInterruptible() is false, and restarts processLoop with a fresh
 //     procCtx.
 //
+// EndFrame is not a per-processor cancellation signal in the base. It
+// travels downstream in normal frame order and final task cleanup stops
+// the whole pipeline after EndFrame reaches the sink. This lets post-
+// playback processors, such as the assistant context aggregator, flush
+// played audio state before cleanup runs.
+//
 // Concrete processors interact with BaseProcessor through five
 // affordances:
 //
@@ -325,10 +331,7 @@ func (b *BaseProcessor) startProcessLoop() {
 }
 
 // processLoop drains procCh and invokes ProcessFrame for each data
-// frame. Exits when ctx is cancelled (interrupt or task shutdown) or
-// after the user's ProcessFrame handler for an EndFrame returns; on
-// EndFrame the base cancels the per-processor ctx so the input loop
-// and any user-spawned goroutines also unwind.
+// frame. Exits when ctx is cancelled (interrupt or task shutdown).
 //
 // The non-blocking ctx.Done check at the top of each iteration matters
 // for correctness during cancel-and-recreate: after an in-flight
@@ -348,13 +351,6 @@ func (b *BaseProcessor) processLoop(ctx context.Context) {
 			return
 		case env := <-b.procCh:
 			b.self.ProcessFrame(ctx, env.Frame, env.Direction)
-			if _, isEnd := env.Frame.(EndFrame); isEnd {
-				b.cancelling.Store(true)
-				if b.cancel != nil {
-					b.cancel()
-				}
-				return
-			}
 		}
 	}
 }
@@ -375,7 +371,7 @@ func (b *BaseProcessor) handleSystem(env Envelope) {
 // processLoop goroutine to exit (bounded), purges procCh of
 // interruptible frames, then starts a fresh processLoop. After this
 // returns, no in-flight ProcessFrame call is running and procCh holds
-// only frames marked !IsInterruptible (today: EndFrame).
+// only frames marked !IsInterruptible.
 func (b *BaseProcessor) interruptProcessLoop() {
 	b.procMu.Lock()
 	cancel := b.procCancel

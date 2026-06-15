@@ -141,7 +141,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 
 	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
 	userIdle := voicepipelinecore.NewUserIdleProcessor(taskCtx)
-	contextAggregator := voicepipelinecore.NewContextAggregator(taskCtx, pl.InitialMessages, pl.PromptKey)
+	contextAggregators := voicepipelinecore.NewContextAggregatorPair(taskCtx, pl.InitialMessages, pl.PromptKey)
 	talkTime := voicepipelinecore.NewTalkTimeMonitoringProcessorWithMaxTalkTime(taskCtx, pl.MaxTalkTime)
 	llmClient, err := newSalesLLMClient(deps, pl.Startup)
 	if err != nil {
@@ -158,11 +158,12 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 		audioSource,
 		stt,
 		userIdle,
-		contextAggregator,
+		contextAggregators.User(),
 		talkTime,
 		llm,
 		tts,
 		playback,
+		contextAggregators.Assistant(),
 		sink,
 	})
 	task.SetPipeline(source, pipeline)

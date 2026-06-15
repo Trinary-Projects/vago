@@ -71,3 +71,24 @@ func TestErrorFrame_Construction(t *testing.T) {
 		t.Error("ErrorFrame should survive interrupt purges")
 	}
 }
+
+func TestPostPlaybackFramesUseSystemPriority(t *testing.T) {
+	frames := []struct {
+		name  string
+		frame Frame
+	}{
+		{name: "WordTimestampFrame", frame: NewWordTimestampFrame([]string{"hi"})},
+		{name: "TTSDoneFrame", frame: NewTTSDoneFrame()},
+		{name: "BotStartedSpeakingFrame", frame: NewBotStartedSpeakingFrame()},
+		{name: "BotStoppedSpeakingFrame", frame: NewBotStoppedSpeakingFrame()},
+	}
+
+	for _, tc := range frames {
+		if !tc.frame.IsSystem() {
+			t.Errorf("%s should be system-priority", tc.name)
+		}
+		if tc.frame.IsInterruptible() {
+			t.Errorf("%s should survive interrupt purges", tc.name)
+		}
+	}
+}

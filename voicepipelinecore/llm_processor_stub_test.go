@@ -176,7 +176,7 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 			{tokens: []string{"guidance ", "received"}},
 		},
 	}
-	aggregator := NewContextAggregator(fix.TaskCtx, []Message{
+	aggregator := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 		{Role: "user", Content: "hello?"},
 	}, "")
@@ -216,9 +216,8 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 	}
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, sink)
 
 	select {
 	case req := <-handlerCalls:
@@ -297,7 +296,7 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 			{tokens: []string{"done"}},
 		},
 	}
-	aggregator := NewContextAggregator(fix.TaskCtx, []Message{
+	aggregator := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 		{Role: "user", Content: "hello?"},
 	}, "")
@@ -357,9 +356,8 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 	}
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, sink)
 
 	requests := client.Requests()
 	if len(requests) != 2 {

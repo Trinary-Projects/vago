@@ -3,6 +3,7 @@ package voicepipelinecore
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 )
 
 func TestPlaybackBotPCMFrameConvertsRawPCMBytes(t *testing.T) {
@@ -46,4 +47,61 @@ func TestResampleMonoPCMDownsamplesBackground(t *testing.T) {
 			t.Fatalf("sample %d = %d, want %d", i, got[i], input[i*3])
 		}
 	}
+}
+
+func TestPlaybackSinkForwardsInterruptDownstream(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
+	p := NewPlaybackSinkProcessor(fix.TaskCtx)
+
+	down, _ := runProcessorTest(t, fix, runConfig{
+		processor: p,
+		framesToSend: []Frame{
+			NewInterruptFrame(),
+		},
+		settleDelay:  30 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	if c := countFrames[InterruptFrame](down); c != 1 {
+		t.Fatalf("expected InterruptFrame forwarded downstream, got %d in %s", c, describeFrameTypes(down))
+	}
+}
+
+func TestPlaybackSinkInterruptDropsQueuedUnplayedReconciliationFrames(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewPlaybackSinkProcessor(fix.TaskCtx)
+	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
+	p.Link(sink)
+	sink.Start(fix.RootCtx)
+
+	p.playbackQueue = []Frame{
+		NewAudioFrame(make([]byte, framePCMBytes)),
+		NewWordTimestampFrame([]string{"unheard"}),
+		NewTTSDoneFrame(),
+		NewEndFrame("shutdown"),
+	}
+
+	p.handleQueueFrame(NewInterruptFrame())
+	time.Sleep(20 * time.Millisecond)
+
+	if len(p.playbackQueue) != 1 {
+		t.Fatalf("expected only EndFrame to survive playback interrupt, got %s", describeFrameTypes(p.playbackQueue))
+	}
+	if _, ok := p.playbackQueue[0].(EndFrame); !ok {
+		t.Fatalf("expected EndFrame to survive playback interrupt, got %s", describeFrameTypes(p.playbackQueue))
+	}
+
+	down := sink.Captured()
+	if c := countFrames[InterruptFrame](down); c != 1 {
+		t.Fatalf("expected InterruptFrame forwarded downstream, got %d in %s", c, describeFrameTypes(down))
+	}
+	if c := countFrames[WordTimestampFrame](down); c != 0 {
+		t.Fatalf("queued WordTimestampFrame should be dropped as unplayed, got %d in %s", c, describeFrameTypes(down))
+	}
+	if c := countFrames[TTSDoneFrame](down); c != 0 {
+		t.Fatalf("queued TTSDoneFrame should be dropped as unplayed, got %d in %s", c, describeFrameTypes(down))
+	}
+
+	stopProcessorsAndWait(t, fix, 3*time.Second, sink)
 }

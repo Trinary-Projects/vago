@@ -17,10 +17,8 @@ func TestPipelineSource_QueueForwardsDownstream(t *testing.T) {
 	sink.Start(fix.RootCtx)
 
 	p.Queue(EndFrame{Reason: "test"})
-
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, p, sink)
 
 	got := sink.Captured()
 	endFrame, ok := findFrame[EndFrame](got)
@@ -54,9 +52,7 @@ func TestPipelineSink_CallsOnEndCallback(t *testing.T) {
 		t.Fatal("onEnd was not called within 2s")
 	}
 
-	if err := waitForWG(fix.WG, 2*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 2*time.Second, p)
 }
 
 // TestPipelineSource_FatalErrorTriggersEndTask verifies that when a
@@ -178,7 +174,6 @@ func TestPipelineSink_IgnoresNonEndFrames(t *testing.T) {
 
 	// Now actually shut down with an EndFrame.
 	p.QueueFrame(EndFrame{Reason: "shutdown"}, Downstream)
-	if err := waitForWG(fix.WG, 2*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 2*time.Second, p)
 }

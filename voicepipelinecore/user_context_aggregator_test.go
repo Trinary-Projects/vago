@@ -6,12 +6,16 @@ import (
 	"time"
 )
 
-// TestContextAggregator_FinalTranscriptEmitsLLMMessages verifies a
+func testInitialMessages() []Message {
+	return []Message{{Role: "system", Content: "test prompt"}}
+}
+
+// TestUserContextAggregator_FinalTranscriptEmitsLLMMessages verifies a
 // final transcript ending with <end> produces an LLMMessagesFrame
 // downstream.
-func TestContextAggregator_FinalTranscriptEmitsLLMMessages(t *testing.T) {
+func TestUserContextAggregator_FinalTranscriptEmitsLLMMessages(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	down, _ := runProcessorTest(t, fix, runConfig{
 		processor: a,
@@ -42,9 +46,9 @@ func TestContextAggregator_FinalTranscriptEmitsLLMMessages(t *testing.T) {
 	}
 }
 
-func TestContextAggregator_SuppressesInterimUserTranscriptionEvents(t *testing.T) {
+func TestUserContextAggregator_SuppressesInterimUserTranscriptionEvents(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	runProcessorTest(t, fix, runConfig{
 		processor: a,
@@ -62,9 +66,9 @@ func TestContextAggregator_SuppressesInterimUserTranscriptionEvents(t *testing.T
 	}
 }
 
-func TestContextAggregator_FinalUserTranscriptionStillEmitsRTVI(t *testing.T) {
+func TestUserContextAggregator_FinalUserTranscriptionStillEmitsRTVI(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	runProcessorTest(t, fix, runConfig{
 		processor: a,
@@ -94,9 +98,9 @@ func TestContextAggregator_FinalUserTranscriptionStillEmitsRTVI(t *testing.T) {
 	}
 }
 
-func TestContextAggregator_InitialMessagesSeedLLMContext(t *testing.T) {
+func TestUserContextAggregator_InitialMessagesSeedLLMContext(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "seed context"},
 		{Role: "assistant", Content: "hello seed"},
 	}, "")
@@ -126,9 +130,9 @@ func TestContextAggregator_InitialMessagesSeedLLMContext(t *testing.T) {
 	}
 }
 
-func TestContextAggregator_AppendRunLLMEmitsFirstTurnFromInitialContext(t *testing.T) {
+func TestUserContextAggregator_AppendRunLLMEmitsFirstTurnFromInitialContext(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 		{Role: "user", Content: "hello?"},
 	}, "")
@@ -154,13 +158,13 @@ func TestContextAggregator_AppendRunLLMEmitsFirstTurnFromInitialContext(t *testi
 	}
 	// The append frame itself must be consumed, not forwarded.
 	if _, forwarded := findFrame[LLMMessagesAppendFrame](down); forwarded {
-		t.Fatal("LLMMessagesAppendFrame should be consumed by ContextAggregator, not forwarded")
+		t.Fatal("LLMMessagesAppendFrame should be consumed by UserContextAggregator, not forwarded")
 	}
 }
 
-func TestContextAggregator_AppendAddsMessages(t *testing.T) {
+func TestUserContextAggregator_AppendAddsMessages(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 	}, "")
 
@@ -185,9 +189,9 @@ func TestContextAggregator_AppendAddsMessages(t *testing.T) {
 	}
 }
 
-func TestContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T) {
+func TestUserContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 	}, "")
 
@@ -205,14 +209,13 @@ func TestContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
-	if len(a.messages) != 3 {
-		t.Fatalf("context messages = %+v, want prompt + assistant tool call + tool result", a.messages)
+	messages := a.messagesForTest()
+	if len(messages) != 3 {
+		t.Fatalf("context messages = %+v, want prompt + assistant tool call + tool result", messages)
 	}
-	assistant := a.messages[1]
+	assistant := messages[1]
 	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("assistant tool message = %+v, want one tool call", assistant)
 	}
@@ -222,7 +225,7 @@ func TestContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T
 	if assistant.ToolCalls[0].Function.Arguments != `{"situation":"pain"}` {
 		t.Fatalf("tool arguments = %q, want raw JSON", assistant.ToolCalls[0].Function.Arguments)
 	}
-	tool := a.messages[2]
+	tool := messages[2]
 	if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Content != "guidance text" {
 		t.Fatalf("tool result message = %+v, want call_1 guidance text", tool)
 	}
@@ -242,9 +245,9 @@ func TestContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T
 	}
 }
 
-func TestContextAggregator_FunctionCallsUsePipecatAssistantToolPairs(t *testing.T) {
+func TestUserContextAggregator_FunctionCallsUsePipecatAssistantToolPairs(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 	}, "")
 
@@ -264,32 +267,31 @@ func TestContextAggregator_FunctionCallsUsePipecatAssistantToolPairs(t *testing.
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
-	if len(a.messages) != 5 {
-		t.Fatalf("context messages = %+v, want prompt + two assistant/tool pairs", a.messages)
+	messages := a.messagesForTest()
+	if len(messages) != 5 {
+		t.Fatalf("context messages = %+v, want prompt + two assistant/tool pairs", messages)
 	}
-	assistant := a.messages[1]
+	assistant := messages[1]
 	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("first assistant tool message = %+v, want one tool call", assistant)
 	}
 	if assistant.ToolCalls[0].Function.Name != "get_guidance" {
 		t.Fatalf("first tool call = %+v, want get_guidance", assistant.ToolCalls)
 	}
-	if a.messages[2].Role != "tool" || a.messages[2].ToolCallID != "call_1" || a.messages[2].Content != "guidance text" {
-		t.Fatalf("first tool result = %+v", a.messages[2])
+	if messages[2].Role != "tool" || messages[2].ToolCallID != "call_1" || messages[2].Content != "guidance text" {
+		t.Fatalf("first tool result = %+v", messages[2])
 	}
-	assistant = a.messages[3]
+	assistant = messages[3]
 	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("second assistant tool message = %+v, want one tool call", assistant)
 	}
 	if assistant.ToolCalls[0].Function.Name != "lookup_plan" {
 		t.Fatalf("second tool call = %+v, want lookup_plan", assistant.ToolCalls)
 	}
-	if a.messages[4].Role != "tool" || a.messages[4].ToolCallID != "call_2" || a.messages[4].Content != "plan text" {
-		t.Fatalf("second tool result = %+v", a.messages[4])
+	if messages[4].Role != "tool" || messages[4].ToolCallID != "call_2" || messages[4].Content != "plan text" {
+		t.Fatalf("second tool result = %+v", messages[4])
 	}
 	llmMsg, ok := findFrame[LLMMessagesFrame](sink.Captured())
 	if !ok {
@@ -300,9 +302,9 @@ func TestContextAggregator_FunctionCallsUsePipecatAssistantToolPairs(t *testing.
 	}
 }
 
-func TestContextAggregator_EmptyFunctionResultPushesError(t *testing.T) {
+func TestUserContextAggregator_EmptyFunctionResultPushesError(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 	}, "")
 
@@ -320,23 +322,22 @@ func TestContextAggregator_EmptyFunctionResultPushesError(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
 	if c := countFrames[ErrorFrame](source.Captured()); c != 1 {
 		t.Fatalf("expected one ErrorFrame for empty tool result, got %d in %s", c, describeFrameTypes(source.Captured()))
 	}
-	if len(a.messages) != 3 {
-		t.Fatalf("context messages = %+v", a.messages)
+	messages := a.messagesForTest()
+	if len(messages) != 3 {
+		t.Fatalf("context messages = %+v", messages)
 	}
-	tool := a.messages[2]
+	tool := messages[2]
 	if tool.Role != "tool" || tool.ToolCallID != "call_1" || !strings.Contains(tool.Content, "empty tool result") {
 		t.Fatalf("tool result message = %+v, want explicit empty-result error", tool)
 	}
 }
 
-func TestContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
+func TestUserContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
 	fix := newTestFixture(t)
 	var assistantToolCalls []Message
 	var toolResults []Message
@@ -346,7 +347,7 @@ func TestContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
 			toolResults = append(toolResults, toolResult)
 		},
 	})
-	a := NewContextAggregator(fix.TaskCtx, []Message{{Role: "system", Content: "prompt"}}, "")
+	a := NewUserContextAggregator(fix.TaskCtx, []Message{{Role: "system", Content: "prompt"}}, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
@@ -362,9 +363,7 @@ func TestContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(assistantToolCalls) != 1 || len(toolResults) != 1 {
@@ -382,41 +381,46 @@ func TestContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
 	}
 }
 
-func TestContextAggregator_ExplicitEmptyInitialMessagesSkipsDefaultPrompt(t *testing.T) {
+func TestUserContextAggregator_EmptyInitialMessagesPanics(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, []Message{}, "")
-
-	down, _ := runProcessorTest(t, fix, runConfig{
-		processor: a,
-		framesToSend: []Frame{
-			TranscriptFrame{Text: "hello", IsFinal: true},
-			TranscriptFrame{Text: "<end>", IsFinal: true},
-		},
-		sendEndFrame: true,
-	})
-
-	llmMsg, ok := findFrame[LLMMessagesFrame](down)
-	if !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
-	}
-	if len(llmMsg.Messages) != 1 {
-		t.Fatalf("message count = %d, want only the user message", len(llmMsg.Messages))
-	}
-	if llmMsg.Messages[0].Role != "user" {
-		t.Fatalf("first message role = %q, want user", llmMsg.Messages[0].Role)
-	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected empty initial messages to panic")
+		}
+	}()
+	NewUserContextAggregator(fix.TaskCtx, []Message{}, "")
 }
 
-// TestContextAggregator_BargeInEmitsInterrupt verifies that >= 3 interim
-// words during bot speech triggers an InterruptFrame downstream.
-func TestContextAggregator_BargeInEmitsInterrupt(t *testing.T) {
+func TestUserContextAggregator_NilInitialMessagesPanics(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected nil initial messages to panic")
+		}
+	}()
+	NewUserContextAggregator(fix.TaskCtx, nil, "")
+}
+
+func TestUserContextAggregator_InvalidInitialMessagesPanics(t *testing.T) {
+	fix := newTestFixture(t)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected invalid initial messages to panic")
+		}
+	}()
+	NewUserContextAggregator(fix.TaskCtx, []Message{{Role: "system"}}, "")
+}
+
+// TestUserContextAggregator_BargeInEmitsInterrupt verifies that >= 3 interim
+// words during bot speech triggers an InterruptFrame downstream.
+func TestUserContextAggregator_BargeInEmitsInterrupt(t *testing.T) {
+	fix := newTestFixture(t)
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	down, _ := runProcessorTest(t, fix, runConfig{
 		processor: a,
 		framesToSend: []Frame{
-			BotStartedSpeakingFrame{}, // arrives upstream from PlaybackSink; ContextAggregator sets botSpeaking
+			BotStartedSpeakingFrame{}, // arrives upstream from PlaybackSink; UserContextAggregator sets botSpeaking
 			TranscriptFrame{Text: "one two three", IsFinal: false, ResponseID: 1}, // 3 words → barge-in
 		},
 		settleDelay:  30 * time.Millisecond,
@@ -428,11 +432,11 @@ func TestContextAggregator_BargeInEmitsInterrupt(t *testing.T) {
 	}
 }
 
-// TestContextAggregator_NoBargeInBelowThreshold verifies that fewer
+// TestUserContextAggregator_NoBargeInBelowThreshold verifies that fewer
 // than 3 interim words does NOT trigger an InterruptFrame.
-func TestContextAggregator_NoBargeInBelowThreshold(t *testing.T) {
+func TestUserContextAggregator_NoBargeInBelowThreshold(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	down, _ := runProcessorTest(t, fix, runConfig{
 		processor: a,
@@ -449,15 +453,15 @@ func TestContextAggregator_NoBargeInBelowThreshold(t *testing.T) {
 	}
 }
 
-// TestContextAggregator_BackchannelDiscardedWhenBotFinishesFirst verifies
+// TestUserContextAggregator_BackchannelDiscardedWhenBotFinishesFirst verifies
 // the race-case bug fix: when the user speaks below the barge-in
-// threshold WHILE the bot is talking, AND the bot finishes (TTSDoneFrame
-// arrives) BEFORE Soniox emits the <end> for that speech, the lagging
+// threshold WHILE the bot is talking, AND the bot stops speaking BEFORE
+// Soniox emits the <end> for that speech, the lagging
 // <end> must NOT submit those words as a user turn. Mirrors Pipecat's
 // reset_aggregation behavior at the bot-turn boundary.
-func TestContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testing.T) {
+func TestUserContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
@@ -477,8 +481,8 @@ func TestContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testing.T
 	source.QueueFrame(TranscriptFrame{Text: "okay", IsFinal: true, ResponseID: 1}, Downstream)
 	time.Sleep(20 * time.Millisecond)
 
-	// Bot finishes naturally — TTSDoneFrame arrives BEFORE Soniox's <end>.
-	sink.QueueFrame(TTSDoneFrame{}, Upstream)
+	// Bot stops naturally — BotStoppedSpeakingFrame arrives BEFORE Soniox's <end>.
+	sink.QueueFrame(NewBotStoppedSpeakingFrame(), Upstream)
 	time.Sleep(20 * time.Millisecond)
 
 	// Now Soniox finally emits <end> for the backchannel. The aggregator
@@ -487,9 +491,7 @@ func TestContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testing.T
 	time.Sleep(20 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
 	if c := countFrames[LLMMessagesFrame](sink.Captured()); c != 0 {
 		t.Errorf("expected NO LLMMessagesFrame for back-channel speech, got %d in %s", c, describeFrameTypes(sink.Captured()))
@@ -498,20 +500,20 @@ func TestContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testing.T
 		t.Errorf("did not expect InterruptFrame for sub-threshold speech, got %d", c)
 	}
 	// And no user-role message should have been appended.
-	for _, m := range a.messages {
+	for _, m := range a.messagesForTest() {
 		if m.Role == "user" {
 			t.Errorf("aggregator should not have a user message; got %q", m.Content)
 		}
 	}
 }
 
-// TestContextAggregator_BackchannelDiscardedWhileBotStillSpeaking
+// TestUserContextAggregator_BackchannelDiscardedWhileBotStillSpeaking
 // verifies the existing in-progress discard branch still works: when
 // <end> arrives WHILE botSpeaking is still true, the below-threshold
 // transcript is discarded synchronously.
-func TestContextAggregator_BackchannelDiscardedWhileBotStillSpeaking(t *testing.T) {
+func TestUserContextAggregator_BackchannelDiscardedWhileBotStillSpeaking(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
@@ -530,28 +532,26 @@ func TestContextAggregator_BackchannelDiscardedWhileBotStillSpeaking(t *testing.
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
 	if c := countFrames[LLMMessagesFrame](sink.Captured()); c != 0 {
 		t.Errorf("expected NO LLMMessagesFrame; in-progress discard should fire, got %d", c)
 	}
-	for _, m := range a.messages {
+	for _, m := range a.messagesForTest() {
 		if m.Role == "user" {
 			t.Errorf("aggregator should not have a user message; got %q", m.Content)
 		}
 	}
 }
 
-// TestContextAggregator_BargeInPreservesUserTranscript verifies the
+// TestUserContextAggregator_BargeInPreservesUserTranscript verifies the
 // regression boundary: when the user DOES cross the barge-in threshold,
 // their accumulated speech is NOT reset by the TTSDone path (since
 // barge-in fires before TTSDone in our flow, and interruptSent gates
 // the reset).
-func TestContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
+func TestUserContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
@@ -573,9 +573,7 @@ func TestContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
 	if c := countFrames[InterruptFrame](sink.Captured()); c != 1 {
 		t.Errorf("expected 1 InterruptFrame, got %d", c)
@@ -590,115 +588,37 @@ func TestContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	}
 }
 
-// TestContextAggregator_TTSDoneCommitsAssistantMessage verifies that a
-// TTSDoneFrame arriving upstream commits accumulated WordTimestampFrame
-// words as an assistant message.
-func TestContextAggregator_TTSDoneCommitsAssistantMessage(t *testing.T) {
-	fix := newTestFixture(t)
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
-
-	// Drive the aggregator: user message → words spoken → TTSDone.
-	// To emit upstream frames, we'd need a processor downstream that
-	// pushes them upstream; simplest is to call QueueFrame directly with
-	// Upstream direction.
-	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
-	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
-	source.Link(a)
-	a.Link(sink)
-	source.Start(fix.RootCtx)
-	a.Start(fix.RootCtx)
-	sink.Start(fix.RootCtx)
-
-	// Send a user message to populate messages list.
-	source.QueueFrame(TranscriptFrame{Text: "hello", IsFinal: true}, Downstream)
-	source.QueueFrame(TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
-	time.Sleep(20 * time.Millisecond)
-
-	// Now send WordTimestampFrames upstream (simulating PlaybackSink
-	// emitting words as bot speaks).
-	sink.QueueFrame(WordTimestampFrame{Words: []string{"hi"}}, Upstream)
-	sink.QueueFrame(WordTimestampFrame{Words: []string{"there"}}, Upstream)
-	time.Sleep(20 * time.Millisecond)
-
-	// TTSDone arrives upstream → commits.
-	sink.QueueFrame(TTSDoneFrame{}, Upstream)
-	time.Sleep(20 * time.Millisecond)
-
-	source.QueueFrame(EndFrame{}, Downstream)
-	if err := waitForWG(fix.WG, 3*time.Second); err != nil {
-		t.Fatalf("waitForWG: %v", err)
-	}
-
-	// After commit, the aggregator's messages should contain an assistant
-	// message with the spoken words.
-	var sawAssistant bool
-	for _, m := range a.messages {
-		if m.Role == "assistant" {
-			sawAssistant = true
-			if m.Content != "hi there" {
-				t.Errorf("assistant content: got %q, want 'hi there'", m.Content)
-			}
-		}
-	}
-	if !sawAssistant {
-		t.Error("expected an assistant message after TTSDone commit")
-	}
-}
-
-func TestContextAggregator_EmitsCommittedTurnCallEventsWithMetrics(t *testing.T) {
+func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	fix := newTestFixture(t)
 	var users []string
-	var assistants []string
-	var metrics []TurnMetrics
 	var userPromptKeys []string
-	var assistantPromptKeys []string
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
 		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
 			users = append(users, text)
 			userPromptKeys = append(userPromptKeys, promptKey)
 		},
-		OnAssistantTurnCommitted: func(text string, at time.Time, m TurnMetrics, promptKey string) {
-			assistants = append(assistants, text)
-			metrics = append(metrics, m)
-			assistantPromptKeys = append(assistantPromptKeys, promptKey)
-		},
 	})
-	a := NewContextAggregator(fix.TaskCtx, nil, "sales_call/main_sys-3day_v2_v17")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "sales_call/main_sys-3day_v2_v17")
 
-	fix.TaskCtx.metrics.absorb(NewMetricsFrame([]MetricsData{
-		{Processor: "llm", Label: MetricTTFB, ValueMs: 12},
-		{Processor: "tts", Label: MetricTTFB, ValueMs: 34},
-	}))
 	a.addUserMessage("hello")
-	a.appendWords([]string{"hi", "there"})
-	a.commitSpokenText(false)
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(users) != 1 || users[0] != "hello" {
 		t.Fatalf("user turn events = %v, want [hello]", users)
 	}
-	if len(assistants) != 1 || assistants[0] != "hi there" {
-		t.Fatalf("assistant turn events = %v, want [hi there]", assistants)
-	}
-	if len(metrics) != 1 || metrics[0].LLMTTFBMs != 12 || metrics[0].TTSTTFBMs != 34 {
-		t.Fatalf("assistant metrics = %+v, want llm=12 tts=34", metrics)
-	}
 	if len(userPromptKeys) != 1 || userPromptKeys[0] != "sales_call/main_sys-3day_v2_v17" {
 		t.Fatalf("user prompt keys = %v, want sales prompt key", userPromptKeys)
 	}
-	if len(assistantPromptKeys) != 1 || assistantPromptKeys[0] != "sales_call/main_sys-3day_v2_v17" {
-		t.Fatalf("assistant prompt keys = %v, want sales prompt key", assistantPromptKeys)
-	}
 }
 
-func TestContextAggregator_UserFirstSpeechLifecycleFiresOnce(t *testing.T) {
+func TestUserContextAggregator_UserFirstSpeechLifecycleFiresOnce(t *testing.T) {
 	fix := newTestFixture(t)
 	calls := make(chan time.Time, 2)
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
 		OnUserFirstSpeech: func(at time.Time) { calls <- at },
 	})
 	defer fix.TaskCtx.callEvents.stopAndDrain()
-	a := NewContextAggregator(fix.TaskCtx, nil, "")
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
 	runProcessorTest(t, fix, runConfig{
 		processor: a,

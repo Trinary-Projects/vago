@@ -113,7 +113,7 @@ func (p *PipelineSinkProcessor) ProcessFrame(ctx context.Context, frame Frame, d
 		if p.onEnd != nil {
 			p.onEnd(f)
 		}
-		// base auto-cancels b.ctx after this returns
+		// PipelineTask cleanup stops the pipeline after this returns.
 		return
 	}
 	// Other frames (upstream from the chain) terminate here.
