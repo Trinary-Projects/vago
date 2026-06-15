@@ -18,7 +18,7 @@ const (
 	groupPollLockTTL = 60 * time.Second
 	// pollTriggerTimeout bounds the fire-and-forget trigger so it can
 	// never delay the call.
-	pollTriggerTimeout = 5 * time.Second
+	pollTriggerTimeout = 30 * time.Second
 )
 
 // triggerPoll fires a fire-and-forget re-poll of the (primary) model
