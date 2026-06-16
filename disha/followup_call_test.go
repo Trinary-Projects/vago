@@ -37,6 +37,20 @@ func seedDocumentWithConfig(t *testing.T, server *miniredis.Miniredis, name, env
 	server.Set("document:"+name+":"+env, string(raw))
 }
 
+func endCallToolConfig() []any {
+	return []any{
+		map[string]any{"function": map[string]any{
+			"name":        "end_call",
+			"description": "End the call.",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+				"required":   []any{},
+			},
+		}},
+	}
+}
+
 func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "prod")
 	redisServer, redisClient := newRedisTestClient(t)
@@ -117,6 +131,42 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	}
 }
 
+func TestFollowUpBotPlanLoadsEndCallToolForRegularPrompt(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "prod")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+
+	seedDocumentWithConfig(
+		t,
+		redisServer,
+		followUpPromptDefault,
+		"production",
+		4,
+		"FOLLOWUP",
+		map[string]any{"tools": endCallToolConfig()},
+	)
+	seedConversationData(t, redisServer, "follow-regular-tools", ConversationData{
+		Conversation: ConversationRow{
+			ID:      "follow-regular-tools",
+			UserID:  "user-1",
+			BotType: FollowUpBotType,
+		},
+		UserProfile: UserProfileData{UserID: "user-1"},
+	})
+
+	pl, err := FollowUpBot{}.plan(context.Background(), "follow-regular-tools", testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("FollowUpBot.plan: %v", err)
+	}
+	if pl.Dynamic {
+		t.Fatal("Dynamic = true, want false")
+	}
+	if len(pl.Tools) != 1 || pl.Tools[0].Function.Name != endCallToolName {
+		t.Fatalf("Tools = %+v, want end_call", pl.Tools)
+	}
+}
+
 func TestPatientScheduleFromSlots(t *testing.T) {
 	checkin := map[string]any{"morning": "8 AM"}
 	cases := []struct {
@@ -142,7 +192,7 @@ func TestFollowUpBotPlanPhoneOverrideUsesGPT41Group(t *testing.T) {
 	apiServer, _ := newCallAPIServer(t)
 	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
 
-	seedDocument(t, redisServer, followUpPromptInvestorDemo, "production", 3, "INVESTOR")
+	seedDocumentWithConfig(t, redisServer, followUpPromptInvestorDemo, "production", 3, "INVESTOR", map[string]any{"tools": endCallToolConfig()})
 	seedConversationData(t, redisServer, "follow-phone", ConversationData{
 		Conversation: ConversationRow{
 			ID:      "follow-phone",
@@ -164,6 +214,9 @@ func TestFollowUpBotPlanPhoneOverrideUsesGPT41Group(t *testing.T) {
 	}
 	if pl.ModelGroup != followUpPhoneOverrideModelGroup {
 		t.Fatalf("ModelGroup = %q, want %q", pl.ModelGroup, followUpPhoneOverrideModelGroup)
+	}
+	if len(pl.Tools) != 1 || pl.Tools[0].Function.Name != endCallToolName {
+		t.Fatalf("Tools = %+v, want end_call", pl.Tools)
 	}
 }
 

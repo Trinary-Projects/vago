@@ -87,12 +87,9 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 		modelGroup = followUpPhoneOverrideModelGroup
 	}
 
-	var tools []voicepipelinecore.ToolDefinition
-	if dynamic {
-		tools, err = buildDynamicFollowUpToolDefinitions(promptConfig)
-		if err != nil {
-			return nil, err
-		}
+	tools, err := buildCallToolDefinitionsFromConfig(promptConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	pl := &followUpPlan{
@@ -157,9 +154,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		return nil, err
 	}
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
-	if pl.Dynamic {
-		registerDynamicFollowUpTools(llm, task, deps, pl)
-	}
+	registerFollowUpTools(llm, task, deps, pl)
 	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
@@ -315,93 +310,6 @@ func downloadCompiledCallFlow(ctx context.Context, s3 S3GetClient, key string) (
 	return string(raw), nil
 }
 
-func buildDynamicFollowUpToolDefinitions(promptConfig map[string]any) ([]voicepipelinecore.ToolDefinition, error) {
-	rawTools, ok := promptConfig["tools"]
-	if !ok {
-		return nil, errors.New("disha: dynamic follow-up prompt config must define tools")
-	}
-	items, ok := rawTools.([]any)
-	if !ok || len(items) == 0 {
-		return nil, errors.New("disha: dynamic follow-up prompt config tools must be a non-empty list")
-	}
-	tools := make([]voicepipelinecore.ToolDefinition, 0, len(items))
-	seen := map[string]bool{}
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("disha: invalid tool config: %T", item)
-		}
-		def, err := toolDefinitionFromConfig(m)
-		if err != nil {
-			return nil, err
-		}
-		seen[def.Function.Name] = true
-		tools = append(tools, def)
-	}
-	for _, required := range []string{"get_guidance", "end_call"} {
-		if !seen[required] {
-			return nil, fmt.Errorf("disha: dynamic follow-up prompt config missing tool %q", required)
-		}
-	}
-	return tools, nil
-}
-
-func toolDefinitionFromConfig(config map[string]any) (voicepipelinecore.ToolDefinition, error) {
-	functionConfig := config
-	if nested, ok := config["function"].(map[string]any); ok {
-		functionConfig = nested
-	}
-	name, _ := functionConfig["name"].(string)
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return voicepipelinecore.ToolDefinition{}, errors.New("disha: tool config missing function name")
-	}
-	description, _ := functionConfig["description"].(string)
-	parameters, _ := functionConfig["parameters"].(map[string]any)
-	if parameters == nil {
-		properties, _ := functionConfig["properties"].(map[string]any)
-		required, _ := functionConfig["required"].([]any)
-		parameters = map[string]any{
-			"type":       "object",
-			"properties": propertiesOrEmpty(properties),
-			"required":   stringSliceFromAny(required),
-		}
-	}
-	var strict *bool
-	if v, ok := functionConfig["strict"].(bool); ok {
-		strict = &v
-	}
-	return voicepipelinecore.ToolDefinition{
-		Type: "function",
-		Function: voicepipelinecore.ToolFunction{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
-			Strict:      strict,
-		},
-	}, nil
-}
-
-func propertiesOrEmpty(properties map[string]any) map[string]any {
-	if properties == nil {
-		return map[string]any{}
-	}
-	return properties
-}
-
-func stringSliceFromAny(values []any) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 func newFollowUpLLMClient(deps Deps, pl *followUpPlan) (voicepipelinecore.LLMClient, error) {
 	return llmrouter.New(llmrouter.Config{
 		Group:          pl.ModelGroup,
@@ -413,7 +321,7 @@ func newFollowUpLLMClient(deps Deps, pl *followUpPlan) (voicepipelinecore.LLMCli
 	})
 }
 
-func registerDynamicFollowUpTools(llm *voicepipelinecore.LLMProcessor, task *voicepipelinecore.PipelineTask, deps Deps, pl *followUpPlan) {
+func registerFollowUpTools(llm *voicepipelinecore.LLMProcessor, task *voicepipelinecore.PipelineTask, deps Deps, pl *followUpPlan) {
 	for _, def := range pl.Tools {
 		switch def.Function.Name {
 		case "get_guidance":
@@ -425,13 +333,8 @@ func registerDynamicFollowUpTools(llm *voicepipelinecore.LLMProcessor, task *voi
 				}
 				return voicepipelinecore.ToolCallResponse{Result: text, RunLLM: true}, nil
 			}, voicepipelinecore.ToolOptions{CancelOnInterruption: false, Timeout: 30 * time.Second})
-		case "end_call":
-			llm.RegisterTool(def, func(ctx context.Context, req voicepipelinecore.ToolCallRequest) (voicepipelinecore.ToolCallResponse, error) {
-				if task != nil {
-					task.End(voicepipelinecore.EndReasonUnspecified)
-				}
-				return voicepipelinecore.ToolCallResponse{Result: map[string]any{"status": "call_ending"}, RunLLM: false}, nil
-			}, voicepipelinecore.ToolOptions{CancelOnInterruption: false, Timeout: 5 * time.Second})
+		case endCallToolName:
+			registerEndCallTool(llm, task, def)
 		}
 	}
 }

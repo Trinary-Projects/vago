@@ -59,6 +59,7 @@ type salesCallPlan struct {
 	PhoneticDict    map[string]string
 	Callbacks       *CallEventCallbacks
 	PromptKey       string
+	Tools           []voicepipelinecore.ToolDefinition
 }
 
 // plan resolves everything that depends only on the conversation data:
@@ -71,12 +72,17 @@ func (b SalesCallBot) plan(ctx context.Context, conversationID string, deps Deps
 		return nil, err
 	}
 
-	prompt, promptName, promptVersion, err := loadSalesPrompt(ctx, deps.Documents, startup)
+	prompt, promptName, promptVersion, promptConfig, err := loadSalesPrompt(ctx, deps.Documents, startup)
 	if err != nil {
 		return nil, err
 	}
 	startup.Logger.Printf("disha: sales prompt selected name=%s version=%d\n", promptName, promptVersion)
 	promptKey := PromptKey(promptName, promptVersion)
+
+	tools, err := buildCallToolDefinitionsFromConfig(promptConfig)
+	if err != nil {
+		return nil, err
+	}
 
 	resumeMsg := buildResumeSystemMessage(startup.Data, time.Now())
 	if resumeMsg != "" {
@@ -88,6 +94,7 @@ func (b SalesCallBot) plan(ctx context.Context, conversationID string, deps Deps
 		InitialMessages: buildInitialMessages(prompt, startup.Data.Chunks, resumeMsg),
 		MaxTalkTime:     salesTalkTimeLimit(startup.Data.UserProfile.RemainingSalesCallTalktimeSeconds),
 		PromptKey:       promptKey,
+		Tools:           tools,
 		Callbacks: NewCallEventCallbacks(
 			startup,
 			deps.Redis,
@@ -149,6 +156,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 		return nil, err
 	}
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
+	registerSalesTools(llm, task, pl)
 	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
@@ -182,7 +190,7 @@ func isDailyRoomURL(roomURL string) bool {
 // campaign_pricing_experiment_flag (matching Python) and fetches it
 // from the document store. Variables passed to the template mirror
 // `sales_call_variables` in sales_call.py.
-func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStartup) (string, string, int, error) {
+func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStartup) (string, string, int, map[string]any, error) {
 	name := salesPromptDefault
 	switch derefString(startup.Data.UserProfile.CampaignPricingExperimentFlag) {
 	case campaignFlag21For3Days:
@@ -192,7 +200,7 @@ func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStar
 	}
 
 	if store == nil {
-		return "", "", 0, fmt.Errorf("disha: document store is required to load %q", name)
+		return "", "", 0, nil, fmt.Errorf("disha: document store is required to load %q", name)
 	}
 
 	vars := DocumentVariables{
@@ -208,14 +216,22 @@ func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStar
 			derefString(startup.Data.UnprocessedChatContext),
 		),
 	}
-	text, version, err := store.GetDocument(ctx, name, 0, vars)
+	text, version, config, err := store.GetDocumentWithConfig(ctx, name, 0, vars)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("disha: load sales prompt %q: %w", name, err)
+		return "", "", 0, nil, fmt.Errorf("disha: load sales prompt %q: %w", name, err)
 	}
 	if strings.TrimSpace(text) == "" {
-		return "", "", 0, fmt.Errorf("disha: sales prompt %q is empty", name)
+		return "", "", 0, nil, fmt.Errorf("disha: sales prompt %q is empty", name)
 	}
-	return text, name, version, nil
+	return text, name, version, config, nil
+}
+
+func registerSalesTools(llm *voicepipelinecore.LLMProcessor, task *voicepipelinecore.PipelineTask, pl *salesCallPlan) {
+	for _, def := range pl.Tools {
+		if def.Function.Name == endCallToolName {
+			registerEndCallTool(llm, task, def)
+		}
+	}
 }
 
 // newSalesLLMClient builds the health-based LLM router for the sales

@@ -403,6 +403,42 @@ func TestSalesCallBotPlanPicksCampaignPrompt(t *testing.T) {
 	}
 }
 
+func TestSalesCallBotPlanLoadsEndCallToolFromPromptConfig(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	seedDocumentWithConfig(
+		t,
+		redisServer,
+		salesPromptDefault,
+		"production",
+		5,
+		testSalesPrompt,
+		map[string]any{"tools": []any{
+			map[string]any{
+				"name":        "end_call",
+				"description": "End the call.",
+				"properties":  map[string]any{},
+				"required":    []any{},
+			},
+		}},
+	)
+	seedConversationData(t, redisServer, "conv-tools", ConversationData{
+		Conversation: ConversationRow{ID: "conv-tools", UserID: "user-1", BotType: SalesCallBotType},
+		UserProfile:  UserProfileData{UserID: "user-1"},
+	})
+
+	pl, err := SalesCallBot{}.plan(context.Background(), "conv-tools", testDeps(redisClient, NewAPIClient(apiServer.URL, 10*time.Second, nil)))
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(pl.Tools) != 1 || pl.Tools[0].Function.Name != endCallToolName {
+		t.Fatalf("Tools = %+v, want end_call", pl.Tools)
+	}
+	if got, _ := pl.Tools[0].Function.Parameters["properties"].(map[string]any); got == nil || len(got) != 0 {
+		t.Fatalf("end_call properties = %#v, want empty object", pl.Tools[0].Function.Parameters["properties"])
+	}
+}
+
 func TestSalesCallBotPlanAppendsResumeMessage(t *testing.T) {
 	redisServer, redisClient := newRedisTestClient(t)
 	apiServer, _ := newCallAPIServer(t)
