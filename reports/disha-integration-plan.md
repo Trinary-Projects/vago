@@ -327,10 +327,13 @@ talk-go/
 ├── go.mod                           # module github.com/jaideep329/talk-go
 ├── go.sum
 ├── main.go                          # HTTP server, sessions map, wiring
-├── livekit-client.html              # unchanged
+├── clients/
+│   ├── daily-client.html
+│   └── livekit-client.html
 ├── background-office-sound.mp3      # unchanged
 ├── AGENTS.md                        # updated (see §14)
-├── disha-integration-plan.md        # this file
+├── reports/
+│   └── disha-integration-plan.md    # this file
 ├── voicepipelinecore/
 │   ├── frame.go
 │   ├── processor.go
@@ -359,7 +362,7 @@ talk-go/
 1. `mkdir voicepipelinecore`
 2. `git mv` every `.go` file (production + test) at the root into `voicepipelinecore/`, EXCEPT:
    - Keep `main.go` at the root (you'll rewrite it).
-   - Do not move `livekit-client.html`, `background-office-sound.mp3`, `app.log`, the binary, `.env`, etc.
+   - Do not move `clients/`, `reports/`, `background-office-sound.mp3`, `app.log`, the binary, `.env`, etc.
 3. In every moved file, change `package main` → `package voicepipelinecore`.
 4. The current `main.go` at the root needs full rewrite — you'll do this in §4.5.
 5. Re-export anything `main.go` (or future `disha/`) will need. Quick checklist of probable renames (verify against the actual code):
@@ -433,7 +436,7 @@ func main() {
 
     http.HandleFunc("/connect", handleConnect)
     http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        http.ServeFile(w, r, "livekit-client.html")
+        http.ServeFile(w, r, "clients/livekit-client.html")
     })
     log.Println("HTTP server listening on :3000")
     if err := http.ListenAndServe(":3000", nil); err != nil {

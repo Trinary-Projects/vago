@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=builder /out/talk-go /app/talk-go
 COPY daily_bridge.py /app/daily_bridge.py
 COPY jinja_renderer.py /app/jinja_renderer.py
-COPY daily-client.html /app/daily-client.html
+COPY clients /app/clients
 COPY background-office-sound.mp3 /app/background-office-sound.mp3
 
 EXPOSE 7860

@@ -69,9 +69,9 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/daily-client.html":
-			http.ServeFile(w, r, "daily-client.html")
+			http.ServeFile(w, r, "clients/daily-client.html")
 		case "/livekit-client.html", "/LiveKitClient.html", "/LifeKitClient.html":
-			http.ServeFile(w, r, "livekit-client.html")
+			http.ServeFile(w, r, "clients/livekit-client.html")
 		default:
 			http.NotFound(w, r)
 		}

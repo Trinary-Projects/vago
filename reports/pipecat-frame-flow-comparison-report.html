@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vago vs pipecat — Pipeline Structure, Frame Movement &amp; Call-Ending Review</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --panel2: #141a21; --ink: #e6edf3; --muted: #9aa7b4;
+    --line: #2a333d; --accent: #4ea1ff; --go: #5bd6c0; --py: #ffd166;
+    --warn-bg: #2a1f14; --warn-bd: #c98a2b; --warn-ink: #ffd9a0;
+    --ok-bg: #14241c; --ok-bd: #3fae6f; --ok-ink: #a7e8c2;
+    --bad-bg: #2a1717; --bad-bd: #d65b5b; --bad-ink: #ffb3b3;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 28px 96px; }
+  header.doc { border-bottom: 1px solid var(--line); padding-bottom: 22px; margin-bottom: 30px; }
+  h1 { font-size: 27px; line-height: 1.25; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 { font-size: 21px; margin: 44px 0 12px; padding-top: 14px; border-top: 1px solid var(--line); letter-spacing: -0.01em; }
+  h3 { font-size: 16.5px; margin: 26px 0 8px; color: #cdd9e5; }
+  p { margin: 12px 0; }
+  .sub { color: var(--muted); font-size: 13.5px; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.6px; background: #0b1118; border: 1px solid var(--line); border-radius: 5px;
+    padding: 1px 5px; color: #d7e3ee; }
+  pre { background: #0b1118; border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px;
+    overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.6px; line-height: 1.55; color: #cdd9e5; }
+  pre .c { color: #6f7e8c; }
+  pre .g { color: var(--go); }
+  pre .y { color: var(--py); }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13.4px; }
+  th, td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); color: #cdd9e5; font-weight: 600; }
+  tr:nth-child(even) td { background: var(--panel2); }
+  .tag { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .03em;
+    border-radius: 4px; padding: 1px 7px; vertical-align: middle; }
+  .t-down { background: #16263a; color: #8ec5ff; border: 1px solid #2f5a86; }
+  .t-up { background: #2a2114; color: #ffcf8a; border: 1px solid #7a5a23; }
+  .t-bc { background: #1d2733; color: #b8c6d6; border: 1px solid #3a4756; }
+  .callout { border-radius: 9px; padding: 14px 16px 14px 18px; margin: 18px 0; border: 1px solid; }
+  .callout h4 { margin: 0 0 6px; font-size: 14.5px; letter-spacing: .01em; }
+  .callout p:last-child { margin-bottom: 0; }
+  .warn { background: var(--warn-bg); border-color: var(--warn-bd); }
+  .warn h4 { color: var(--warn-ink); }
+  .ok { background: var(--ok-bg); border-color: var(--ok-bd); }
+  .ok h4 { color: var(--ok-ink); }
+  .bad { background: var(--bad-bg); border-color: var(--bad-bd); }
+  .bad h4 { color: var(--bad-ink); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  .two .col { border: 1px solid var(--line); border-radius: 9px; padding: 4px 16px 14px; background: var(--panel2); }
+  .col.go h3 { color: var(--go); } .col.py h3 { color: var(--py); }
+  .flow { font-family: ui-monospace, Menlo, monospace; font-size: 12.2px; color: #cdd9e5;
+    background: #0b1118; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; }
+  .flow .hl { color: var(--go); font-weight: 700; }
+  .flow .hlp { color: var(--py); font-weight: 700; }
+  ul, ol { margin: 10px 0; padding-left: 22px; }
+  li { margin: 6px 0; }
+  .ref { color: var(--muted); font-size: 12px; }
+  .kicker { text-transform: uppercase; letter-spacing: .08em; font-size: 11.5px; color: var(--accent); font-weight: 700; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 28px 0; }
+  .legend { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  .nowrap { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="kicker">Architecture review · voicepipelinecore</div>
+  <h1>vago vs pipecat: pipeline structure, frame movement &amp; how the call ends</h1>
+  <p class="meta">Comparison of the Go voice pipeline (<code>voicepipelinecore</code>) against pipecat 0.0.108, focused on frame-processor topology, frame directions/ordering, and teardown semantics — and where we still diverge in ways that matter.</p>
+  <p class="meta">Scope: <code>processor.go</code>, <code>pipeline.go</code>, <code>pipeline_edges.go</code>, <code>playback_sink_processor.go</code>, <code>tts_processor.go</code>, the split <code>UserContextAggregator</code>/<code>AssistantContextAggregator</code> pair, and the assembled pipelines in <code>disha/followup_call.go</code> &amp; <code>disha/sales_call.go</code>. pipecat references are to the installed 0.0.108 source.</p>
+</header>
+
+<h2>TL;DR</h2>
+<div class="callout ok">
+  <h4>The goodbye-commit path is now structurally sound and matches pipecat's safety model</h4>
+  <p>Three things together make the final spoken turn commit before teardown, race-free <em>by construction</em>: (1) processors no longer self-cancel when an <code>EndFrame</code> passes through; (2) cleanup is global and only runs after the <code>EndFrame</code> reaches the sink; (3) the assistant aggregator sits at the tail and commits on a <strong>downstream</strong> signal (<code>BotStoppedSpeaking</code>) that is ordered ahead of the <code>EndFrame</code> on the same FIFO path. It also keeps our requirement that we commit the <strong>actually-played</strong> words, not generated text.</p>
+</div>
+<div class="callout warn">
+  <h4>One place still has the original bug's shape: function-call handling travels upstream</h4>
+  <p>Tool-call context (and its persisted chunks) is handled by <code>UserContextAggregator</code> <em>above</em> the LLM, fed by <code>FunctionCall*</code> frames that travel <strong>upstream</strong> — the opposite direction from the <code>EndFrame</code>. It is currently safe only by a large timing margin (1 hop up vs. a long downstream path through TTS+playback), not by ordering. It also opens a "re-run during shutdown" hazard for any future <code>RunLLM=true</code> tool used near end-of-call. Pipecat instead handles tool calls in the tail assistant aggregator (downstream). Relocating ours is the change to prioritize.</p>
+</div>
+
+<h2>1. Pipeline structure</h2>
+<p>The split aggregator pair over one shared, mutex-guarded message list is a faithful port of pipecat's <code>LLMContextAggregatorPair</code> sharing one <code>LLMContext</code>. The assistant aggregator sits at the <strong>tail</strong> (after <code>playback</code>, before <code>sink</code>) — the same slot pipecat uses (after <code>transport.output</code>).</p>
+
+<div class="two">
+  <div class="col go">
+    <h3>vago — <span class="sub">disha/followup_call.go:162</span></h3>
+    <div class="flow">source → audioSource → stt → userIdle →
+  <span class="hl">User()</span> → llm → tts → playback →
+  <span class="hl">Assistant()</span> → sink</div>
+    <p class="legend">sales_call.go is identical with a <code>talkTime</code> stage between <code>User()</code> and <code>llm</code>.</p>
+  </div>
+  <div class="col py">
+    <h3>pipecat — <span class="sub">0.0.108</span></h3>
+    <div class="flow">transport.input → <span class="hlp">user_agg</span> → … →
+  llm → tts → transport.output →
+  <span class="hlp">assistant_agg</span></div>
+    <p class="legend">Same shape: user aggregator above the LLM, assistant aggregator at the tail after the output stage.</p>
+  </div>
+</div>
+
+<p>Frame-propagation mechanics also match: each processor has a priority input (system frames jump the queue) plus an in-order process queue. <code>EndFrame</code> is <code>IsSystem=false</code> (in-order) and <code>IsInterruptible=false</code> — the equivalent of pipecat's <code>ControlFrame + UninterruptibleFrame</code> on <code>EndFrame</code> <span class="ref">(frames.py: EndFrame ≈ line 1877)</span>.</p>
+
+<h2>2. How the call ends — and why the commit is race-free now</h2>
+<p>The earlier teardown race is gone because the design changed in two compounding ways that together reproduce pipecat's guarantee.</p>
+
+<h3>2a. Processors no longer self-cancel on <code>EndFrame</code></h3>
+<p>The base <code>processLoop</code> used to cancel the per-processor context and return the moment it processed an <code>EndFrame</code>. That is removed — processors stay alive until a single global <code>Pipeline.Stop()</code>, which only runs after the <code>EndFrame</code> reaches the sink (<code>PipelineSink → CompleteEnd → runCleanup → Pipeline.Stop</code>). This mirrors pipecat exactly: a base <code>FrameProcessor</code> has <em>no</em> <code>EndFrame</code> branch that stops itself; the <code>PipelineTask</code> drains to the sink and then cleans up globally <span class="ref">(frame_processor.py process_frame; task.py _process_push_queue / _wait_for_pipeline_end)</span>.</p>
+
+<pre><span class="c">// processor.go — processLoop, AFTER the fix (self-cancel removed)</span>
+case env := &lt;-b.procCh:
+    b.self.ProcessFrame(ctx, env.Frame, env.Direction)
+    <span class="c">// (previously: if EndFrame { b.cancel(); return } — gone)</span></pre>
+
+<p>TTS needed a matching tweak: when it forwards the deferred <code>EndFrame</code> it now calls <code>closeTTSConnection()</code> (close the Cartesia socket only) instead of <code>Stop()</code>, so the TTS processor stays alive as a <strong>conduit</strong> for any upstream frames while the output side drains.</p>
+
+<h3>2b. The commit rides the same downstream path as the <code>EndFrame</code></h3>
+<p>For a goodbye that ends the call, <code>playback</code> processes its queue in order and emits, all <strong>downstream</strong> to the tail <code>Assistant()</code> aggregator:</p>
+<pre><span class="c">// playback_sink_processor.go — tick(), in queue order</span>
+played <span class="g">WordTimestampFrame</span> → Downstream   <span class="c">// words, as audio actually plays</span>
+<span class="g">TTSDoneFrame</span>           → Downstream
+Broadcast(<span class="g">BotStoppedSpeakingFrame</span>)        <span class="c">// downstream copy = commit trigger</span>
+<span class="g">EndFrame</span>               → Downstream   <span class="c">// drained AFTER the audio</span></pre>
+<p>So <code>Assistant()</code> receives, in order: played words → <code>BotStoppedSpeaking</code> (commit the played turn) → <code>EndFrame</code> (flush backstop, no-op if already committed) → on to <code>sink</code> (which triggers cleanup). The commit is strictly ahead of the sink on a single FIFO path through one processor — no up-vs-down divergence, so no race. This is the same property pipecat relies on, and it preserves our reconciliation requirement: the committed text is the actually-played words.</p>
+
+<div class="callout ok">
+  <h4>Why this is immune to teardown by construction</h4>
+  <p>The commit is a synchronous mutation of shared state triggered by frames that always reach the tail downstream-in-order; the <code>EndFrame</code> is uninterruptible and ordered behind them; and the dispatcher that persists the chunk is drained during cleanup (<code>callEvents.stopAndDrain()</code>) which runs <em>after</em> the <code>EndFrame</code> passed <code>Assistant()</code>. Pipecat's commit has the identical property (local <code>add_message</code> first, frames pushed after).</p>
+</div>
+
+<h2>3. Frame movement — full direction inventory</h2>
+<p>Legend: <span class="tag t-down">DOWN</span> with the data flow, <span class="tag t-up">UP</span> opposite the data flow, <span class="tag t-bc">BROADCAST</span> both directions.</p>
+
+<table>
+  <thead><tr><th>Frame</th><th>vago direction</th><th>pipecat</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Transcript / LLMMessages / Text / Audio</td><td><span class="tag t-down">DOWN</span></td><td>same</td><td>main data flow</td></tr>
+    <tr><td>Played <code>WordTimestamp</code>, <code>TTSDone</code></td><td><span class="tag t-down">DOWN</span> (playback → Assistant)</td><td>n/a (pipecat commits generated text)</td><td>moved from upstream → downstream; this is what makes the commit safe</td></tr>
+    <tr><td><code>BotStarted/StoppedSpeaking</code></td><td><span class="tag t-bc">BROADCAST</span></td><td>broadcast</td><td>down → Assistant (commit), up → User/userIdle (turn-taking)</td></tr>
+    <tr><td><code>InterruptFrame</code> (barge-in)</td><td><span class="tag t-down">DOWN</span> only</td><td><span class="tag t-bc">BROADCAST</span></td><td>⚠ divergence — see §5</td></tr>
+    <tr><td><code>EndFrame</code></td><td><span class="tag t-down">DOWN</span> from source</td><td>down (converted from upstream <code>EndTaskFrame</code>)</td><td>vago skips the <code>EndTaskFrame</code> hop; same net effect</td></tr>
+    <tr><td><code>ErrorFrame</code></td><td><span class="tag t-up">UP</span> → source</td><td>up</td><td>matches; fatal → end task</td></tr>
+    <tr><td><strong>Function-call frames</strong></td><td><span class="tag t-up">UP</span> (llm → User)</td><td><span class="tag t-down">DOWN</span> (llm → tail assistant agg)</td><td>⚠ major divergence — see §4</td></tr>
+  </tbody>
+</table>
+
+<h2>4. Significant divergence: function-call handling goes the opposite direction from pipecat</h2>
+<p>This is the one to flag hardest, because it is the <strong>same shape as the original goodbye-loss bug</strong>.</p>
+<p>In pipecat the tail assistant aggregator owns <em>all</em> assistant context — text <strong>and</strong> tool calls — and only pushes context <strong>upstream</strong> to re-run the LLM. In vago it is <strong>split</strong>:</p>
+<ul>
+  <li><code>Assistant()</code> (tail) commits the spoken text from downstream played-word frames.</li>
+  <li><code>UserContextAggregator</code> (<em>above</em> the LLM) handles tool calls; <code>FunctionCallInProgress</code>/<code>FunctionCallResult</code> travel <strong>upstream</strong> (<span class="ref">user_context_aggregator.go:264, 271</span>), and the tool-call context mutation + <code>fireToolResultCommitted</code> (chunk persist) depend on those upstream frames.</li>
+</ul>
+
+<div class="callout warn">
+  <h4>Why it's safe today — but not <em>by construction</em></h4>
+  <p>The upstream <code>FunctionCall*</code> frames are <strong>1 hop</strong> (llm → User), while the <code>EndFrame</code> that triggers cleanup is many hops down <em>plus</em> the TTS synthesis wait <em>plus</em> the playback drain. So the tool messages commit with a huge margin before cleanup. It works because of that hop-count asymmetry, not because anything orders the two — exactly the fragile situation we just removed from the spoken-turn commit.</p>
+</div>
+<div class="callout bad">
+  <h4>Related hazard: re-run during shutdown</h4>
+  <p>Because <code>FunctionCall*</code> frames are <strong>unordered</strong> relative to the downstream <code>EndFrame</code>, a <code>FunctionCallResult</code> with <code>RunLLM=true</code> arriving at <code>User()</code> after the <code>EndFrame</code> has passed would push a fresh <code>LLMMessagesFrame</code> downstream and <strong>start another LLM turn during shutdown</strong>. <code>end_call</code> is safe only because its result is <code>RunLLM=false</code>; any future re-running tool used near end-of-call reopens this.</p>
+</div>
+<p><strong>Clean fix (full pipecat parity):</strong> move function-call handling into the tail <code>Assistant()</code> aggregator so those frames flow downstream, in-order with everything else, and have <code>Assistant()</code> push the re-run context upstream (as pipecat does). That collapses the last opposite-direction commit path and removes the shutdown re-run hazard.</p>
+
+<h2>5. Other divergences worth knowing</h2>
+
+<h3>Interruption is downstream-only, not a broadcast</h3>
+<p>vago's barge-in <code>InterruptFrame</code> is a system frame pushed <strong>downstream only</strong> (<span class="ref">user_context_aggregator.go:284</span>); pipecat <strong>broadcasts</strong> it both ways <span class="ref">(frame_processor.py broadcast_interruption)</span>. Downstream reaches llm/tts/playback/Assistant (cancels generation, flushes played words — good), but <code>stt</code>/<code>userIdle</code> <em>above</em> <code>User()</code> never see it. Likely fine (they don't need it), but upstream-side state can't react to a barge-in, which is a behavioral gap vs pipecat.</p>
+
+<h3>Commit trigger = <code>BotStopped</code> (played), not <code>LLMFullResponseEnd</code> (generated)</h3>
+<p>Deliberate and correct for our reconciliation requirement — but note it matches pipecat's <em>deprecated</em> aggregator (commit on <code>BotStoppedSpeaking</code>), not the current universal one (commit generated text on <code>LLMFullResponseEnd</code>). Consequence: on barge-in the <code>InterruptFrame</code> is a <em>system</em> frame and can jump ahead of the last one or two played <code>WordTimestamp</code>s still queued in <code>Assistant()</code>, so the committed barge-in text may be very slightly short. Pipecat's interruption has the same race, so it's consistent — just be aware "played words on interrupt" is best-effort to the last frame.</p>
+
+<h3>End vs Cancel are one frame with a reason, not two frame types</h3>
+<p>pipecat separates graceful <code>EndFrame</code> (drain) from <code>CancelFrame</code> (immediate drop, short-circuits queues). vago overloads <code>EndFrame</code> + <code>shouldStopPlaybackImmediately(reason)</code> at the playback sink (client-disconnect/error ⇒ drop audio, else drain). Functional, but "immediate teardown" is not a first-class, pipeline-wide concept the way pipecat's <code>CancelFrame</code> is — only playback honors the immediacy.</p>
+
+<h3>Minor: dead <code>TTSDoneFrame</code> branch in the user aggregator</h3>
+<p><code>UserContextAggregator</code> still has a <code>TTSDoneFrame</code> case (<span class="ref">user_context_aggregator.go:302</span>), but <code>playback</code> no longer sends <code>TTSDone</code> upstream (it's downstream now), so that branch is unreachable. Back-channel discard now correctly rides the upstream <code>BotStoppedSpeaking</code> broadcast copy instead. Harmless, worth cleaning up.</p>
+
+<h2>6. Teardown-ordering: side-by-side</h2>
+<table>
+  <thead><tr><th>Property</th><th>pipecat 0.0.108</th><th>vago (current)</th><th>Match?</th></tr></thead>
+  <tbody>
+    <tr><td>Processor self-cancels on EndFrame</td><td>No</td><td>No (removed)</td><td>✅</td></tr>
+    <tr><td>EndFrame in-order &amp; uninterruptible</td><td>Yes (Control + Uninterruptible)</td><td>Yes (<code>IsSystem=false</code>, <code>IsInterruptible=false</code>)</td><td>✅</td></tr>
+    <tr><td>Cleanup after EndFrame reaches sink</td><td>Task waits on "reached sink", then cleanup</td><td>Sink reaching EndFrame triggers <code>runCleanup</code></td><td>✅ (equivalent)</td></tr>
+    <tr><td>Final spoken-turn commit vs teardown</td><td>Tail agg commits in-order before sink</td><td>Tail agg commits on downstream <code>BotStopped</code>/<code>EndFrame</code> before sink</td><td>✅ race-free</td></tr>
+    <tr><td>Tool-call context commit vs teardown</td><td>Tail agg, downstream, in-order</td><td>User agg, <strong>upstream</strong> — safe by timing margin only</td><td>⚠ divergent</td></tr>
+    <tr><td>Cancel path (immediate)</td><td>First-class <code>CancelFrame</code></td><td>EndFrame + reason at playback</td><td>⚠ partial</td></tr>
+    <tr><td>Interruption propagation</td><td>Broadcast both ways</td><td>Downstream only</td><td>⚠ divergent</td></tr>
+  </tbody>
+</table>
+
+<h2>7. Bottom line</h2>
+<p>The spoken-turn / goodbye-commit path now matches pipecat's safety model — no self-cancel, drain-to-sink-then-cleanup, commit on a downstream signal ordered ahead of the <code>EndFrame</code> — while keeping played-word reconciliation, which pipecat doesn't do. That class of bug is closed for the assistant text.</p>
+<p>The single remaining place with the original bug's shape is <strong>function-call handling</strong>, which travels upstream into the <code>UserContextAggregator</code>: currently safe by timing margin rather than by construction, and the source of a latent "re-run during shutdown" hazard for any <code>RunLLM=true</code> tool near end-of-call. <strong>Relocating tool-call handling to the tail <code>Assistant()</code> aggregator (downstream, like pipecat) is the change to prioritize</strong> if we want full parity and to retire the class of issue entirely. The rest — downstream-only interrupt, End/Cancel overloading, the dead <code>TTSDone</code> branch — are minor and behaviorally acceptable today.</p>
+
+<hr>
+<p class="sub">References — vago: <code>voicepipelinecore/{processor,pipeline,pipeline_edges,playback_sink_processor,tts_processor,user_context_aggregator,assistant_context_aggregator,aggregator_pair,aggregator_shared_state}.go</code>, <code>disha/{followup_call,sales_call}.go</code>. pipecat 0.0.108: <code>processors/frame_processor.py</code>, <code>frames/frames.py</code>, <code>pipeline/task.py</code>, <code>processors/aggregators/llm_response_universal.py</code>, <code>transports/base_output.py</code>.</p>
+
+</div>
+</body>
+</html>
