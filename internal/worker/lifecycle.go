@@ -1,11 +1,16 @@
-package disha
+package worker
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/jaideep329/talk-go/disha"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -21,7 +26,7 @@ type WorkerPodRegistration struct {
 	AppName string
 }
 
-func RegisterWorkerPod(ctx context.Context, deps Deps, reg WorkerPodRegistration) error {
+func RegisterWorkerPod(ctx context.Context, deps disha.Deps, reg WorkerPodRegistration) error {
 	if deps.Redis == nil {
 		return errors.New("disha: Redis dependency is required")
 	}
@@ -44,7 +49,7 @@ func RegisterWorkerPod(ctx context.Context, deps Deps, reg WorkerPodRegistration
 
 	// Match Disha's worker registration order: enqueue the DB work first,
 	// then write the Redis idempotency key so a failed enqueue can retry.
-	if err := deps.API.EnqueueJob(ctx, EnqueueJobRequest{
+	if err := deps.API.EnqueueJob(ctx, disha.EnqueueJobRequest{
 		ModuleName: "bots.gke_pod_manager",
 		FuncName:   "register_worker_pod_db_ops",
 		Kwargs: map[string]any{
@@ -86,14 +91,14 @@ func RegisterWorkerPod(ctx context.Context, deps Deps, reg WorkerPodRegistration
 	return nil
 }
 
-func EnqueueWorkerCleanup(ctx context.Context, deps Deps, podName string) error {
+func EnqueueWorkerCleanup(ctx context.Context, deps disha.Deps, podName string) error {
 	if deps.API == nil {
 		return errors.New("disha: API dependency is required")
 	}
 	if podName == "" {
 		return errors.New("disha: pod_name is required")
 	}
-	if err := deps.API.EnqueueJob(ctx, EnqueueJobRequest{
+	if err := deps.API.EnqueueJob(ctx, disha.EnqueueJobRequest{
 		ModuleName: "bots.signal_handler",
 		FuncName:   "cleanup_state",
 		Kwargs: map[string]any{
@@ -116,7 +121,7 @@ func EnqueueWorkerCleanup(ctx context.Context, deps Deps, podName string) error 
 	return nil
 }
 
-func EnqueueWorkerGracefulShutdown(ctx context.Context, deps Deps, podName string) error {
+func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName string) error {
 	if deps.Redis == nil {
 		return errors.New("disha: Redis dependency is required")
 	}
@@ -139,7 +144,7 @@ func EnqueueWorkerGracefulShutdown(ctx context.Context, deps Deps, podName strin
 		})
 		return err
 	}
-	if err := deps.API.EnqueueJob(ctx, EnqueueJobRequest{
+	if err := deps.API.EnqueueJob(ctx, disha.EnqueueJobRequest{
 		ModuleName: "bots.signal_handler",
 		FuncName:   "on_graceful_shutdown_initiated",
 		Kwargs: map[string]any{
@@ -168,4 +173,82 @@ func workerRegistrationKey(podName, podUID string) string {
 
 func workerSigtermKey(podName string) string {
 	return fmt.Sprintf("pod_sigterm:%s", podName)
+}
+
+func (r *Runtime) RegisterWorkerPodIfConfigured() {
+	reg, ok, err := PodRegistrationFromEnv()
+	if err != nil {
+		sentryutil.Capture(sentryutil.Event{
+			Err:  err,
+			Tags: map[string]string{"component": "worker_registration"},
+		})
+		log.Fatal("worker registration config error:", err)
+	}
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := RegisterWorkerPod(ctx, r.deps, reg); err != nil {
+		sentryutil.Capture(sentryutil.Event{
+			Err:  err,
+			Tags: map[string]string{"component": "worker_registration"},
+			Details: map[string]any{
+				"pod_name": reg.PodName,
+				"pod_uid":  reg.PodUID,
+			},
+		})
+		log.Fatal("worker pod registration failed:", err)
+	}
+	log.Printf("registered worker pod: pod_name=%s app_name=%s\n", reg.PodName, reg.AppName)
+}
+
+func PodRegistrationFromEnv() (WorkerPodRegistration, bool, error) {
+	podName := strings.TrimSpace(os.Getenv("HOSTNAME"))
+	podUID := strings.TrimSpace(os.Getenv("POD_UID"))
+	appName := strings.TrimSpace(os.Getenv("GKE_DEPLOYMENT_NAME"))
+	if podName == "" || podUID == "" || appName == "" {
+		return WorkerPodRegistration{}, false, nil
+	}
+	podIP := strings.TrimSpace(os.Getenv("POD_IP"))
+	if podIP == "" {
+		var err error
+		podIP, err = detectPodIP()
+		if err != nil {
+			return WorkerPodRegistration{}, false, err
+		}
+	}
+	return WorkerPodRegistration{
+		PodIP:   podIP,
+		PodName: podName,
+		PodUID:  podUID,
+		AppName: appName,
+	}, true, nil
+}
+
+func detectPodIP() (string, error) {
+	hostname, err := os.Hostname()
+	if err == nil && hostname != "" {
+		if ips, lookupErr := net.LookupIP(hostname); lookupErr == nil {
+			for _, ip := range ips {
+				if v4 := ip.To4(); v4 != nil && !v4.IsLoopback() {
+					return v4.String(), nil
+				}
+			}
+		}
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if v4 := ipNet.IP.To4(); v4 != nil && !v4.IsLoopback() {
+			return v4.String(), nil
+		}
+	}
+	return "", errors.New("no non-loopback pod IP found")
 }

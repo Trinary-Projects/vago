@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jaideep329/talk-go/internal/perfdiag"
+	"github.com/jaideep329/talk-go/internal/perf"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -148,7 +148,7 @@ func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskC
 		return nil, fmt.Errorf("daily bridge stderr: %w", err)
 	}
 
-	perfDiagEnabled := perfdiag.Enabled()
+	perfDiagEnabled := perf.Enabled()
 	room := &DailyRoom{
 		roomURL:     roomURL,
 		roomName:    dailyRoomNameFromURL(roomURL),

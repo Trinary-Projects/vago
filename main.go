@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,7 +14,9 @@ import (
 
 	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/disha"
+	"github.com/jaideep329/talk-go/internal/perf"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
+	"github.com/jaideep329/talk-go/internal/worker"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
@@ -23,7 +24,6 @@ var (
 	sessions   = map[string]*voicepipelinecore.PipelineTask{}
 	sessionsMu sync.Mutex
 	dishaDeps  disha.Deps
-	worker     workerRuntime
 )
 
 func main() {
@@ -37,7 +37,7 @@ func main() {
 	appLog, _ := os.Create("app.log")
 	log.SetOutput(io.MultiWriter(os.Stderr, appLog))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	stopPyroscope := startPyroscopeIfEnabled()
+	stopPyroscope := perf.StartPyroscopeIfEnabled()
 	defer stopPyroscope()
 	if dsn := strings.TrimSpace(os.Getenv("SENTRY_DSN")); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{
@@ -53,19 +53,14 @@ func main() {
 	} else {
 		log.Println("sentry disabled: SENTRY_DSN is empty")
 	}
-	defer reportAbruptShutdownOnExit()
 	defer sentry.Flush(2 * time.Second)
 	dishaDeps = newDishaDeps()
 	defer closeDishaDeps(dishaDeps)
-	registerCleanupHandlers()
-	registerWorkerPodIfConfigured()
-	http.HandleFunc("/bot/create_worker_room", requireMethod(http.MethodPost, handleCreateWorkerRoom))
-	http.HandleFunc("/bot/has_active_session", requireMethod(http.MethodGet, handleHasActiveSession))
-	http.HandleFunc("/bot/health_check", requireMethod(http.MethodGet, handleHealthCheck))
-	http.HandleFunc("/bot/readiness_check", requireMethod(http.MethodGet, handleReadinessCheck))
-	http.HandleFunc("/bot/pre_stop_check", requireMethod(http.MethodGet, handleHealthCheck))
-	http.HandleFunc("/bot/mark_machine_reserved", requireMethod(http.MethodPost, handleMarkMachineReserved))
-	http.HandleFunc("/bot/trigger_exit", requireMethod(http.MethodPost, handleTriggerExit))
+	workerRuntime := worker.NewRuntime(dishaDeps, prepareTask)
+	defer workerRuntime.ReportAbruptShutdownOnExit()
+	workerRuntime.RegisterSignalHandlers()
+	workerRuntime.RegisterWorkerPodIfConfigured()
+	workerRuntime.RegisterRoutes(http.DefaultServeMux)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/daily-client.html":
@@ -90,19 +85,10 @@ func main() {
 		exitCode = 1
 		return
 	}
-	markGracefulShutdownCompleted()
+	workerRuntime.MarkGracefulShutdownCompleted()
 }
 
-type botTaskLaunchRequest struct {
-	ConversationID string `json:"conversation_id"`
-	BotType        string `json:"bot_type"`
-	RoomURL        string `json:"room_url"`
-	RoomName       string `json:"room_name"`
-	Token          string `json:"token"`
-	BotToken       string `json:"bot_token"`
-}
-
-func buildBotTask(ctx context.Context, req botTaskLaunchRequest) (*voicepipelinecore.PipelineTask, error) {
+func buildBotTask(ctx context.Context, req worker.TaskLaunchRequest) (*voicepipelinecore.PipelineTask, error) {
 	if req.RoomURL == "" {
 		return nil, errors.New("room_url is required")
 	}
@@ -129,7 +115,7 @@ func buildBotTask(ctx context.Context, req botTaskLaunchRequest) (*voicepipeline
 	}, dishaDeps)
 }
 
-func prepareTask(ctx context.Context, req botTaskLaunchRequest, onCleanup func(*voicepipelinecore.PipelineTask)) (*voicepipelinecore.PipelineTask, error) {
+func prepareTask(ctx context.Context, req worker.TaskLaunchRequest, onCleanup func(*voicepipelinecore.PipelineTask)) (*voicepipelinecore.PipelineTask, error) {
 	task, err := buildBotTask(ctx, req)
 	if err != nil {
 		return nil, err
@@ -186,7 +172,7 @@ func newDishaDeps() disha.Deps {
 		Documents:    disha.NewDocumentStore(redis, logger),
 		PhoneticDict: phonetic,
 		S3:           disha.NewS3GetClientFromEnv(logger, "AWS_BUCKET_NAME", "AWS_MAIN_REGION"),
-		GKEPatcher:   disha.NewGKEPodPatcher(logger),
+		GKEPatcher:   worker.NewGKEPodPatcher(logger),
 	}
 }
 
@@ -250,84 +236,6 @@ func loadEnv(path string) {
 			}
 		}
 	}
-}
-
-func registerWorkerPodIfConfigured() {
-	reg, ok, err := workerPodRegistrationFromEnv()
-	if err != nil {
-		sentryutil.Capture(sentryutil.Event{
-			Err:  err,
-			Tags: map[string]string{"component": "worker_registration"},
-		})
-		log.Fatal("worker registration config error:", err)
-	}
-	if !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := disha.RegisterWorkerPod(ctx, dishaDeps, reg); err != nil {
-		sentryutil.Capture(sentryutil.Event{
-			Err:  err,
-			Tags: map[string]string{"component": "worker_registration"},
-			Details: map[string]any{
-				"pod_name": reg.PodName,
-				"pod_uid":  reg.PodUID,
-			},
-		})
-		log.Fatal("worker pod registration failed:", err)
-	}
-	log.Printf("registered worker pod: pod_name=%s app_name=%s\n", reg.PodName, reg.AppName)
-}
-
-func workerPodRegistrationFromEnv() (disha.WorkerPodRegistration, bool, error) {
-	podName := strings.TrimSpace(os.Getenv("HOSTNAME"))
-	podUID := strings.TrimSpace(os.Getenv("POD_UID"))
-	appName := strings.TrimSpace(os.Getenv("GKE_DEPLOYMENT_NAME"))
-	if podName == "" || podUID == "" || appName == "" {
-		return disha.WorkerPodRegistration{}, false, nil
-	}
-	podIP := strings.TrimSpace(os.Getenv("POD_IP"))
-	if podIP == "" {
-		var err error
-		podIP, err = detectPodIP()
-		if err != nil {
-			return disha.WorkerPodRegistration{}, false, err
-		}
-	}
-	return disha.WorkerPodRegistration{
-		PodIP:   podIP,
-		PodName: podName,
-		PodUID:  podUID,
-		AppName: appName,
-	}, true, nil
-}
-
-func detectPodIP() (string, error) {
-	hostname, err := os.Hostname()
-	if err == nil && hostname != "" {
-		if ips, lookupErr := net.LookupIP(hostname); lookupErr == nil {
-			for _, ip := range ips {
-				if v4 := ip.To4(); v4 != nil && !v4.IsLoopback() {
-					return v4.String(), nil
-				}
-			}
-		}
-	}
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", err
-	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		if v4 := ipNet.IP.To4(); v4 != nil && !v4.IsLoopback() {
-			return v4.String(), nil
-		}
-	}
-	return "", errors.New("no non-loopback pod IP found")
 }
 
 func firstNonEmpty(values ...string) string {

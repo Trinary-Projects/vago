@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"context"
@@ -10,11 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jaideep329/talk-go/disha"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
-type workerRuntime struct {
+type workerState struct {
 	mu                   sync.Mutex
 	active               bool
 	reserved             bool
@@ -40,45 +39,45 @@ const (
 // success rather than spawning a second bot. The returned id is the
 // conversation currently holding the worker (useful when the outcome is a
 // conflict).
-func (w *workerRuntime) claim(conversationID string) (claimOutcome, string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.active {
-		if w.activeConversationID == conversationID {
-			return claimDuplicate, w.activeConversationID
+func (s *workerState) claim(conversationID string) (claimOutcome, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		if s.activeConversationID == conversationID {
+			return claimDuplicate, s.activeConversationID
 		}
-		return claimConflict, w.activeConversationID
+		return claimConflict, s.activeConversationID
 	}
-	w.active = true
-	w.activeConversationID = conversationID
+	s.active = true
+	s.activeConversationID = conversationID
 	return claimGranted, conversationID
 }
 
-func (w *workerRuntime) setTask(task *voicepipelinecore.PipelineTask) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.task = task
+func (s *workerState) setTask(task *voicepipelinecore.PipelineTask) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.task = task
 }
 
-func (w *workerRuntime) finish() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.active = false
-	w.reserved = false
-	w.task = nil
-	w.activeConversationID = ""
+func (s *workerState) finish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active = false
+	s.reserved = false
+	s.task = nil
+	s.activeConversationID = ""
 }
 
-func (w *workerRuntime) markReserved() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.reserved = true
+func (s *workerState) markReserved() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserved = true
 }
 
-func (w *workerRuntime) snapshot() (active, reserved bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.active, w.reserved
+func (s *workerState) snapshot() (active, reserved bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active, s.reserved
 }
 
 type workerRoomRequest struct {
@@ -90,22 +89,35 @@ type workerRoomRequest struct {
 	BotWorkerType  string `json:"bot_worker_type"`
 }
 
-func handleCreateWorkerRoom(w http.ResponseWriter, r *http.Request) {
-	var req workerRoomRequest
-	if !decodeJSONRequest(w, r, &req) {
+func (r *Runtime) RegisterRoutes(mux *http.ServeMux) {
+	if mux == nil {
+		mux = http.DefaultServeMux
+	}
+	mux.HandleFunc("/bot/create_worker_room", requireMethod(http.MethodPost, r.handleCreateWorkerRoom))
+	mux.HandleFunc("/bot/has_active_session", requireMethod(http.MethodGet, r.handleHasActiveSession))
+	mux.HandleFunc("/bot/health_check", requireMethod(http.MethodGet, r.handleHealthCheck))
+	mux.HandleFunc("/bot/readiness_check", requireMethod(http.MethodGet, r.handleReadinessCheck))
+	mux.HandleFunc("/bot/pre_stop_check", requireMethod(http.MethodGet, r.handleHealthCheck))
+	mux.HandleFunc("/bot/mark_machine_reserved", requireMethod(http.MethodPost, r.handleMarkMachineReserved))
+	mux.HandleFunc("/bot/trigger_exit", requireMethod(http.MethodPost, r.handleTriggerExit))
+}
+
+func (r *Runtime) handleCreateWorkerRoom(w http.ResponseWriter, req *http.Request) {
+	var roomReq workerRoomRequest
+	if !decodeJSONRequest(w, req, &roomReq) {
 		return
 	}
 
-	outcome, activeID := worker.claim(req.ConversationID)
+	outcome, activeID := r.state.claim(roomReq.ConversationID)
 	switch outcome {
 	case claimDuplicate:
-		// Retried request for the conversation we are already handling — the
+		// Retried request for the conversation we are already handling - the
 		// forwarder re-sent it after a slow response. Treat as success instead
 		// of returning a conflict that would drop the call.
-		log.Printf("duplicate create_worker_room request for conversation=%s, treating as success\n", req.ConversationID)
+		log.Printf("duplicate create_worker_room request for conversation=%s, treating as success\n", roomReq.ConversationID)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":   "success",
-			"room_url": req.RoomURL,
+			"room_url": roomReq.RoomURL,
 		})
 		return
 	case claimConflict:
@@ -121,11 +133,11 @@ func handleCreateWorkerRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// claimGranted: we now own the worker — launch the bot.
-	go runWorkerRoom(req)
+	// claimGranted: we now own the worker - launch the bot.
+	go r.runWorkerRoom(roomReq)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":   "success",
-		"room_url": req.RoomURL,
+		"room_url": roomReq.RoomURL,
 	})
 }
 
@@ -143,17 +155,17 @@ func (r *workerRoomRequest) normalize() {
 
 func (r workerRoomRequest) validate() error {
 	fields := []requiredField{
-		requiredField{Name: "room_url", Value: r.RoomURL},
-		requiredField{Name: "token", Value: r.Token},
-		requiredField{Name: "conversation_id", Value: r.ConversationID},
-		requiredField{Name: "bot_worker_type", Value: r.BotWorkerType},
-		requiredField{Name: "room_name", Value: r.RoomName},
+		{Name: "room_url", Value: r.RoomURL},
+		{Name: "token", Value: r.Token},
+		{Name: "conversation_id", Value: r.ConversationID},
+		{Name: "bot_worker_type", Value: r.BotWorkerType},
+		{Name: "room_name", Value: r.RoomName},
 	}
 	return requireFields(fields...)
 }
 
-func (r workerRoomRequest) botTaskRequest() botTaskLaunchRequest {
-	return botTaskLaunchRequest{
+func (r workerRoomRequest) taskLaunchRequest() TaskLaunchRequest {
+	return TaskLaunchRequest{
 		ConversationID: r.ConversationID,
 		BotType:        r.BotWorkerType,
 		RoomURL:        r.RoomURL,
@@ -171,35 +183,40 @@ func (e *missingFieldsError) Error() string {
 	return "Missing required parameters: " + strings.Join(e.fields, ", ")
 }
 
-func runWorkerRoom(req workerRoomRequest) {
+func (r *Runtime) runWorkerRoom(req workerRoomRequest) {
 	// Pin the pod against autoscaler eviction for the lifetime of the
 	// call. This mirrors Python `BotWorkerManager.create_bot_task`
 	// which calls `set_safe_to_evict(pod_name, safe_to_evict=False)`
 	// right before launching the bot. It's idempotent with the pin done
 	// at reservation time.
-	pinPodAgainstEviction()
+	r.pinPodAgainstEviction()
 
-	task, err := prepareTask(context.Background(), req.botTaskRequest(), func(*voicepipelinecore.PipelineTask) {
-		unpinPodAfterCall()
-		finishWorkerAndQueueCleanup()
+	if r.starter == nil {
+		log.Printf("worker task failed to start conversation=%s: task starter is not configured\n", req.ConversationID)
+		r.unpinPodAfterCall()
+		r.finishWorkerAndQueueCleanup()
+		return
+	}
+	task, err := r.starter(context.Background(), req.taskLaunchRequest(), func(*voicepipelinecore.PipelineTask) {
+		r.unpinPodAfterCall()
+		r.finishWorkerAndQueueCleanup()
 	})
 	if err != nil {
 		log.Printf("worker task failed to start conversation=%s: %v\n", req.ConversationID, err)
-		unpinPodAfterCall()
-		finishWorkerAndQueueCleanup()
+		r.unpinPodAfterCall()
+		r.finishWorkerAndQueueCleanup()
 		return
 	}
-	worker.setTask(task)
+	r.state.setTask(task)
 	log.Printf("worker task started conversation=%s session=%s\n", req.ConversationID, task.SessionID)
 	task.Start()
 }
 
-// pinPodAgainstEviction best-effort sets the GKE safe-to-evict
-// annotation to "false" so the cluster autoscaler can't evict the pod
-// while it is reserved or running a call. Logs failures and otherwise
-// no-ops outside Kubernetes.
-func pinPodAgainstEviction() {
-	if dishaDeps.GKEPatcher == nil {
+// pinPodAgainstEviction best-effort sets the GKE safe-to-evict annotation to
+// "false" so the cluster autoscaler can't evict the pod while it is reserved
+// or running a call. Logs failures and otherwise no-ops outside Kubernetes.
+func (r *Runtime) pinPodAgainstEviction() {
+	if r.deps.GKEPatcher == nil {
 		return
 	}
 	podName := strings.TrimSpace(os.Getenv("HOSTNAME"))
@@ -208,16 +225,16 @@ func pinPodAgainstEviction() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := dishaDeps.GKEPatcher.SetSafeToEvict(ctx, podName, false); err != nil {
+	if err := r.deps.GKEPatcher.SetSafeToEvict(ctx, podName, false); err != nil {
 		log.Printf("failed to set safe-to-evict=false on pod=%s: %v\n", podName, err)
 	}
 }
 
-// unpinPodAfterCall restores safe-to-evict so the pod can be reaped
-// after Disha's cleanup_state job tears it down. Failures are logged
-// but never block the cleanup path.
-func unpinPodAfterCall() {
-	if dishaDeps.GKEPatcher == nil {
+// unpinPodAfterCall restores safe-to-evict so the pod can be reaped after
+// Disha's cleanup_state job tears it down. Failures are logged but never block
+// the cleanup path.
+func (r *Runtime) unpinPodAfterCall() {
+	if r.deps.GKEPatcher == nil {
 		return
 	}
 	podName := strings.TrimSpace(os.Getenv("HOSTNAME"))
@@ -226,26 +243,26 @@ func unpinPodAfterCall() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := dishaDeps.GKEPatcher.SetSafeToEvict(ctx, podName, true); err != nil {
+	if err := r.deps.GKEPatcher.SetSafeToEvict(ctx, podName, true); err != nil {
 		log.Printf("failed to set safe-to-evict=true on pod=%s: %v\n", podName, err)
 	}
 }
 
-func finishWorkerAndQueueCleanup() {
-	worker.finish()
+func (r *Runtime) finishWorkerAndQueueCleanup() {
+	r.state.finish()
 	podName := strings.TrimSpace(os.Getenv("HOSTNAME"))
 	if podName == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := disha.EnqueueWorkerCleanup(ctx, dishaDeps, podName); err != nil {
+	if err := EnqueueWorkerCleanup(ctx, r.deps, podName); err != nil {
 		log.Printf("failed to enqueue worker cleanup for pod=%s: %v\n", podName, err)
 	}
 }
 
-func handleHasActiveSession(w http.ResponseWriter, r *http.Request) {
-	active, _ := worker.snapshot()
+func (r *Runtime) handleHasActiveSession(w http.ResponseWriter, req *http.Request) {
+	active, _ := r.state.snapshot()
 	activeSessions := 0
 	if active {
 		activeSessions = 1
@@ -256,12 +273,12 @@ func handleHasActiveSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+func (r *Runtime) handleHealthCheck(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
 }
 
-func handleReadinessCheck(w http.ResponseWriter, r *http.Request) {
-	active, reserved := worker.snapshot()
+func (r *Runtime) handleReadinessCheck(w http.ResponseWriter, req *http.Request) {
+	active, reserved := r.state.snapshot()
 	if active || reserved {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"status": "not ready",
@@ -272,22 +289,22 @@ func handleReadinessCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func handleMarkMachineReserved(w http.ResponseWriter, r *http.Request) {
-	worker.markReserved()
-	// Pin the pod as soon as it is reserved — Disha reserves several
+func (r *Runtime) handleMarkMachineReserved(w http.ResponseWriter, req *http.Request) {
+	r.state.markReserved()
+	// Pin the pod as soon as it is reserved - Disha reserves several
 	// seconds before the user joins, and an autoscaler scale-down in
 	// that window would kill the pod before the call starts. Mirrors
 	// Python `mark_machine_reserved`, which also flips safe-to-evict to
 	// false. The matching unpin happens on call cleanup.
-	pinPodAgainstEviction()
+	r.pinPodAgainstEviction()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
-func handleTriggerExit(w http.ResponseWriter, r *http.Request) {
+func (r *Runtime) handleTriggerExit(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		os.Exit(0)
+		r.exitProcess(0)
 	}()
 }
 
@@ -302,22 +319,22 @@ type requiredField struct {
 }
 
 func requireMethod(method string, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != method {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != method {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		next(w, r)
+		next(w, req)
 	}
 }
 
-func decodeJSONRequest(w http.ResponseWriter, r *http.Request, req validatedJSONRequest) bool {
-	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+func decodeJSONRequest(w http.ResponseWriter, req *http.Request, body validatedJSONRequest) bool {
+	if err := json.NewDecoder(req.Body).Decode(body); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return false
 	}
-	req.normalize()
-	if err := req.validate(); err != nil {
+	body.normalize()
+	if err := body.validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return false
 	}

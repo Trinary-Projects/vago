@@ -1,4 +1,4 @@
-package main
+package perf
 
 import (
 	"log"
@@ -6,11 +6,10 @@ import (
 	"strings"
 
 	"github.com/grafana/pyroscope-go"
-	"github.com/jaideep329/talk-go/internal/perfdiag"
 )
 
-func startPyroscopeIfEnabled() func() {
-	if !perfdiag.Enabled() {
+func StartPyroscopeIfEnabled() func() {
+	if !Enabled() {
 		log.Println("performance diagnostics disabled")
 		return func() {}
 	}
@@ -76,4 +75,13 @@ func pyroscopeEnv() string {
 		os.Getenv("ENVIRONMENT"),
 		os.Getenv("SENTRY_ENVIRONMENT"),
 	)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

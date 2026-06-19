@@ -1,4 +1,4 @@
-package perfdiag
+package perf
 
 import (
 	"os"

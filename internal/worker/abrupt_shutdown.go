@@ -1,28 +1,22 @@
-package main
+package worker
 
 import (
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
-var (
-	gracefulShutdownCompleted atomic.Bool
-	abruptShutdownReported    atomic.Bool
-)
-
-func markGracefulShutdownCompleted() {
-	gracefulShutdownCompleted.Store(true)
+func (r *Runtime) MarkGracefulShutdownCompleted() {
+	r.gracefulShutdownComplete.Store(true)
 }
 
-func reportAbruptShutdownOnExit() {
-	if gracefulShutdownCompleted.Load() || !abruptShutdownReported.CompareAndSwap(false, true) {
+func (r *Runtime) ReportAbruptShutdownOnExit() {
+	if r.gracefulShutdownComplete.Load() || !r.abruptShutdownReported.CompareAndSwap(false, true) {
 		return
 	}
 	identifier := strings.TrimSpace(os.Getenv("FLY_MACHINE_ID"))

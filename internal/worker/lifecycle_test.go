@@ -1,16 +1,18 @@
-package disha
+package worker
 
 import (
 	"context"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/jaideep329/talk-go/disha"
 )
 
 func TestRegisterWorkerPodEnqueuesDBOpsAndSetsRegistrationKey(t *testing.T) {
 	_, redisClient := newRedisTestClient(t)
-	apiServer, apiRecorder := newCallAPIServer(t)
-	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	apiServer, apiRecorder := newWorkerAPIServer(t)
+	api := disha.NewAPIClient(apiServer.URL, 10*time.Second, nil)
 
 	err := RegisterWorkerPod(context.Background(), testDeps(redisClient, api), WorkerPodRegistration{
 		PodIP:   "10.1.2.3",
@@ -52,8 +54,8 @@ func TestRegisterWorkerPodEnqueuesDBOpsAndSetsRegistrationKey(t *testing.T) {
 
 func TestRegisterWorkerPodSkipsAlreadyRegisteredPod(t *testing.T) {
 	_, redisClient := newRedisTestClient(t)
-	apiServer, apiRecorder := newCallAPIServer(t)
-	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	apiServer, apiRecorder := newWorkerAPIServer(t)
+	api := disha.NewAPIClient(apiServer.URL, 10*time.Second, nil)
 	if err := redisClient.SetCache(context.Background(), workerRegistrationKey("pod-1", "uid-1"), true, time.Hour); err != nil {
 		t.Fatalf("SetCache registration key: %v", err)
 	}
@@ -73,10 +75,10 @@ func TestRegisterWorkerPodSkipsAlreadyRegisteredPod(t *testing.T) {
 }
 
 func TestEnqueueWorkerCleanup(t *testing.T) {
-	apiServer, apiRecorder := newCallAPIServer(t)
-	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	apiServer, apiRecorder := newWorkerAPIServer(t)
+	api := disha.NewAPIClient(apiServer.URL, 10*time.Second, nil)
 
-	if err := EnqueueWorkerCleanup(context.Background(), Deps{API: api}, "pod-1"); err != nil {
+	if err := EnqueueWorkerCleanup(context.Background(), disha.Deps{API: api}, "pod-1"); err != nil {
 		t.Fatalf("EnqueueWorkerCleanup: %v", err)
 	}
 
@@ -99,8 +101,8 @@ func TestEnqueueWorkerCleanup(t *testing.T) {
 
 func TestEnqueueWorkerGracefulShutdownSetsSigtermKeyAndEnqueuesJob(t *testing.T) {
 	_, redisClient := newRedisTestClient(t)
-	apiServer, apiRecorder := newCallAPIServer(t)
-	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	apiServer, apiRecorder := newWorkerAPIServer(t)
+	api := disha.NewAPIClient(apiServer.URL, 10*time.Second, nil)
 
 	if err := EnqueueWorkerGracefulShutdown(context.Background(), testDeps(redisClient, api), "pod-1"); err != nil {
 		t.Fatalf("EnqueueWorkerGracefulShutdown: %v", err)

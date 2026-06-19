@@ -20,7 +20,7 @@ import (
 	pionmedia "github.com/pion/webrtc/v4/pkg/media"
 	"gopkg.in/hraban/opus.v2"
 
-	"github.com/jaideep329/talk-go/internal/perfdiag"
+	"github.com/jaideep329/talk-go/internal/perf"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -127,7 +127,7 @@ func startLiveKitRoomAttempt(roomURL, roomName, token string, taskCtx *TaskConte
 		taskCtx:     taskCtx,
 		audioSource: audioSource,
 		outCodec:    outCodec,
-		perfDiag:    perfdiag.Enabled(),
+		perfDiag:    perf.Enabled(),
 		closedCh:    make(chan struct{}),
 		tracks:      make(map[string]*lkpcm.PCMRemoteTrack),
 	}

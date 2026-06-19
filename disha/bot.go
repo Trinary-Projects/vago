@@ -15,7 +15,11 @@ type Deps struct {
 	Documents    *DocumentStore
 	PhoneticDict *PhoneticDict
 	S3           S3GetClient
-	GKEPatcher   *GKEPodPatcher
+	GKEPatcher   GKEPatcher
+}
+
+type GKEPatcher interface {
+	SetSafeToEvict(ctx context.Context, podName string, safe bool) error
 }
 
 // BotTaskRequest carries everything a bot needs to assemble and join a

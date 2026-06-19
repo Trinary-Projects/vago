@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"context"
@@ -6,41 +6,36 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/getsentry/sentry-go"
-	"github.com/jaideep329/talk-go/disha"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
-var shutdownInitiated atomic.Bool
-var exitProcess = os.Exit
-
-func registerCleanupHandlers() {
+func (r *Runtime) RegisterSignalHandlers() {
 	log.Println("Registering cleanup handlers...")
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		for sig := range signals {
-			handleShutdownSignal(sig)
+			r.HandleShutdownSignal(sig)
 		}
 	}()
 }
 
-func handleShutdownSignal(sig os.Signal) {
-	if !shutdownInitiated.CompareAndSwap(false, true) {
+func (r *Runtime) HandleShutdownSignal(sig os.Signal) {
+	if !r.shutdownInitiated.CompareAndSwap(false, true) {
 		log.Printf("Received duplicate %s, ignoring (shutdown already in progress)...\n", sig)
 		return
 	}
 
-	markGracefulShutdownCompleted()
+	r.MarkGracefulShutdownCompleted()
 	log.Printf("Received %s, checking worker status...\n", sig)
 
 	if sig == syscall.SIGINT || sig == os.Interrupt {
 		sentry.Flush(2 * time.Second)
-		exitProcess(0)
+		r.exitProcess(0)
 		return
 	}
 
@@ -48,14 +43,14 @@ func handleShutdownSignal(sig os.Signal) {
 	if podName == "" {
 		log.Println("HOSTNAME is empty; skipping worker graceful shutdown enqueue")
 		sentry.Flush(2 * time.Second)
-		exitProcess(0)
+		r.exitProcess(0)
 		return
 	}
 
 	log.Println("Allowing graceful shutdown to proceed...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := disha.EnqueueWorkerGracefulShutdown(ctx, dishaDeps, podName); err != nil {
+	if err := EnqueueWorkerGracefulShutdown(ctx, r.deps, podName); err != nil {
 		sentryutil.Capture(sentryutil.Event{
 			Err:  err,
 			Tags: map[string]string{"component": "signal_handler"},

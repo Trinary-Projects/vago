@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"encoding/json"
@@ -6,25 +6,25 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jaideep329/talk-go/disha"
 )
 
-func resetWorkerForTest(t *testing.T) {
-	t.Helper()
-	worker.finish()
-	t.Cleanup(func() {
-		worker.finish()
-	})
+func newTestRuntime() *Runtime {
+	rt := NewRuntime(disha.Deps{}, nil)
+	rt.exitProcess = func(int) {}
+	return rt
 }
 
-func TestWorkerPodRegistrationFromEnv(t *testing.T) {
+func TestPodRegistrationFromEnv(t *testing.T) {
 	t.Setenv("HOSTNAME", "pod-1")
 	t.Setenv("POD_UID", "uid-1")
 	t.Setenv("GKE_DEPLOYMENT_NAME", "sales-worker")
 	t.Setenv("POD_IP", "10.1.2.3")
 
-	reg, ok, err := workerPodRegistrationFromEnv()
+	reg, ok, err := PodRegistrationFromEnv()
 	if err != nil {
-		t.Fatalf("workerPodRegistrationFromEnv: %v", err)
+		t.Fatalf("PodRegistrationFromEnv: %v", err)
 	}
 	if !ok {
 		t.Fatal("ok = false, want true")
@@ -34,15 +34,15 @@ func TestWorkerPodRegistrationFromEnv(t *testing.T) {
 	}
 }
 
-func TestWorkerPodRegistrationFromEnvSkipsLocalWhenIncomplete(t *testing.T) {
+func TestPodRegistrationFromEnvSkipsLocalWhenIncomplete(t *testing.T) {
 	t.Setenv("HOSTNAME", "pod-1")
 	t.Setenv("POD_UID", "")
 	t.Setenv("GKE_DEPLOYMENT_NAME", "sales-worker")
 	t.Setenv("POD_IP", "10.1.2.3")
 
-	_, ok, err := workerPodRegistrationFromEnv()
+	_, ok, err := PodRegistrationFromEnv()
 	if err != nil {
-		t.Fatalf("workerPodRegistrationFromEnv: %v", err)
+		t.Fatalf("PodRegistrationFromEnv: %v", err)
 	}
 	if ok {
 		t.Fatal("ok = true, want false")
@@ -50,14 +50,14 @@ func TestWorkerPodRegistrationFromEnvSkipsLocalWhenIncomplete(t *testing.T) {
 }
 
 func TestHandleHasActiveSession(t *testing.T) {
-	resetWorkerForTest(t)
-	if outcome, _ := worker.claim("conv-active"); outcome != claimGranted {
+	rt := newTestRuntime()
+	if outcome, _ := rt.state.claim("conv-active"); outcome != claimGranted {
 		t.Fatal("claim did not grant idle worker")
 	}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/bot/has_active_session", nil)
-	handleHasActiveSession(rec, req)
+	rt.handleHasActiveSession(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -72,18 +72,18 @@ func TestHandleHasActiveSession(t *testing.T) {
 }
 
 func TestHandleReadinessCheck(t *testing.T) {
-	resetWorkerForTest(t)
+	rt := newTestRuntime()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/bot/readiness_check", nil)
-	handleReadinessCheck(rec, req)
+	rt.handleReadinessCheck(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ready status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	worker.markReserved()
+	rt.state.markReserved()
 	rec = httptest.NewRecorder()
-	handleReadinessCheck(rec, req)
+	rt.handleReadinessCheck(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("reserved status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
@@ -93,31 +93,31 @@ func TestHandleReadinessCheck(t *testing.T) {
 }
 
 func TestHandleCreateWorkerRoomRejectsMissingFields(t *testing.T) {
-	resetWorkerForTest(t)
+	rt := newTestRuntime()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/bot/create_worker_room", strings.NewReader(`{}`))
-	handleCreateWorkerRoom(rec, req)
+	rt.handleCreateWorkerRoom(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
-	active, _ := worker.snapshot()
+	active, _ := rt.state.snapshot()
 	if active {
 		t.Fatal("worker active = true, want false")
 	}
 }
 
 func TestHandleCreateWorkerRoomReturnsConflictWhenActive(t *testing.T) {
-	resetWorkerForTest(t)
-	if outcome, _ := worker.claim("conv-existing"); outcome != claimGranted {
+	rt := newTestRuntime()
+	if outcome, _ := rt.state.claim("conv-existing"); outcome != claimGranted {
 		t.Fatal("claim did not grant idle worker")
 	}
 
 	body := `{"room_url":"https://room.daily.co/test","room_name":"test","token":"user-token","conversation_id":"conv-1","bot_worker_type":"sales_call"}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/bot/create_worker_room", strings.NewReader(body))
-	handleCreateWorkerRoom(rec, req)
+	rt.handleCreateWorkerRoom(rec, req)
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
@@ -133,8 +133,8 @@ func TestHandleCreateWorkerRoomReturnsConflictWhenActive(t *testing.T) {
 }
 
 func TestHandleCreateWorkerRoomTreatsRetriedConversationAsSuccess(t *testing.T) {
-	resetWorkerForTest(t)
-	if outcome, _ := worker.claim("conv-1"); outcome != claimGranted {
+	rt := newTestRuntime()
+	if outcome, _ := rt.state.claim("conv-1"); outcome != claimGranted {
 		t.Fatal("claim did not grant idle worker")
 	}
 
@@ -143,7 +143,7 @@ func TestHandleCreateWorkerRoomTreatsRetriedConversationAsSuccess(t *testing.T) 
 	body := `{"room_url":"https://room.daily.co/test","room_name":"test","token":"user-token","conversation_id":"conv-1","bot_worker_type":"sales_call"}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/bot/create_worker_room", strings.NewReader(body))
-	handleCreateWorkerRoom(rec, req)
+	rt.handleCreateWorkerRoom(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
