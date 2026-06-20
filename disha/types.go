@@ -90,8 +90,9 @@ type PostCallOperationsRequest struct {
 }
 
 type EnqueueJobRequest struct {
-	ModuleName string         `json:"module_name"`
-	FuncName   string         `json:"func_name"`
-	Kwargs     map[string]any `json:"kwargs"`
-	SQSQueue   string         `json:"sqs_queue"`
+	ModuleName     string         `json:"module_name"`
+	FuncName       string         `json:"func_name"`
+	Kwargs         map[string]any `json:"kwargs"`
+	SQSQueue       string         `json:"sqs_queue"`
+	MessageGroupID string         `json:"message_group_id,omitempty"`
 }

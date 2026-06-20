@@ -45,6 +45,7 @@ func TestHandleShutdownSignalEnqueuesGracefulShutdownOnce(t *testing.T) {
 	if requests[0].Body["module_name"] != "bots.signal_handler" ||
 		requests[0].Body["func_name"] != "on_graceful_shutdown_initiated" ||
 		requests[0].Body["sqs_queue"] != "fifo-p0-fast-l1" ||
+		requests[0].Body["message_group_id"] != "pod-1" ||
 		kwargs["pod_name"] != "pod-1" {
 		t.Fatalf("enqueue body mismatch: %+v", requests[0].Body)
 	}

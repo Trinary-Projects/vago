@@ -44,6 +44,7 @@ func TestRegisterWorkerPodEnqueuesDBOpsAndSetsRegistrationKey(t *testing.T) {
 	if requests[0].Body["module_name"] != "bots.gke_pod_manager" ||
 		requests[0].Body["func_name"] != "register_worker_pod_db_ops" ||
 		requests[0].Body["sqs_queue"] != "fifo-p0-fast-l1" ||
+		requests[0].Body["message_group_id"] != "pod-1" ||
 		kwargs["pod_ip"] != "10.1.2.3" ||
 		kwargs["pod_name"] != "pod-1" ||
 		kwargs["pod_uid"] != "uid-1" ||
@@ -128,6 +129,7 @@ func TestEnqueueWorkerGracefulShutdownSetsSigtermKeyAndEnqueuesJob(t *testing.T)
 	if requests[0].Body["module_name"] != "bots.signal_handler" ||
 		requests[0].Body["func_name"] != "on_graceful_shutdown_initiated" ||
 		requests[0].Body["sqs_queue"] != "fifo-p0-fast-l1" ||
+		requests[0].Body["message_group_id"] != "pod-1" ||
 		kwargs["pod_name"] != "pod-1" {
 		t.Fatalf("enqueue body mismatch: %+v", requests[0].Body)
 	}

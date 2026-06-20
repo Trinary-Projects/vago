@@ -58,7 +58,8 @@ func RegisterWorkerPod(ctx context.Context, deps disha.Deps, reg WorkerPodRegist
 			"pod_uid":  reg.PodUID,
 			"app_name": reg.AppName,
 		},
-		SQSQueue: "fifo-p0-fast-l1",
+		SQSQueue:       "fifo-p0-fast-l1",
+		MessageGroupID: reg.PodName,
 	}); err != nil {
 		sentryutil.Capture(sentryutil.Event{
 			Err: err,
@@ -150,7 +151,8 @@ func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName
 		Kwargs: map[string]any{
 			"pod_name": podName,
 		},
-		SQSQueue: "fifo-p0-fast-l1",
+		SQSQueue:       "fifo-p0-fast-l1",
+		MessageGroupID: podName,
 	}); err != nil {
 		sentryutil.Capture(sentryutil.Event{
 			Err: err,
