@@ -166,7 +166,7 @@ func buildInitialMessages(systemPrompt string, chunks [][]any, resumeMessage str
 	msgs = reorderToolResultMessages(msgs)
 	hasPriorTurns := len(msgs) > 1
 	if hasPriorTurns && resumeMessage != "" {
-		msgs = append(msgs, voicepipelinecore.Message{Role: "system", Content: resumeMessage})
+		msgs = append(msgs, voicepipelinecore.Message{Role: "user", Content: "<system_message>" + resumeMessage + "</system_message>"})
 	}
 	if !hasPriorTurns {
 		msgs = append(msgs, voicepipelinecore.Message{Role: "user", Content: "hello?"})
