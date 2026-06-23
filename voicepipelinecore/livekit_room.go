@@ -548,6 +548,7 @@ func (r *LiveKitRoom) markUserJoined(participantID string) {
 		r.taskCtx.callEvents.fireUserJoined(at)
 	}
 	if r.audioSource != nil {
+		r.audioSource.QueueFrame(NewSTTConnectFrame("user_joined", at), Downstream)
 		r.greetOnce.Do(func() {
 			r.log("[%s] User joined; starting bot greeting (first turn)", r.roomName)
 			r.audioSource.QueueFrame(NewLLMMessagesAppendFrame(nil, true), Downstream)

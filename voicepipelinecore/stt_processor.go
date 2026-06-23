@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,11 +47,19 @@ var sttConnectRetryDelays = []time.Duration{time.Second, 2 * time.Second}
 // flag.
 type STTProcessor struct {
 	*BaseProcessor
-	taskCtx       *TaskContext
-	websocketConn *websocket.Conn
-	audioFrames   chan AudioFrame
-	connected     chan struct{} // closed when the websocket is established
-	closeOnce     sync.Once
+	taskCtx          *TaskContext
+	websocketConn    *websocket.Conn
+	audioFrames      chan AudioFrame
+	connected        chan struct{} // closed when the websocket is established
+	activateCh       chan struct{}
+	closeOnce        sync.Once
+	activateOnce     sync.Once
+	connectLogOnce   sync.Once
+	timingMu         sync.Mutex
+	activatedAt      time.Time
+	activationReason string
+	firstAudioAt     time.Time
+	queuedBeforeConn int
 }
 
 func NewSTTProcessor(taskCtx *TaskContext) *STTProcessor {
@@ -58,9 +67,34 @@ func NewSTTProcessor(taskCtx *TaskContext) *STTProcessor {
 		taskCtx:     taskCtx,
 		audioFrames: make(chan AudioFrame, 100),
 		connected:   make(chan struct{}),
+		activateCh:  make(chan struct{}),
 	}
 	p.BaseProcessor = NewBaseProcessor("STT", p, taskCtx)
 	return p
+}
+
+// activate unblocks the Soniox websocket dial. It is safe to call before
+// Start; the reader goroutine will observe the already-closed channel when
+// the pipeline starts.
+func (s *STTProcessor) activate(reason string, at time.Time) {
+	if s == nil {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "unknown"
+	}
+	s.activateOnce.Do(func() {
+		s.timingMu.Lock()
+		s.activatedAt = at
+		s.activationReason = reason
+		s.timingMu.Unlock()
+		s.logf("STT websocket activation requested reason=%s activation_at=%s", reason, at.UTC().Format(time.RFC3339Nano))
+		close(s.activateCh)
+	})
 }
 
 // Stop cancels b.ctx first (so the reader's post-ReadMessage ctx check
@@ -79,6 +113,15 @@ func (s *STTProcessor) Start(ctx context.Context) {
 	s.BaseProcessor.Start(ctx)
 	s.Go(s.runReader)
 	s.Go(s.runWriter)
+}
+
+func (s *STTProcessor) waitForActivation() bool {
+	select {
+	case <-s.activateCh:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
 }
 
 func sttConfigPayload() map[string]interface{} {
@@ -108,6 +151,7 @@ func (s *STTProcessor) connect() error {
 			if err == nil {
 				s.websocketConn = conn
 				s.taskCtx.Logger.Println("STT websocket connected")
+				s.logInitialConnectLatency(time.Now())
 				return nil
 			}
 			conn.Close()
@@ -127,12 +171,60 @@ func (s *STTProcessor) connect() error {
 }
 
 func (s *STTProcessor) runReader() {
+	if !s.waitForActivation() {
+		return
+	}
 	if err := s.connect(); err != nil {
 		s.handleConnectExhausted(err)
 		return
 	}
 	close(s.connected)
 	s.read()
+}
+
+func (s *STTProcessor) logInitialConnectLatency(connectedAt time.Time) {
+	s.connectLogOnce.Do(func() {
+		s.timingMu.Lock()
+		activatedAt := s.activatedAt
+		reason := s.activationReason
+		firstAudioAt := s.firstAudioAt
+		queuedBeforeConn := s.queuedBeforeConn
+		s.timingMu.Unlock()
+
+		var activationToConnectedMs float64
+		if !activatedAt.IsZero() && connectedAt.After(activatedAt) {
+			activationToConnectedMs = float64(connectedAt.Sub(activatedAt).Microseconds()) / 1000.0
+		}
+		var firstAudioToConnectedMs float64
+		if !firstAudioAt.IsZero() && connectedAt.After(firstAudioAt) {
+			firstAudioToConnectedMs = float64(connectedAt.Sub(firstAudioAt).Microseconds()) / 1000.0
+		}
+		s.logf(
+			"STT lazy connect latency activation_reason=%s activation_to_connected_ms=%.1f first_audio_to_connected_ms=%.1f preconnect_audio_observed=%t queued_audio_frames_before_connect=%d",
+			reason,
+			activationToConnectedMs,
+			firstAudioToConnectedMs,
+			!firstAudioAt.IsZero(),
+			queuedBeforeConn,
+		)
+	})
+}
+
+func (s *STTProcessor) noteAudioBeforeConnect(at time.Time) {
+	select {
+	case <-s.connected:
+		return
+	default:
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	s.timingMu.Lock()
+	if s.firstAudioAt.IsZero() {
+		s.firstAudioAt = at
+	}
+	s.queuedBeforeConn++
+	s.timingMu.Unlock()
 }
 
 func (s *STTProcessor) read() {
@@ -205,7 +297,12 @@ func (s *STTProcessor) runWriter() {
 
 func (s *STTProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
 	switch f := frame.(type) {
+	case STTConnectFrame:
+		s.activate(f.Reason, f.At)
 	case AudioFrame:
+		at := time.Now()
+		s.noteAudioBeforeConnect(at)
+		s.activate("first_audio_fallback", at)
 		select {
 		case <-s.ctx.Done():
 		case s.audioFrames <- f:
@@ -216,5 +313,11 @@ func (s *STTProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direct
 		s.Stop()
 	default:
 		s.PushFrame(frame, dir)
+	}
+}
+
+func (s *STTProcessor) logf(format string, args ...any) {
+	if s != nil && s.taskCtx != nil && s.taskCtx.Logger != nil {
+		s.taskCtx.Logger.Printf(format, args...)
 	}
 }

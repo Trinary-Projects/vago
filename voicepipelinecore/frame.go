@@ -98,6 +98,7 @@ const (
 	LLMMessages
 	Error
 	LLMMessagesAppend
+	STTConnect
 	FunctionCallInProgress
 	FunctionCallResult
 )
@@ -348,6 +349,30 @@ func NewLLMMessagesAppendFrame(messages []Message, runLLM bool) LLMMessagesAppen
 func (f LLMMessagesAppendFrame) FrameType() FrameType  { return LLMMessagesAppend }
 func (f LLMMessagesAppendFrame) IsSystem() bool        { return false }
 func (f LLMMessagesAppendFrame) IsInterruptible() bool { return true }
+
+// STTConnectFrame asks the STT processor to establish its provider
+// websocket. Room transports enqueue it when a user joins so lazy STT
+// connect stays in the normal pipeline path instead of a side callback.
+type STTConnectFrame struct {
+	FrameBase
+	Reason string
+	At     time.Time
+}
+
+func NewSTTConnectFrame(reason string, at time.Time) STTConnectFrame {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return STTConnectFrame{
+		FrameBase: FrameBase{Meta: newFrameMeta("STTConnectFrame")},
+		Reason:    reason,
+		At:        at,
+	}
+}
+
+func (f STTConnectFrame) FrameType() FrameType  { return STTConnect }
+func (f STTConnectFrame) IsSystem() bool        { return true }
+func (f STTConnectFrame) IsInterruptible() bool { return false }
 
 type FunctionCallInProgressFrame struct {
 	FrameBase

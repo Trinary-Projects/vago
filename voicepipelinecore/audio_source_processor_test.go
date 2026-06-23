@@ -55,15 +55,15 @@ func TestAudioSource_MarksFirstAudibleUserAudioOnce(t *testing.T) {
 	defer fix.TaskCtx.callEvents.stopAndDrain()
 	a := NewAudioSourceProcessor(fix.TaskCtx)
 
-	a.maybeMarkFirstUserAudio([]int16{0, 999, -1000})
+	a.maybeMarkFirstUserAudio([]int16{0, 999, -1000}, time.Now())
 	select {
 	case <-calls:
 		t.Fatal("quiet samples should not fire OnFirstUserAudio")
 	default:
 	}
 
-	a.maybeMarkFirstUserAudio([]int16{0, 1001})
-	a.maybeMarkFirstUserAudio([]int16{2000})
+	a.maybeMarkFirstUserAudio([]int16{0, 1001}, time.Now())
+	a.maybeMarkFirstUserAudio([]int16{2000}, time.Now())
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	select {

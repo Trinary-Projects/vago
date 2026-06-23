@@ -31,13 +31,17 @@ func hasAudibleSamples(samples []int16) bool {
 	return false
 }
 
-func (a *AudioSourceProcessor) maybeMarkFirstUserAudio(samples []int16) {
+func (a *AudioSourceProcessor) maybeMarkFirstUserAudio(samples []int16, at time.Time) {
 	if a.taskCtx == nil || a.taskCtx.callStats == nil || !hasAudibleSamples(samples) {
 		return
 	}
-	at := time.Now()
-	if a.taskCtx.callStats.MarkFirstUserAudio(at) && a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireFirstUserAudio(at)
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if a.taskCtx.callStats.MarkFirstUserAudio(at) {
+		if a.taskCtx.callEvents != nil {
+			a.taskCtx.callEvents.fireFirstUserAudio(at)
+		}
 	}
 }
 
@@ -50,10 +54,12 @@ func (a *AudioSourceProcessor) PushPCM(pcmBytes []byte, sampleRate, channels int
 	if len(pcmBytes) == 0 {
 		return
 	}
+	at := time.Now()
+
 	timingEnabled := a.audioTimingEnabled()
 	var start time.Time
 	if timingEnabled {
-		start = time.Now()
+		start = at
 	}
 	samples := make([]int16, len(pcmBytes)/2)
 	for i := range samples {
@@ -62,7 +68,7 @@ func (a *AudioSourceProcessor) PushPCM(pcmBytes []byte, sampleRate, channels int
 	if timingEnabled {
 		a.recordAudioTiming("go_audio_source_pcm_scan", time.Since(start))
 	}
-	a.maybeMarkFirstUserAudio(samples)
+	a.maybeMarkFirstUserAudio(samples, at)
 	a.PushFrame(NewAudioFrame(pcmBytes), Downstream)
 }
 

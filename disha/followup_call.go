@@ -131,6 +131,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
+	stt := voicepipelinecore.NewSTTProcessor(taskCtx) // Soniox only, by design.
 
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {
@@ -145,7 +146,6 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	taskCtx.Room = room
 	taskCtx.UIEvents.SetRoom(room)
 
-	stt := voicepipelinecore.NewSTTProcessor(taskCtx) // Soniox only, by design.
 	userIdle := voicepipelinecore.NewUserIdleProcessor(taskCtx)
 	contextAggregators := voicepipelinecore.NewContextAggregatorPair(taskCtx, pl.InitialMessages, pl.PromptKey)
 	llmClient, err := newFollowUpLLMClient(deps, pl)

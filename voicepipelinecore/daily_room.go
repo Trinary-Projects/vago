@@ -481,19 +481,20 @@ func (r *DailyRoom) markUserJoined(participantID string) {
 	if r.taskCtx.callEvents != nil {
 		r.taskCtx.callEvents.fireUserJoined(at)
 	}
-	// The user is present; the bot always speaks first. Queue an
-	// LLMMessagesAppendFrame (no new messages, run the LLM) so
-	// UserContextAggregator runs the first turn from the initial context.
-	// Fires once per call. Mirrors Pipecat's on_client_connected ->
-	// queue_frames([... run_llm ...]).
+	if r.audioSource != nil {
+		r.audioSource.QueueFrame(NewSTTConnectFrame("user_joined", at), Downstream)
+	}
+	// The user is present; request STT connect above, then make the bot
+	// speak first by queueing an LLMMessagesAppendFrame (no new messages,
+	// run the LLM). Mirrors Pipecat's on_client_connected ->
+	// queue_frames([...]).
 	//
 	// Use QueueFrame, not PushFrame: participant_joined can fire during
 	// JoinDailyRoom — before SetPipeline links neighbours and before
 	// Start — and daily_bridge.py replays it for already-present
 	// participants right after `joined`. PushFrame would drop the frame
-	// (next is still nil) and greetOnce would prevent a retry. QueueFrame
-	// buffers it on the audio source's own input channel until its loops
-	// start, so the greeting survives the pre-start/link timing.
+	// (next is still nil). QueueFrame buffers these frames on the audio
+	// source until its loops start.
 	if r.audioSource != nil {
 		r.greetOnce.Do(func() {
 			r.log("[%s] User joined; starting bot greeting (first turn)", r.roomName)

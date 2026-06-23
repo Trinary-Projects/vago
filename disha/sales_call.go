@@ -132,6 +132,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	// transport pumps inbound audio frames into the audio source.
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
+	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
 
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {
@@ -146,7 +147,6 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	taskCtx.Room = room
 	taskCtx.UIEvents.SetRoom(room)
 
-	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
 	userIdle := voicepipelinecore.NewUserIdleProcessor(taskCtx)
 	contextAggregators := voicepipelinecore.NewContextAggregatorPair(taskCtx, pl.InitialMessages, pl.PromptKey)
 	talkTime := voicepipelinecore.NewTalkTimeMonitoringProcessorWithMaxTalkTime(taskCtx, pl.MaxTalkTime)

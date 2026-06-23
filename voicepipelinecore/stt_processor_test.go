@@ -107,3 +107,151 @@ func TestSTTConnectCapsRetries(t *testing.T) {
 		t.Fatalf("connect attempts = %d, want 3", got)
 	}
 }
+
+func TestSTTLazyConnectWaitsForActivation(t *testing.T) {
+	fix := newTestFixture(t)
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	oldURL := sttDialURL
+	sttDialURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	t.Cleanup(func() { sttDialURL = oldURL })
+
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("connect attempts before activation = %d, want 0", got)
+	}
+	p.Stop()
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+}
+
+func TestSTTLazyConnectActivatesOnSTTConnectFrame(t *testing.T) {
+	fix := newTestFixture(t)
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	oldURL := sttDialURL
+	oldDelays := sttConnectRetryDelays
+	sttDialURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	sttConnectRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() {
+		sttDialURL = oldURL
+		sttConnectRetryDelays = oldDelays
+	})
+
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewSTTConnectFrame("user_joined", time.Now()), Downstream)
+
+	if !waitForAttempts(&attempts, 500*time.Millisecond) {
+		t.Fatal("STT did not attempt to connect after STTConnectFrame")
+	}
+	p.Stop()
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+}
+
+func TestSTTLazyConnectFallsBackOnFirstAudio(t *testing.T) {
+	fix := newTestFixture(t)
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	oldURL := sttDialURL
+	oldDelays := sttConnectRetryDelays
+	sttDialURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	sttConnectRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() {
+		sttDialURL = oldURL
+		sttConnectRetryDelays = oldDelays
+	})
+
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewAudioFrame([]byte{0, 0, 1, 0}), Downstream)
+
+	if !waitForAttempts(&attempts, 500*time.Millisecond) {
+		t.Fatal("STT did not attempt to connect after first audio fallback")
+	}
+	p.Stop()
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+}
+
+func TestRoomUserJoinedQueuesSTTConnectFrame(t *testing.T) {
+	fix := newTestFixture(t)
+	dailyAudio := NewAudioSourceProcessor(fix.TaskCtx)
+
+	daily := &DailyRoom{
+		roomName:    "daily-room",
+		taskCtx:     fix.TaskCtx,
+		audioSource: dailyAudio,
+	}
+	daily.markUserJoined("daily-user")
+	assertQueuedSTTConnectFrame(t, dailyAudio, "user_joined")
+
+	liveKitAudio := NewAudioSourceProcessor(fix.TaskCtx)
+	liveKit := &LiveKitRoom{
+		roomName:    "livekit-room",
+		taskCtx:     fix.TaskCtx,
+		audioSource: liveKitAudio,
+	}
+	liveKit.markUserJoined("livekit-user")
+	assertQueuedSTTConnectFrame(t, liveKitAudio, "user_joined")
+}
+
+func assertQueuedSTTConnectFrame(t *testing.T, audioSource *AudioSourceProcessor, wantReason string) {
+	t.Helper()
+	select {
+	case env := <-audioSource.inputSysCh:
+		if env.Direction != Downstream {
+			t.Fatalf("STTConnectFrame direction = %v, want Downstream", env.Direction)
+		}
+		frame, ok := env.Frame.(STTConnectFrame)
+		if !ok {
+			t.Fatalf("queued system frame = %T, want STTConnectFrame", env.Frame)
+		}
+		if frame.Reason != wantReason {
+			t.Fatalf("STTConnectFrame reason = %q, want %q", frame.Reason, wantReason)
+		}
+		if frame.At.IsZero() {
+			t.Fatal("STTConnectFrame At was zero")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("room user join did not queue STTConnectFrame")
+	}
+}
+
+func waitForAttempts(attempts *atomic.Int32, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if attempts.Load() > 0 {
+			return true
+		}
+		select {
+		case <-deadline:
+			return attempts.Load() > 0
+		case <-ticker.C:
+		}
+	}
+}
