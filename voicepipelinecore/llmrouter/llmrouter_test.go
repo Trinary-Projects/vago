@@ -200,7 +200,7 @@ func TestSelectionOneEndpointGroupUsesOwnFallback(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if sel.ConfigKey != "openrouter_gemma_4_26b_a4b_it_nitro" {
+	if sel.ConfigKey != "openrouter_gemma_4_31b_it" {
 		t.Fatalf("selected %q, want dynamic follow-up endpoint", sel.ConfigKey)
 	}
 	if sel.UsingFallback || sel.SelectedGroup != groupFollowUpDynamic {
@@ -420,7 +420,7 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "or-key")
 
 	r := &Router{cfg: Config{}, httpClient: &http.Client{}}
-	req, err := r.buildRequest(ctx(), endpointConfigs["openrouter_gemma_4_26b_a4b_it_nitro"], testLLMRequest())
+	req, err := r.buildRequest(ctx(), endpointConfigs["openrouter_gemma_4_31b_it"], testLLMRequest())
 	if err != nil {
 		t.Fatalf("buildRequest: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 		t.Errorf("auth = %q", got)
 	}
 	body := readBody(t, req)
-	if body["model"] != "google/gemma-4-26b-a4b-it:nitro" {
+	if body["model"] != "google/gemma-4-31b-it" {
 		t.Errorf("model = %v", body["model"])
 	}
 	if body["temperature"] != 0.5 {
@@ -442,8 +442,12 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 		t.Fatalf("provider = %#v, want object", body["provider"])
 	}
 	order, ok := provider["order"].([]any)
-	if !ok || len(order) != 3 || order[0] != "deepinfra/fp8" || order[1] != "cloudflare" || order[2] != "parasail/bf16" {
+	if !ok || len(order) != 3 || order[0] != "deepinfra/fp8" || order[1] != "together" || order[2] != "parasail/fp8" {
 		t.Fatalf("provider.order = %#v", provider["order"])
+	}
+	only, ok := provider["only"].([]any)
+	if !ok || len(only) != 3 || only[0] != "deepinfra/fp8" || only[1] != "together" || only[2] != "parasail/fp8" {
+		t.Fatalf("provider.only = %#v", provider["only"])
 	}
 	ignored, ok := provider["ignore"].([]any)
 	if !ok || len(ignored) != 3 || ignored[0] != "google-ai-studio" {

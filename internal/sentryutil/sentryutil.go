@@ -9,6 +9,7 @@ import (
 type Event struct {
 	Err     error
 	Message string
+	Level   sentry.Level
 	Tags    map[string]string
 	Details map[string]any
 }
@@ -28,7 +29,11 @@ func Capture(event Event) {
 			sentry.CaptureException(event.Err)
 			return
 		}
-		scope.SetLevel(sentry.LevelError)
+		level := event.Level
+		if level == "" {
+			level = sentry.LevelError
+		}
+		scope.SetLevel(level)
 		sentry.CaptureMessage(event.Message)
 	})
 }

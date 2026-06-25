@@ -179,15 +179,15 @@ var endpointConfigs = map[string]endpointConfig{
 	},
 
 	// --- follow-up dynamic treatment main model (no health switching in Python) ---
-	"openrouter_gemma_4_26b_a4b_it_nitro": {
-		Key: "openrouter_gemma_4_26b_a4b_it_nitro", Provider: providerOpenRouter,
-		Model: "google/gemma-4-26b-a4b-it:nitro", Region: "us",
+	"openrouter_gemma_4_31b_it": {
+		Key: "openrouter_gemma_4_31b_it", Provider: providerOpenRouter,
+		Model: "google/gemma-4-31b-it", Region: "us",
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		Temperature: floatPtr(0.5),
 		ExtraBody: map[string]any{
 			"provider": map[string]any{
-				"order":           []string{"deepinfra/fp8", "cloudflare", "parasail/bf16"},
-				"only":            []string{"deepinfra/fp8", "cloudflare", "parasail/bf16"},
+				"order":           []string{"deepinfra/fp8", "together", "parasail/fp8"},
+				"only":            []string{"deepinfra/fp8", "together", "parasail/fp8"},
 				"ignore":          []string{"google-ai-studio", "google-vertex", "novita"},
 				"allow_fallbacks": true,
 			},
@@ -252,8 +252,8 @@ var modelGroups = map[string]modelGroup{
 		FallbackGroup: groupGPT41,
 	},
 	groupFollowUpDynamic: {
-		Configs:  []string{"openrouter_gemma_4_26b_a4b_it_nitro"},
-		Fallback: "openrouter_gemma_4_26b_a4b_it_nitro",
+		Configs:  []string{"openrouter_gemma_4_31b_it"},
+		Fallback: "openrouter_gemma_4_31b_it",
 	},
 	groupGPTOSS120Fast: {
 		Configs: []string{
