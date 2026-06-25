@@ -117,6 +117,13 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 		pl.InitialMessages[1].Content != "hello" {
 		t.Fatalf("InitialMessages = %+v", pl.InitialMessages)
 	}
+	if pl.PromptMetadata["system_prompt_name"] != followUpPromptD1Inactive ||
+		pl.PromptMetadata["system_prompt_version"] != 9 {
+		t.Fatalf("PromptMetadata identity = %+v", pl.PromptMetadata)
+	}
+	if len(pl.PromptMetadata) != 3 {
+		t.Fatalf("PromptMetadata keys = %+v, want only system prompt triplet", pl.PromptMetadata)
+	}
 
 	vars, ok := pl.PromptMetadata["system_prompt_variables"].(DocumentVariables)
 	if !ok {
@@ -302,9 +309,18 @@ func TestFollowUpBotPlanDynamicLoadsCallFlowAndTools(t *testing.T) {
 	if len(required) != 1 || required[0] != "situation" {
 		t.Fatalf("get_guidance required = %#v, want situation", pl.Tools[0].Function.Parameters["required"])
 	}
-	if pl.PromptMetadata["call_flow_key"] != "weekly_checkin" ||
-		pl.PromptMetadata["compiled_call_flow_s3_key"] != "compiled/flow.json" {
-		t.Fatalf("PromptMetadata = %+v", pl.PromptMetadata)
+	if pl.PromptMetadata["system_prompt_name"] != followUpDynamicMainPrompt ||
+		pl.PromptMetadata["system_prompt_version"] != 12 {
+		t.Fatalf("PromptMetadata identity = %+v", pl.PromptMetadata)
+	}
+	if len(pl.PromptMetadata) != 3 {
+		t.Fatalf("PromptMetadata keys = %+v, want only system prompt triplet", pl.PromptMetadata)
+	}
+	if _, ok := pl.PromptMetadata["call_flow_key"]; ok {
+		t.Fatalf("PromptMetadata should not include call_flow_key: %+v", pl.PromptMetadata)
+	}
+	if _, ok := pl.PromptMetadata["compiled_call_flow_s3_key"]; ok {
+		t.Fatalf("PromptMetadata should not include compiled_call_flow_s3_key: %+v", pl.PromptMetadata)
 	}
 	vars, ok := pl.PromptMetadata["system_prompt_variables"].(DocumentVariables)
 	if !ok || vars["call_flow"] != "CALL FLOW BODY" {

@@ -70,15 +70,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 		startup.Logger.Println("disha: appending follow-up resume system message")
 	}
 
-	metadata := map[string]any{
-		"system_prompt_name":      promptName,
-		"system_prompt_version":   promptVersion,
-		"system_prompt_variables": variables,
-	}
-	if dynamic {
-		metadata["call_flow_key"] = startup.Data.Conversation.CallFlowKey
-		metadata["compiled_call_flow_s3_key"] = startup.Data.Conversation.CompiledCallFlowS3Key
-	}
+	metadata := buildPromptTraceMetadata("system", promptName, promptVersion, variables)
 
 	modelGroup := followUpModelGroup
 	if dynamic {
@@ -348,17 +340,14 @@ func getFollowUpGuidance(ctx context.Context, deps Deps, pl *followUpPlan, situa
 	if deps.Documents == nil {
 		return "", errors.New("disha: document store is required for get_guidance")
 	}
-	systemPrompt, _, err := deps.Documents.GetDocument(ctx, followUpGetGuidancePrompt, 0, DocumentVariables{"situation": situation})
+	systemVariables := DocumentVariables{"situation": situation}
+	systemPrompt, systemVersion, err := deps.Documents.GetDocument(ctx, followUpGetGuidancePrompt, 0, systemVariables)
 	if err != nil {
 		return "", err
 	}
-	metadata := map[string]any{
-		"tool_name":               "get_guidance",
-		"system_prompt_name":      followUpGetGuidancePrompt,
-		"system_prompt_variables": map[string]any{"situation": situation},
-		"user_prompt_name":        "raw_situation",
-		"user_prompt_variables":   map[string]any{"situation": situation},
-	}
+	metadata := buildPromptTraceMetadata("system", followUpGetGuidancePrompt, systemVersion, systemVariables)
+	metadata["user_prompt_name"] = "raw_situation"
+	metadata["user_prompt_variables"] = DocumentVariables{"situation": situation}
 	req := voicepipelinecore.LLMRequest{Messages: []voicepipelinecore.Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: situation},

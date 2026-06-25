@@ -259,6 +259,23 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 		pl.InitialMessages[3].Content != "tool turn" {
 		t.Fatalf("InitialMessages mismatch: %+v", pl.InitialMessages)
 	}
+	if pl.PromptMetadata["system_prompt_name"] != salesPromptDefault ||
+		pl.PromptMetadata["system_prompt_version"] != 17 {
+		t.Fatalf("PromptMetadata identity = %+v", pl.PromptMetadata)
+	}
+	if len(pl.PromptMetadata) != 3 {
+		t.Fatalf("PromptMetadata keys = %+v, want only system prompt triplet", pl.PromptMetadata)
+	}
+	promptVars, ok := pl.PromptMetadata["system_prompt_variables"].(DocumentVariables)
+	if !ok {
+		t.Fatalf("system_prompt_variables = %#v, want DocumentVariables", pl.PromptMetadata["system_prompt_variables"])
+	}
+	if promptVars["patient_info"] != "Riya, age 32" {
+		t.Fatalf("patient_info = %#v, want conversation patient info", promptVars["patient_info"])
+	}
+	if _, ok := promptVars["current_datetime"].(string); !ok {
+		t.Fatalf("current_datetime = %#v, want string", promptVars["current_datetime"])
+	}
 	events := pl.Callbacks.Events()
 	turnAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
 	events.OnUserTurnCommitted("new user", turnAt, pl.PromptKey)
@@ -473,7 +490,8 @@ func TestSalesCallBotPlanAppendsResumeMessage(t *testing.T) {
 	if len(pl.InitialMessages) != 3 {
 		t.Fatalf("InitialMessages = %+v, want 3", pl.InitialMessages)
 	}
-	if pl.InitialMessages[2].Role != "system" || !containsAll(pl.InitialMessages[2].Content, "hanji to aap keh") {
+	if pl.InitialMessages[2].Role != "user" ||
+		!containsAll(pl.InitialMessages[2].Content, "<system_message>", "hanji to aap keh", "</system_message>") {
 		t.Fatalf("resume message missing: %+v", pl.InitialMessages[2])
 	}
 }

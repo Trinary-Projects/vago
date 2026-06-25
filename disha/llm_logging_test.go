@@ -30,8 +30,13 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 				Arguments: `{"situation":"pain"}`,
 			},
 		}},
-		TTFBMs:           12.5,
-		TotalMs:          48.25,
+		TTFBMs:  12.5,
+		TotalMs: 48.25,
+		PromptMetadata: map[string]any{
+			"system_prompt_name":      "sales_call/main_sys-3day_v2",
+			"system_prompt_version":   17,
+			"system_prompt_variables": DocumentVariables{"patient_info": "Riya"},
+		},
 		PromptTokens:     11,
 		CompletionTokens: 7,
 		StatusCode:       http.StatusOK,
@@ -67,6 +72,18 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 		kwargs["prompt_tokens"] != float64(11) ||
 		kwargs["completion_tokens"] != float64(7) {
 		t.Fatalf("kwargs mismatch: %+v", kwargs)
+	}
+	promptMetadata, ok := kwargs["prompt_metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("prompt_metadata = %#v, want object", kwargs["prompt_metadata"])
+	}
+	if promptMetadata["system_prompt_name"] != "sales_call/main_sys-3day_v2" ||
+		promptMetadata["system_prompt_version"] != float64(17) {
+		t.Fatalf("prompt_metadata identity = %+v", promptMetadata)
+	}
+	promptVars, ok := promptMetadata["system_prompt_variables"].(map[string]any)
+	if !ok || promptVars["patient_info"] != "Riya" {
+		t.Fatalf("system_prompt_variables = %#v, want patient_info", promptMetadata["system_prompt_variables"])
 	}
 	responsePayload, ok := kwargs["response_payload"].(map[string]any)
 	if !ok {

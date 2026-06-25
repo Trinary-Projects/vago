@@ -151,8 +151,8 @@ func isTruthyJSON(v any) bool {
 //
 //   - If there are prior chunks, prepend the system prompt and replay
 //     each non-debug chunk in role/content form.
-//   - When resuming, append a system message describing how to
-//     reconnect with the user.
+//   - When resuming, append a user message containing a <system_message>
+//     nudge describing how to reconnect with the user.
 //   - On a fresh call, seed with `{user: "hello?"}` so the bot speaks
 //     first.
 func buildInitialMessages(systemPrompt string, chunks [][]any, resumeMessage string) []voicepipelinecore.Message {

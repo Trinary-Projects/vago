@@ -59,6 +59,7 @@ type salesCallPlan struct {
 	PhoneticDict    map[string]string
 	Callbacks       *CallEventCallbacks
 	PromptKey       string
+	PromptMetadata  map[string]any
 	Tools           []voicepipelinecore.ToolDefinition
 }
 
@@ -72,7 +73,7 @@ func (b SalesCallBot) plan(ctx context.Context, conversationID string, deps Deps
 		return nil, err
 	}
 
-	prompt, promptName, promptVersion, promptConfig, err := loadSalesPrompt(ctx, deps.Documents, startup)
+	prompt, promptName, promptVersion, promptConfig, promptVariables, err := loadSalesPrompt(ctx, deps.Documents, startup)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +95,7 @@ func (b SalesCallBot) plan(ctx context.Context, conversationID string, deps Deps
 		InitialMessages: buildInitialMessages(prompt, startup.Data.Chunks, resumeMsg),
 		MaxTalkTime:     salesTalkTimeLimit(startup.Data.UserProfile.RemainingSalesCallTalktimeSeconds),
 		PromptKey:       promptKey,
+		PromptMetadata:  buildPromptTraceMetadata("system", promptName, promptVersion, promptVariables),
 		Tools:           tools,
 		Callbacks: NewCallEventCallbacks(
 			startup,
@@ -150,7 +152,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	userIdle := voicepipelinecore.NewUserIdleProcessor(taskCtx)
 	contextAggregators := voicepipelinecore.NewContextAggregatorPair(taskCtx, pl.InitialMessages, pl.PromptKey)
 	talkTime := voicepipelinecore.NewTalkTimeMonitoringProcessorWithMaxTalkTime(taskCtx, pl.MaxTalkTime)
-	llmClient, err := newSalesLLMClient(deps, pl.Startup)
+	llmClient, err := newSalesLLMClient(deps, pl)
 	if err != nil {
 		task.Abort()
 		return nil, err
@@ -190,7 +192,7 @@ func isDailyRoomURL(roomURL string) bool {
 // campaign_pricing_experiment_flag (matching Python) and fetches it
 // from the document store. Variables passed to the template mirror
 // `sales_call_variables` in sales_call.py.
-func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStartup) (string, string, int, map[string]any, error) {
+func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStartup) (string, string, int, map[string]any, DocumentVariables, error) {
 	name := salesPromptDefault
 	switch derefString(startup.Data.UserProfile.CampaignPricingExperimentFlag) {
 	case campaignFlag21For3Days:
@@ -200,7 +202,7 @@ func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStar
 	}
 
 	if store == nil {
-		return "", "", 0, nil, fmt.Errorf("disha: document store is required to load %q", name)
+		return "", "", 0, nil, nil, fmt.Errorf("disha: document store is required to load %q", name)
 	}
 
 	vars := DocumentVariables{
@@ -218,12 +220,12 @@ func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStar
 	}
 	text, version, config, err := store.GetDocumentWithConfig(ctx, name, 0, vars)
 	if err != nil {
-		return "", "", 0, nil, fmt.Errorf("disha: load sales prompt %q: %w", name, err)
+		return "", "", 0, nil, nil, fmt.Errorf("disha: load sales prompt %q: %w", name, err)
 	}
 	if strings.TrimSpace(text) == "" {
-		return "", "", 0, nil, fmt.Errorf("disha: sales prompt %q is empty", name)
+		return "", "", 0, nil, nil, fmt.Errorf("disha: sales prompt %q is empty", name)
 	}
-	return text, name, version, config, nil
+	return text, name, version, config, vars, nil
 }
 
 func registerSalesTools(llm *voicepipelinecore.LLMProcessor, task *voicepipelinecore.PipelineTask, pl *salesCallPlan) {
@@ -236,14 +238,16 @@ func registerSalesTools(llm *voicepipelinecore.LLMProcessor, task *voicepipeline
 
 // newSalesLLMClient builds the health-based LLM router for the sales
 // call (model group grok-4.1-fast-sales, region us, temperature 0).
-func newSalesLLMClient(deps Deps, startup CallStartup) (voicepipelinecore.LLMClient, error) {
+func newSalesLLMClient(deps Deps, pl *salesCallPlan) (voicepipelinecore.LLMClient, error) {
+	startup := pl.Startup
 	logger := startup.Logger
 	router, err := llmrouter.New(llmrouter.Config{
-		Group:   salesModelGroup,
-		Region:  "us",
-		Redis:   deps.Redis,
-		Logger:  logger,
-		LogSink: newLLMLogSink(deps.API, logger, salesUsecaseType, startup.UserID, startup.ConversationID),
+		Group:          salesModelGroup,
+		Region:         "us",
+		Redis:          deps.Redis,
+		Logger:         logger,
+		LogSink:        newLLMLogSink(deps.API, logger, salesUsecaseType, startup.UserID, startup.ConversationID),
+		PromptMetadata: pl.PromptMetadata,
 	})
 	if err != nil {
 		if logger != nil {
