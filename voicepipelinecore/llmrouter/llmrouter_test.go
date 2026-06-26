@@ -442,11 +442,11 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 		t.Fatalf("provider = %#v, want object", body["provider"])
 	}
 	order, ok := provider["order"].([]any)
-	if !ok || len(order) != 3 || order[0] != "deepinfra/fp8" || order[1] != "together" || order[2] != "parasail/fp8" {
+	if !ok || len(order) != 4 || order[0] != "modelrun/fp4" || order[1] != "deepinfra/fp8" || order[2] != "together" || order[3] != "parasail/fp8" {
 		t.Fatalf("provider.order = %#v", provider["order"])
 	}
 	only, ok := provider["only"].([]any)
-	if !ok || len(only) != 3 || only[0] != "deepinfra/fp8" || only[1] != "together" || only[2] != "parasail/fp8" {
+	if !ok || len(only) != 4 || only[0] != "modelrun/fp4" || only[1] != "deepinfra/fp8" || only[2] != "together" || only[3] != "parasail/fp8" {
 		t.Fatalf("provider.only = %#v", provider["only"])
 	}
 	ignored, ok := provider["ignore"].([]any)
