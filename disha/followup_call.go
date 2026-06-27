@@ -122,6 +122,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	taskCtx := task.TaskCtx
 
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
+	task.AttachSource(source)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
 	stt := voicepipelinecore.NewSTTProcessor(taskCtx) // Soniox only, by design.
 

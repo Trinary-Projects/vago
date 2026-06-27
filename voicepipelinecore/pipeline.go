@@ -196,9 +196,15 @@ func NewPipelineTask(parentCtx context.Context, cfg TaskConfig) (*PipelineTask, 
 	return task, nil
 }
 
-// SetPipeline attaches the assembled pipeline and its source to the
-// task. The bot calls this after building all processors and wiring
-// them with NewPipeline.
+// AttachSource makes the external lifecycle entry point available before the
+// full processor chain is assembled. Room transports can emit participant-left
+// events during join, so End() must be able to queue an EndFrame in that window.
+func (t *PipelineTask) AttachSource(source *PipelineSourceProcessor) {
+	t.Source = source
+}
+
+// SetPipeline attaches the assembled pipeline and its source to the task. The
+// bot calls this after building all processors and wiring them with NewPipeline.
 func (t *PipelineTask) SetPipeline(source *PipelineSourceProcessor, p *Pipeline) {
 	t.Source = source
 	t.Pipeline = p

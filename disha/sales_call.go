@@ -130,9 +130,11 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	}
 	taskCtx := task.TaskCtx
 
-	// Source + audio input must exist before the room join: the room
-	// transport pumps inbound audio frames into the audio source.
+	// Attach the source before room join: Daily can report a quick
+	// participant-left while BuildTask is still assembling the rest of the
+	// pipeline, and End() needs a source to queue the EndFrame.
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
+	task.AttachSource(source)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
 	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
 

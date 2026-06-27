@@ -58,3 +58,44 @@ func TestPipelineTaskRunCleanupCallsOnCallEndedWithStats(t *testing.T) {
 		t.Fatal("OnCallEnded was not called")
 	}
 }
+
+func TestPipelineTaskEndCanQueueBeforePipelineAttached(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	task, err := NewPipelineTask(ctx, TaskConfig{
+		Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewPipelineTask: %v", err)
+	}
+
+	source := NewPipelineSourceProcessor(task.TaskCtx)
+	task.AttachSource(source)
+
+	// This is the BuildTask race window: the room transport can request an end
+	// after the source exists but before the full processor chain is attached.
+	task.End(EndReasonClientDisconnect)
+
+	gotEnd := make(chan EndFrame, 1)
+	sink := NewPipelineSinkProcessor(task.TaskCtx, func(frame EndFrame) {
+		gotEnd <- frame
+	})
+	task.SetPipeline(source, NewPipeline([]Processor{source, sink}))
+	task.Start()
+
+	select {
+	case frame := <-gotEnd:
+		if frame.Reason != string(EndReasonClientDisconnect) {
+			t.Fatalf("EndFrame reason = %q, want %q", frame.Reason, EndReasonClientDisconnect)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued EndFrame did not reach pipeline sink")
+	}
+
+	task.Pipeline.Stop()
+	task.Cancel()
+	if err := waitForWG(&task.wg, 2*time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+}
