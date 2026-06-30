@@ -25,6 +25,9 @@ func TestLLMResponseTimeout_TimeoutInterruptsAndRetries(t *testing.T) {
 	if c := countFrames[LLMMessagesAppendFrame](up); c != 1 {
 		t.Fatalf("upstream LLMMessagesAppendFrame count = %d, want 1 in %s", c, describeFrameTypes(up))
 	}
+	if got := len(fix.TaskCtx.UIEvents.Snapshot()); got != 0 {
+		t.Fatalf("timeout processor emitted %d RTVI events, want none", got)
+	}
 }
 
 func TestLLMResponseTimeout_ResponseEndCancelsTimer(t *testing.T) {

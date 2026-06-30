@@ -119,6 +119,9 @@ func TestLLM_InterruptCancelsClientStream(t *testing.T) {
 	if c := countFrames[InterruptFrame](got); c != 1 {
 		t.Errorf("expected InterruptFrame forwarded, got %d", c)
 	}
+	if !hasLLMCallResult(fix.TaskCtx.UIEvents.Snapshot(), "interrupted", "test-model") {
+		t.Errorf("expected interrupted llm_call_result server-message")
+	}
 }
 
 // TestLLM_EndFrameCancelsInFlight verifies EndFrame cancels the
@@ -208,6 +211,22 @@ func TestLLM_PassesThroughOtherFrames(t *testing.T) {
 type stubLogger struct{}
 
 func (stubLogger) Write(p []byte) (int, error) { return len(p), nil }
+
+func hasLLMCallResult(entries []RTVIDebugLogEntry, status, model string) bool {
+	for _, entry := range entries {
+		if entry.Type != "server-message" {
+			continue
+		}
+		data, ok := entry.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		if data["type"] == "llm_call_result" && data["status"] == status && data["model"] == model {
+			return true
+		}
+	}
+	return false
+}
 
 // TestLLM_HandlesClientError verifies LLM handles a client stream error
 // gracefully (no panic, just no downstream tokens).
