@@ -159,6 +159,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	}
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
 	registerSalesTools(llm, task, pl)
+	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
@@ -171,6 +172,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 		contextAggregators.User(),
 		talkTime,
 		llm,
+		llmResponseTimeout,
 		tts,
 		playback,
 		contextAggregators.Assistant(),

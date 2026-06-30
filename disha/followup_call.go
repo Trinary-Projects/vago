@@ -147,6 +147,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	}
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
 	registerFollowUpTools(llm, task, deps, pl)
+	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
 	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
@@ -159,6 +160,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		userIdle,
 		contextAggregators.User(),
 		llm,
+		llmResponseTimeout,
 		llmOutputFilter,
 		tts,
 		playback,
