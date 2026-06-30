@@ -206,17 +206,9 @@ func loadSalesPrompt(ctx context.Context, store *DocumentStore, startup CallStar
 	}
 
 	vars := DocumentVariables{
-		"patient_info":     startup.Data.Conversation.PatientInfo,
-		"current_datetime": time.Now().In(istLocation()).Format("2 Jan 2006 15:04:05"),
-		// short_term_memory mirrors Python's fetch_conversation: the
-		// user-profile value concatenated with `unprocessed_chat_context`
-		// when present. Today's sales prompts don't reference it, but
-		// exposing it keeps us compatible with future prompt edits
-		// without another code change.
-		"short_term_memory": mergeShortTermMemory(
-			derefString(startup.Data.UserProfile.ShortTermMemory),
-			derefString(startup.Data.UnprocessedChatContext),
-		),
+		"patient_info":      startup.Data.Conversation.PatientInfo,
+		"current_datetime":  time.Now().In(istLocation()).Format("2 Jan 2006 15:04:05"),
+		"short_term_memory": derefString(startup.Data.UserProfile.PatientExecutiveProfile),
 	}
 	text, version, config, err := store.GetDocumentWithConfig(ctx, name, 0, vars)
 	if err != nil {

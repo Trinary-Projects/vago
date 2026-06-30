@@ -276,26 +276,6 @@ func parseResumedChunkCreated(payload map[string]any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// mergeShortTermMemory replicates Python's fetch_conversation.py:
-// short_term_memory is concatenated with unprocessed_chat_context
-// using a double newline separator. Either side may be empty. This is
-// part of the shared resume/initial-flow memory, independent of bot
-// type.
-func mergeShortTermMemory(shortTerm, unprocessed string) string {
-	shortTerm = strings.TrimSpace(shortTerm)
-	unprocessed = strings.TrimSpace(unprocessed)
-	switch {
-	case shortTerm == "" && unprocessed == "":
-		return ""
-	case shortTerm == "":
-		return unprocessed
-	case unprocessed == "":
-		return shortTerm
-	default:
-		return shortTerm + "\n\n" + unprocessed
-	}
-}
-
 func derefString(s *string) string {
 	if s == nil {
 		return ""

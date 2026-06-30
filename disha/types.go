@@ -33,7 +33,8 @@ type UserProfileData struct {
 	Phone                             string         `json:"phone"`
 	RemainingSalesCallTalktimeSeconds *float64       `json:"remaining_sales_call_talktime_seconds"`
 	CampaignPricingExperimentFlag     *string        `json:"campaign_pricing_experiment_flag"`
-	ShortTermMemory                   *string        `json:"short_term_memory"`
+	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
+	ActiveChatContext                 *string        `json:"active_chat_context"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
 	DevanagariName                    string         `json:"devanagari_name"`

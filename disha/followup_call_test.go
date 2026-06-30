@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +60,8 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 
 	conversationID := "follow-1"
 	userID := "user-1"
-	shortTerm := "Sleeps late"
+	patientExecutiveProfile := "Formatted patient executive profile"
+	activeChatContext := "Recent active chat context"
 	unprocessed := "Recent chat note"
 	schedule := map[string]any{
 		"checkin_slots": map[string]any{"morning": "8 AM"},
@@ -70,7 +72,7 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 		followUpPromptD1Inactive,
 		"production",
 		9,
-		"FOLLOWUP patient={{ patient_info }} memory={{ patient_memory }} name={{ patient_name }} pronoun={{ he_she }} schedule={{ patient_schedule }}",
+		"FOLLOWUP patient={{ patient_info }} memory={{ patient_memory }} active={{ active_chat_context }} when={{ current_datetime }} name={{ patient_name }} pronoun={{ he_she }} schedule={{ patient_schedule }}",
 	)
 	seedConversationData(t, redisServer, conversationID, ConversationData{
 		Conversation: ConversationRow{
@@ -84,12 +86,13 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 			{"chunk-1", "user", "hello", false, nil},
 		},
 		UserProfile: UserProfileData{
-			UserID:             userID,
-			ShortTermMemory:    &shortTerm,
-			IdealCallTimeSlots: schedule,
-			DevanagariName:     "रिया",
-			FirstName:          "Riya",
-			Gender:             "female",
+			UserID:                  userID,
+			PatientExecutiveProfile: &patientExecutiveProfile,
+			ActiveChatContext:       &activeChatContext,
+			IdealCallTimeSlots:      schedule,
+			DevanagariName:          "रिया",
+			FirstName:               "Riya",
+			Gender:                  "female",
 		},
 		UnprocessedChatContext: &unprocessed,
 	})
@@ -112,10 +115,13 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	}
 	if len(pl.InitialMessages) != 2 ||
 		pl.InitialMessages[0].Role != "system" ||
-		!containsAll(pl.InitialMessages[0].Content, "FOLLOWUP", "Riya, age 32", "Sleeps late\n\nRecent chat note", "रिया", "she") ||
+		!containsAll(pl.InitialMessages[0].Content, "FOLLOWUP", "Riya, age 32", "Formatted patient executive profile", "Recent active chat context", "रिया", "she") ||
 		pl.InitialMessages[1].Role != "user" ||
 		pl.InitialMessages[1].Content != "hello" {
 		t.Fatalf("InitialMessages = %+v", pl.InitialMessages)
+	}
+	if strings.Contains(pl.InitialMessages[0].Content, "Recent chat note") {
+		t.Fatalf("InitialMessages should not append unprocessed chat context into patient memory: %+v", pl.InitialMessages)
 	}
 	if pl.PromptMetadata["system_prompt_name"] != followUpPromptD1Inactive ||
 		pl.PromptMetadata["system_prompt_version"] != 9 {
@@ -129,8 +135,21 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	if !ok {
 		t.Fatalf("system_prompt_variables = %#v, want DocumentVariables", pl.PromptMetadata["system_prompt_variables"])
 	}
-	if vars["patient_memory"] != "Sleeps late\n\nRecent chat note" {
+	if vars["patient_memory"] != patientExecutiveProfile {
 		t.Fatalf("patient_memory = %#v", vars["patient_memory"])
+	}
+	if vars["patient_executive_profile"] != patientExecutiveProfile {
+		t.Fatalf("patient_executive_profile = %#v", vars["patient_executive_profile"])
+	}
+	if vars["active_chat_context"] != activeChatContext {
+		t.Fatalf("active_chat_context = %#v", vars["active_chat_context"])
+	}
+	currentDatetime, ok := vars["current_datetime"].(string)
+	if !ok {
+		t.Fatalf("current_datetime = %#v, want string", vars["current_datetime"])
+	}
+	if _, err := time.Parse("2 Jan 2006 03:04 PM", currentDatetime); err != nil {
+		t.Fatalf("current_datetime = %q, want AM/PM IST prompt format: %v", currentDatetime, err)
 	}
 	// Python extracts checkin_slots: `_slots.get("checkin_slots") or _slots`.
 	if !reflect.DeepEqual(vars["patient_schedule"], schedule["checkin_slots"]) {
@@ -325,5 +344,8 @@ func TestFollowUpBotPlanDynamicLoadsCallFlowAndTools(t *testing.T) {
 	vars, ok := pl.PromptMetadata["system_prompt_variables"].(DocumentVariables)
 	if !ok || vars["call_flow"] != "CALL FLOW BODY" {
 		t.Fatalf("call_flow vars = %#v", pl.PromptMetadata["system_prompt_variables"])
+	}
+	if vars["active_chat_context"] != "" {
+		t.Fatalf("active_chat_context = %#v, want empty fallback", vars["active_chat_context"])
 	}
 }

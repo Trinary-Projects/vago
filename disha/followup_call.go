@@ -218,20 +218,18 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 	user := data.UserProfile
 	gender := strings.ToLower(strings.TrimSpace(user.Gender))
 	name := firstNonEmptyString(user.DevanagariName, user.FirstName, user.Name)
-	shortTermMemory := mergeShortTermMemory(
-		derefString(user.ShortTermMemory),
-		derefString(data.UnprocessedChatContext),
-	)
+	patientExecutiveProfile := derefString(user.PatientExecutiveProfile)
 	var callFlowValue any
 	if callFlow != "" {
 		callFlowValue = callFlow
 	}
 	return DocumentVariables{
 		"patient_info":              data.Conversation.PatientInfo,
-		"patient_memory":            shortTermMemory,
-		"current_datetime":          time.Now().In(istLocation()).Format("2 Jan 2006 15:04:05"),
+		"patient_memory":            patientExecutiveProfile,
+		"current_datetime":          time.Now().In(istLocation()).Format("2 Jan 2006 03:04 PM"),
 		"diet_chart_xml":            user.LastDietChartXML,
-		"patient_executive_profile": shortTermMemory,
+		"patient_executive_profile": patientExecutiveProfile,
+		"active_chat_context":       derefString(user.ActiveChatContext),
 		"patient_name":              name,
 		"patient_schedule":          patientScheduleFromSlots(user.IdealCallTimeSlots),
 		"he_she":                    subjectPronoun(gender),

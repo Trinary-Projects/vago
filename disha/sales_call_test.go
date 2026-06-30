@@ -82,7 +82,7 @@ func seedConversationData(t *testing.T, server *miniredis.Miniredis, conversatio
 
 // testSalesPrompt is the body the test harness seeds into the document
 // store. Production reads the real Langfuse prompt from Redis.
-const testSalesPrompt = "TEST_SYSTEM_PROMPT patient={{ patient_info }} when={{ current_datetime }}"
+const testSalesPrompt = "TEST_SYSTEM_PROMPT patient={{ patient_info }} profile={{ short_term_memory }} when={{ current_datetime }}"
 
 func seedDocument(t *testing.T, server *miniredis.Miniredis, name, env string, version int, body string) {
 	t.Helper()
@@ -216,6 +216,8 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 	remainingTalkTime := 2.5
 	conversationID := "conv-1"
 	userID := "user-1"
+	patientExecutiveProfile := "Sales patient executive profile"
+	unprocessed := "Recent chat note"
 	seedDocument(t, redisServer, salesPromptDefault, "production", 17, testSalesPrompt)
 	seedConversationData(t, redisServer, conversationID, ConversationData{
 		Conversation: ConversationRow{
@@ -235,7 +237,9 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 			UserID:                            userID,
 			Phone:                             "+15551234567",
 			RemainingSalesCallTalktimeSeconds: &remainingTalkTime,
+			PatientExecutiveProfile:           &patientExecutiveProfile,
 		},
+		UnprocessedChatContext: &unprocessed,
 	})
 
 	pl, err := SalesCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
@@ -250,7 +254,7 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 	}
 	if len(pl.InitialMessages) != 4 ||
 		pl.InitialMessages[0].Role != "system" ||
-		!containsAll(pl.InitialMessages[0].Content, "TEST_SYSTEM_PROMPT", "patient=Riya, age 32") ||
+		!containsAll(pl.InitialMessages[0].Content, "TEST_SYSTEM_PROMPT", "patient=Riya, age 32", "profile=Sales patient executive profile") ||
 		pl.InitialMessages[1].Role != "user" ||
 		pl.InitialMessages[1].Content != "hello" ||
 		pl.InitialMessages[2].Role != "assistant" ||
@@ -275,6 +279,12 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 	}
 	if _, ok := promptVars["current_datetime"].(string); !ok {
 		t.Fatalf("current_datetime = %#v, want string", promptVars["current_datetime"])
+	}
+	if promptVars["short_term_memory"] != patientExecutiveProfile {
+		t.Fatalf("short_term_memory = %#v, want cached patient executive profile", promptVars["short_term_memory"])
+	}
+	if strings.Contains(promptVars["short_term_memory"].(string), unprocessed) {
+		t.Fatalf("short_term_memory should not include unprocessed chat context: %#v", promptVars["short_term_memory"])
 	}
 	events := pl.Callbacks.Events()
 	turnAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
