@@ -140,6 +140,7 @@ func NewInterruptFrame() InterruptFrame {
 func (f InterruptFrame) FrameType() FrameType  { return Interrupt }
 func (f InterruptFrame) IsSystem() bool        { return true }
 func (f InterruptFrame) IsInterruptible() bool { return false }
+func (f InterruptFrame) Clone() Frame          { return NewInterruptFrame() }
 
 type LLMResponseStartFrame struct {
 	FrameBase
