@@ -442,19 +442,19 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 		t.Fatalf("provider = %#v, want object", body["provider"])
 	}
 	order, ok := provider["order"].([]any)
-	if !ok || len(order) != 4 || order[0] != "modelrun/fp4" || order[1] != "wandb/bf16" || order[2] != "together" || order[3] != "parasail/fp8" {
+	if !ok || len(order) != 3 || order[0] != "modelrun/fp4" || order[1] != "wandb/bf16" || order[2] != "together" {
 		t.Fatalf("provider.order = %#v", provider["order"])
 	}
 	only, ok := provider["only"].([]any)
-	if !ok || len(only) != 4 || only[0] != "modelrun/fp4" || only[1] != "wandb/bf16" || only[2] != "together" || only[3] != "parasail/fp8" {
+	if !ok || len(only) != 3 || only[0] != "modelrun/fp4" || only[1] != "wandb/bf16" || only[2] != "together" {
 		t.Fatalf("provider.only = %#v", provider["only"])
 	}
 	ignored, ok := provider["ignore"].([]any)
-	if !ok || len(ignored) != 3 || ignored[0] != "google-ai-studio" {
+	if !ok || len(ignored) != 5 || ignored[0] != "google-ai-studio" || ignored[3] != "deepinfra/fp8" || ignored[4] != "parasail/fp8" {
 		t.Fatalf("provider.ignore = %#v", provider["ignore"])
 	}
-	if provider["allow_fallbacks"] != true {
-		t.Fatalf("provider.allow_fallbacks = %#v, want true", provider["allow_fallbacks"])
+	if provider["allow_fallbacks"] != false {
+		t.Fatalf("provider.allow_fallbacks = %#v, want false", provider["allow_fallbacks"])
 	}
 }
 
