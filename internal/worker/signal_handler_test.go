@@ -22,11 +22,12 @@ func TestHandleShutdownSignalEnqueuesGracefulShutdownOnce(t *testing.T) {
 		exitCodes = append(exitCodes, code)
 	}
 	t.Setenv("HOSTNAME", "pod-1")
+	t.Setenv("POD_UID", "uid-1")
 
 	rt.HandleShutdownSignal(syscall.SIGTERM)
 	rt.HandleShutdownSignal(syscall.SIGTERM)
 
-	raw, ok, err := redisClient.GetCache(context.Background(), "pod_sigterm:pod-1")
+	raw, ok, err := redisClient.GetCache(context.Background(), "pod_sigterm:pod-1:uid-1")
 	if err != nil {
 		t.Fatalf("GetCache sigterm key: %v", err)
 	}
@@ -46,7 +47,8 @@ func TestHandleShutdownSignalEnqueuesGracefulShutdownOnce(t *testing.T) {
 		requests[0].Body["func_name"] != "on_graceful_shutdown_initiated" ||
 		requests[0].Body["sqs_queue"] != "fifo-p0-fast-l1" ||
 		requests[0].Body["message_group_id"] != "pod-1" ||
-		kwargs["pod_name"] != "pod-1" {
+		kwargs["pod_name"] != "pod-1" ||
+		kwargs["pod_uid"] != "uid-1" {
 		t.Fatalf("enqueue body mismatch: %+v", requests[0].Body)
 	}
 	if len(exitCodes) != 0 {
@@ -79,6 +81,7 @@ func TestHandleShutdownSignalExitsOnSigint(t *testing.T) {
 		exitCodes = append(exitCodes, code)
 	}
 	t.Setenv("HOSTNAME", "pod-1")
+	t.Setenv("POD_UID", "uid-1")
 
 	rt.HandleShutdownSignal(syscall.SIGINT)
 

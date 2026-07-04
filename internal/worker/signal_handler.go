@@ -46,16 +46,18 @@ func (r *Runtime) HandleShutdownSignal(sig os.Signal) {
 		r.exitProcess(0)
 		return
 	}
+	podUID := strings.TrimSpace(os.Getenv("POD_UID"))
 
 	log.Println("Allowing graceful shutdown to proceed...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := EnqueueWorkerGracefulShutdown(ctx, r.deps, podName); err != nil {
+	if err := EnqueueWorkerGracefulShutdown(ctx, r.deps, podName, podUID); err != nil {
 		sentryutil.Capture(sentryutil.Event{
 			Err:  err,
 			Tags: map[string]string{"component": "signal_handler"},
 			Details: map[string]any{
 				"pod_name": podName,
+				"pod_uid":  podUID,
 				"signal":   sig.String(),
 			},
 		})

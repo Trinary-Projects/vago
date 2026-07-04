@@ -222,7 +222,7 @@ func reorderToolResultMessages(msgs []voicepipelinecore.Message) []voicepipeline
 // buildResumeSystemMessage reproduces fetch_conversation.py's
 // resume-message logic, but driven by the cached `resumed_chunk`
 // payload that Disha already writes to conversation_data in Redis.
-// Returns "" when no resume nudge is needed (no chunk to resume from,
+// Returns "" when no resume nudge is needed (no chunk to resume from,to
 // resume_gracefully=false, etc).
 func buildResumeSystemMessage(data *ConversationData, now time.Time) string {
 	if data == nil {

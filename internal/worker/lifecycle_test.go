@@ -105,11 +105,11 @@ func TestEnqueueWorkerGracefulShutdownSetsSigtermKeyAndEnqueuesJob(t *testing.T)
 	apiServer, apiRecorder := newWorkerAPIServer(t)
 	api := disha.NewAPIClient(apiServer.URL, 10*time.Second, nil)
 
-	if err := EnqueueWorkerGracefulShutdown(context.Background(), testDeps(redisClient, api), "pod-1"); err != nil {
+	if err := EnqueueWorkerGracefulShutdown(context.Background(), testDeps(redisClient, api), "pod-1", "uid-1"); err != nil {
 		t.Fatalf("EnqueueWorkerGracefulShutdown: %v", err)
 	}
 
-	raw, ok, err := redisClient.GetCache(context.Background(), workerSigtermKey("pod-1"))
+	raw, ok, err := redisClient.GetCache(context.Background(), workerSigtermKey("pod-1", "uid-1"))
 	if err != nil {
 		t.Fatalf("GetCache sigterm key: %v", err)
 	}
@@ -130,7 +130,8 @@ func TestEnqueueWorkerGracefulShutdownSetsSigtermKeyAndEnqueuesJob(t *testing.T)
 		requests[0].Body["func_name"] != "on_graceful_shutdown_initiated" ||
 		requests[0].Body["sqs_queue"] != "fifo-p0-fast-l1" ||
 		requests[0].Body["message_group_id"] != "pod-1" ||
-		kwargs["pod_name"] != "pod-1" {
+		kwargs["pod_name"] != "pod-1" ||
+		kwargs["pod_uid"] != "uid-1" {
 		t.Fatalf("enqueue body mismatch: %+v", requests[0].Body)
 	}
 }

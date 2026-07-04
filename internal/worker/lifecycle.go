@@ -122,7 +122,7 @@ func EnqueueWorkerCleanup(ctx context.Context, deps disha.Deps, podName string) 
 	return nil
 }
 
-func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName string) error {
+func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName, podUID string) error {
 	if deps.Redis == nil {
 		return errors.New("disha: Redis dependency is required")
 	}
@@ -132,7 +132,7 @@ func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName
 	if podName == "" {
 		return errors.New("disha: pod_name is required")
 	}
-	if err := deps.Redis.SetCache(ctx, workerSigtermKey(podName), true, workerSigtermTTL); err != nil {
+	if err := deps.Redis.SetCache(ctx, workerSigtermKey(podName, podUID), true, workerSigtermTTL); err != nil {
 		sentryutil.Capture(sentryutil.Event{
 			Err: err,
 			Tags: map[string]string{
@@ -141,16 +141,21 @@ func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName
 			},
 			Details: map[string]any{
 				"pod_name": podName,
+				"pod_uid":  podUID,
 			},
 		})
 		return err
 	}
+	kwargs := map[string]any{
+		"pod_name": podName,
+	}
+	if podUID != "" {
+		kwargs["pod_uid"] = podUID
+	}
 	if err := deps.API.EnqueueJob(ctx, disha.EnqueueJobRequest{
-		ModuleName: "bots.signal_handler",
-		FuncName:   "on_graceful_shutdown_initiated",
-		Kwargs: map[string]any{
-			"pod_name": podName,
-		},
+		ModuleName:     "bots.signal_handler",
+		FuncName:       "on_graceful_shutdown_initiated",
+		Kwargs:         kwargs,
 		SQSQueue:       "fifo-p0-fast-l1",
 		MessageGroupID: podName,
 	}); err != nil {
@@ -162,6 +167,7 @@ func EnqueueWorkerGracefulShutdown(ctx context.Context, deps disha.Deps, podName
 			},
 			Details: map[string]any{
 				"pod_name": podName,
+				"pod_uid":  podUID,
 			},
 		})
 		return err
@@ -173,7 +179,10 @@ func workerRegistrationKey(podName, podUID string) string {
 	return fmt.Sprintf("registered_pod:%s:%s", podName, podUID)
 }
 
-func workerSigtermKey(podName string) string {
+func workerSigtermKey(podName, podUID string) string {
+	if podUID != "" {
+		return fmt.Sprintf("pod_sigterm:%s:%s", podName, podUID)
+	}
 	return fmt.Sprintf("pod_sigterm:%s", podName)
 }
 
