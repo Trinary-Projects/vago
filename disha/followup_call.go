@@ -341,7 +341,7 @@ func getFollowUpGuidance(ctx context.Context, deps Deps, pl *followUpPlan, situa
 	if deps.Documents == nil {
 		return "", errors.New("disha: document store is required for get_guidance")
 	}
-	systemVariables := DocumentVariables{"situation": situation}
+	systemVariables := followUpGuidancePromptVariables(pl, situation)
 	systemPrompt, systemVersion, err := deps.Documents.GetDocument(ctx, followUpGetGuidancePrompt, 0, systemVariables)
 	if err != nil {
 		return "", err
@@ -376,6 +376,13 @@ func getFollowUpGuidance(ctx context.Context, deps Deps, pl *followUpPlan, situa
 		return "", err
 	}
 	return b.String(), nil
+}
+
+func followUpGuidancePromptVariables(pl *followUpPlan, situation string) DocumentVariables {
+	return DocumentVariables{
+		"situation":                 situation,
+		"patient_executive_profile": derefString(pl.Startup.Data.UserProfile.PatientExecutiveProfile),
+	}
 }
 
 // reportGuidanceLLMFailure sends get_guidance LLM failures to Sentry. The

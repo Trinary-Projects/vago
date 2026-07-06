@@ -349,3 +349,25 @@ func TestFollowUpBotPlanDynamicLoadsCallFlowAndTools(t *testing.T) {
 		t.Fatalf("active_chat_context = %#v, want empty fallback", vars["active_chat_context"])
 	}
 }
+
+func TestFollowUpGuidancePromptVariablesIncludePatientExecutiveProfile(t *testing.T) {
+	patientExecutiveProfile := "Formatted patient executive profile"
+	pl := &followUpPlan{
+		Startup: CallStartup{
+			Data: &ConversationData{
+				UserProfile: UserProfileData{
+					PatientExecutiveProfile: &patientExecutiveProfile,
+				},
+			},
+		},
+	}
+
+	vars := followUpGuidancePromptVariables(pl, "patient is worried about dinner")
+
+	if vars["situation"] != "patient is worried about dinner" {
+		t.Fatalf("situation = %#v", vars["situation"])
+	}
+	if vars["patient_executive_profile"] != patientExecutiveProfile {
+		t.Fatalf("patient_executive_profile = %#v", vars["patient_executive_profile"])
+	}
+}
