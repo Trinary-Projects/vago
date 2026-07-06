@@ -186,9 +186,9 @@ var endpointConfigs = map[string]endpointConfig{
 		Temperature: floatPtr(0.5),
 		ExtraBody: map[string]any{
 			"provider": map[string]any{
-				"order":           []string{"modelrun/fp4", "wandb/bf16", "together"},
-				"only":            []string{"modelrun/fp4", "wandb/bf16", "together"},
-				"ignore":          []string{"google-ai-studio", "google-vertex", "novita", "deepinfra/fp8", "parasail/fp8"},
+				"order":           []string{"modelrun/fp4", "wandb/bf16"},
+				"only":            []string{"modelrun/fp4", "wandb/bf16"},
+				"ignore":          []string{"google-ai-studio", "google-vertex", "novita", "deepinfra/fp8", "parasail/fp8", "together"},
 				"allow_fallbacks": false,
 			},
 		},
