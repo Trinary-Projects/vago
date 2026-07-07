@@ -37,7 +37,10 @@ func (r *Router) buildRequest(ctx context.Context, cfg endpointConfig, llmReq vp
 	if llmReq.ToolChoice != nil {
 		body["tool_choice"] = llmReq.ToolChoice
 	}
-	if cfg.MaxTokens != nil {
+	switch {
+	case r.cfg.MaxTokens != nil:
+		body["max_tokens"] = *r.cfg.MaxTokens
+	case cfg.MaxTokens != nil:
 		body["max_tokens"] = *cfg.MaxTokens
 	}
 	// Provider/model-specific extra request fields (e.g. reasoning toggles),
@@ -134,10 +137,13 @@ func (r *Router) apiKeyFor(ctx context.Context, cfg endpointConfig) (string, err
 	return key, nil
 }
 
-// temperatureFor returns the endpoint's configured temperature. The
-// temperature is part of the model configuration (the registry), not a
-// caller-supplied value; it defaults to 0 when a config doesn't set one.
+// temperatureFor returns the temperature for a call: the per-client
+// Config override when set (Python passes temperature per call on the
+// failover paths), else the endpoint registry's value, else 0.
 func (r *Router) temperatureFor(cfg endpointConfig) float64 {
+	if r.cfg.Temperature != nil {
+		return *r.cfg.Temperature
+	}
 	if cfg.Temperature != nil {
 		return *cfg.Temperature
 	}

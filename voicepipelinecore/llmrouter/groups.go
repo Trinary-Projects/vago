@@ -208,6 +208,41 @@ var endpointConfigs = map[string]endpointConfig{
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		MaxTokens: intPtr(500),
 	},
+
+	// --- hedged one-shot hedge endpoint ---
+	// Python's gpt_oss120_fast_hedged pair uses OpenRouter with
+	// provider_sort="throughput" for the hedge leg. It gets its own key
+	// (instead of reusing openrouter_gpt_oss_120b) so blacklist
+	// write-back for hedge attempts lands on the config that actually
+	// misbehaved and get_guidance's health entries stay untouched.
+	"openrouter_gpt_oss_120b_throughput": {
+		Key: "openrouter_gpt_oss_120b_throughput", Provider: providerOpenRouter,
+		Model: "openai/gpt-oss-120b", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+		MaxTokens: intPtr(500),
+		ExtraBody: map[string]any{
+			"provider": map[string]any{"sort": "throughput"},
+		},
+	},
+}
+
+// hedgedPair is a fixed ordered primary/hedge endpoint pair for the
+// hedged one-shot client (Python FAILOVER_CONFIGS: config_list[0]/[1],
+// not health-ranked).
+type hedgedPair struct {
+	Primary string
+	Hedge   string
+}
+
+// GroupGPTOSS120FastHedged mirrors Python's gpt_oss120_fast_hedged
+// failover config: Cerebras primary, OpenRouter throughput-sorted hedge.
+const GroupGPTOSS120FastHedged = "gpt-oss120-fast-hedged"
+
+var hedgedPairs = map[string]hedgedPair{
+	GroupGPTOSS120FastHedged: {
+		Primary: "cerebras_gpt_oss_120b",
+		Hedge:   "openrouter_gpt_oss_120b_throughput",
+	},
 }
 
 // modelGroups is the Go port of MODEL_GROUPS for the Disha call bots.

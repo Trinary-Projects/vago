@@ -129,6 +129,52 @@ func TestLLM_DelegatesToClientAndReportsModel(t *testing.T) {
 	}
 }
 
+// TestLLM_FiresOnLLMCallCompleted verifies the OnLLMCallCompleted call
+// event carries the full generated text with interrupted=false on a
+// clean completion, and interrupted=true with the partial text when the
+// client fails mid-stream (Python: is_interrupted = not completed).
+func TestLLM_FiresOnLLMCallCompleted(t *testing.T) {
+	type completedEvent struct {
+		text        string
+		interrupted bool
+	}
+	run := func(t *testing.T, client *stubLLMClient) []completedEvent {
+		fix := newTestFixture(t)
+		var mu sync.Mutex
+		var events []completedEvent
+		fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+			OnLLMCallCompleted: func(text string, interrupted bool) {
+				mu.Lock()
+				events = append(events, completedEvent{text, interrupted})
+				mu.Unlock()
+			},
+		})
+		p := NewLLMProcessorWithClient(fix.TaskCtx, client)
+		runProcessorTest(t, fix, runConfig{
+			processor: p,
+			framesToSend: []Frame{
+				LLMMessagesFrame{Messages: []Message{{Role: "user", Content: "hi"}}},
+			},
+			settleDelay:  200 * time.Millisecond,
+			sendEndFrame: true,
+		})
+		fix.TaskCtx.callEvents.stopAndDrain()
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]completedEvent(nil), events...)
+	}
+
+	completed := run(t, &stubLLMClient{tokens: []string{"foo ", "bar"}, model: "m"})
+	if len(completed) != 1 || completed[0].text != "foo bar" || completed[0].interrupted {
+		t.Errorf("completed events = %+v, want one {foo bar,false}", completed)
+	}
+
+	errored := run(t, &stubLLMClient{tokens: []string{"par", "tial"}, model: "m", err: errors.New("endpoint 500")})
+	if len(errored) != 1 || errored[0].text != "partial" || !errored[0].interrupted {
+		t.Errorf("errored events = %+v, want one {partial,true}", errored)
+	}
+}
+
 // TestLLM_LiveErrorClosesTurn verifies that a live (non-cancellation)
 // client error still emits LLMResponseEndFrame, so the turn returns to a
 // terminal state (TTS flushes, UserIdle can arm) instead of leaving the

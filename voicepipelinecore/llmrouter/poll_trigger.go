@@ -28,6 +28,11 @@ const (
 // even when a fallback group is currently in use, so the exhausted
 // primary endpoints get refreshed.
 func (r *Router) triggerPoll(reason string) {
+	// Fixed-endpoint mode has no group to re-rank (Python's failover
+	// service never touches the poller).
+	if r.cfg.FixedEndpoint != "" {
+		return
+	}
 	if r.pollTriggerURL == "" || r.cfg.Redis == nil {
 		return
 	}

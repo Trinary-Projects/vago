@@ -89,7 +89,14 @@ type CallEvents struct {
 	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
-	OnCallEnded              func(reason EndReason, stats CallStats)
+	// OnLLMCallCompleted fires when an LLM call finishes, with the
+	// generated response text (not the played text) and whether the call
+	// was cut short (barge-in/EndFrame cancellation or a stream error).
+	// Mirrors Python CustomOpenAILLMService's on_llm_call_complete event
+	// (is_interrupted = not completed); the onboarding stage-transition
+	// tracker consumes it.
+	OnLLMCallCompleted func(text string, interrupted bool)
+	OnCallEnded        func(reason EndReason, stats CallStats)
 }
 
 // TurnMetrics is a per-assistant-turn snapshot assembled from the

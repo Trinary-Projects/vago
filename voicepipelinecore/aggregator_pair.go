@@ -13,6 +13,15 @@ func NewContextAggregatorPair(taskCtx *TaskContext, initialMessages []Message, m
 	}
 }
 
+// ReplaceSystemMessage swaps the shared conversation history's system
+// message mid-call (mutex-guarded on the shared-state lock). The next
+// LLM run picks up the new prompt; an in-flight run keeps the snapshot
+// it already took, matching Python where a transition lands between
+// turns.
+func (p *ContextAggregatorPair) ReplaceSystemMessage(text string) {
+	p.user.state.replaceSystemMessage(text)
+}
+
 func (p *ContextAggregatorPair) User() *UserContextAggregator {
 	if p == nil {
 		return nil

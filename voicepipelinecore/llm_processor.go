@@ -164,6 +164,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	p.PushFrame(NewLLMResponseStartFrame(startedAt), Downstream)
 
 	var ttfbMs *float64
+	var responseText strings.Builder
 	firstToken := true
 	onToken := func(content string) {
 		if content == "" {
@@ -176,6 +177,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 				p.PushFrame(*mf, Downstream)
 			}
 		}
+		responseText.WriteString(content)
 		p.PushFrame(NewTextFrame(content), Downstream)
 	}
 
@@ -196,6 +198,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	// frames here (they'd be processed after the reset).
 	if ctx.Err() != nil {
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
+		p.fireLLMCallCompleted(responseText.String(), true)
 		return
 	}
 	if err != nil {
@@ -212,6 +215,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		p.taskCtx.Logger.Println("LLM stream failed:", err)
 		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
+		p.fireLLMCallCompleted(responseText.String(), true)
 		return
 	}
 
@@ -221,6 +225,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	}
 	p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 	p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "completed")
+	p.fireLLMCallCompleted(responseText.String(), false)
 	if len(result.ToolCalls) > 0 {
 		p.Go(func() { p.executeToolCalls(ctx, result.ToolCalls) })
 	}
@@ -371,6 +376,16 @@ func (p *LLMProcessor) reportToolResultError(functionName, toolCallID string, er
 			"tool_call_id":  toolCallID,
 		},
 	})
+}
+
+// fireLLMCallCompleted forwards the finished call's generated text to
+// the OnLLMCallCompleted call event (Python's on_llm_call_complete with
+// is_interrupted = not completed).
+func (p *LLMProcessor) fireLLMCallCompleted(text string, interrupted bool) {
+	if p.taskCtx == nil || p.taskCtx.callEvents == nil {
+		return
+	}
+	p.taskCtx.callEvents.fireLLMCallCompleted(text, interrupted)
 }
 
 // emitLLMCallResult publishes the Python-compatible RTVI server-message
