@@ -34,6 +34,7 @@ type UserProfileData struct {
 	RemainingSalesCallTalktimeSeconds *float64       `json:"remaining_sales_call_talktime_seconds"`
 	CampaignPricingExperimentFlag     *string        `json:"campaign_pricing_experiment_flag"`
 	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
+	OnboardingCallVariant             *string        `json:"onboarding_call_variant"`
 	ActiveChatContext                 *string        `json:"active_chat_context"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
@@ -88,6 +89,21 @@ type PostCallOperationsRequest struct {
 	FitnessPlanIntensityLevel      *string        `json:"fitness_plan_intensity_level"`
 	LatestOnboardingCallStage      *string        `json:"latest_onboarding_call_stage"`
 	ConversationVariables          map[string]any `json:"conversation_variables"`
+}
+
+// SetUserCareplanRequest mirrors VoiceBotAPIService.set_user_careplan's
+// payload for POST /bot/set_user_careplan.
+type SetUserCareplanRequest struct {
+	UserID             string  `json:"user_id"`
+	OnboardingCarePlan string  `json:"onboarding_care_plan"`
+	DetectedCarePlan   *string `json:"detected_care_plan"`
+}
+
+// AddTagToUserRequest mirrors VoiceBotAPIService.add_tag_to_user's
+// payload for POST /bot/add_tag_to_user.
+type AddTagToUserRequest struct {
+	UserID  string `json:"user_id"`
+	TagName string `json:"tag_name"`
 }
 
 type EnqueueJobRequest struct {

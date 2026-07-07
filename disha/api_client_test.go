@@ -301,6 +301,121 @@ func TestAPIClientContextCancellation(t *testing.T) {
 	}
 }
 
+func TestAPIClientSetUserCareplan(t *testing.T) {
+	server, requests := captureAPIRequest(t, http.StatusOK)
+	client := NewAPIClient(server.URL, 0, nil)
+
+	detected := "hair_loss"
+	err := client.SetUserCareplanWithFallback(context.Background(), SetUserCareplanRequest{
+		UserID:             "user-1",
+		OnboardingCarePlan: "general",
+		DetectedCarePlan:   &detected,
+	})
+	if err != nil {
+		t.Fatalf("SetUserCareplanWithFallback: %v", err)
+	}
+	got := <-requests
+	if got.Method != http.MethodPost || got.Path != "/bot/set_user_careplan" {
+		t.Fatalf("request = %s %s, want POST /bot/set_user_careplan", got.Method, got.Path)
+	}
+	if got.Body["user_id"] != "user-1" || got.Body["onboarding_care_plan"] != "general" || got.Body["detected_care_plan"] != "hair_loss" {
+		t.Fatalf("body mismatch: %+v", got.Body)
+	}
+}
+
+func TestAPIClientSetUserCareplanNullDetected(t *testing.T) {
+	server, requests := captureAPIRequest(t, http.StatusOK)
+	client := NewAPIClient(server.URL, 0, nil)
+
+	err := client.SetUserCareplan(context.Background(), SetUserCareplanRequest{
+		UserID:             "user-1",
+		OnboardingCarePlan: "general",
+	})
+	if err != nil {
+		t.Fatalf("SetUserCareplan: %v", err)
+	}
+	got := <-requests
+	// Python sends detected_care_plan: null explicitly.
+	if v, ok := got.Body["detected_care_plan"]; !ok || v != nil {
+		t.Fatalf("detected_care_plan = %#v, want present null", v)
+	}
+}
+
+func TestAPIClientAddTagToUser(t *testing.T) {
+	server, requests := captureAPIRequest(t, http.StatusOK)
+	client := NewAPIClient(server.URL, 0, nil)
+
+	err := client.AddTagToUserWithFallback(context.Background(), AddTagToUserRequest{
+		UserID:  "user-1",
+		TagName: "Stage Transition Failure",
+	})
+	if err != nil {
+		t.Fatalf("AddTagToUserWithFallback: %v", err)
+	}
+	got := <-requests
+	if got.Method != http.MethodPost || got.Path != "/bot/add_tag_to_user" {
+		t.Fatalf("request = %s %s, want POST /bot/add_tag_to_user", got.Method, got.Path)
+	}
+	if got.Body["user_id"] != "user-1" || got.Body["tag_name"] != "Stage Transition Failure" {
+		t.Fatalf("body mismatch: %+v", got.Body)
+	}
+}
+
+func TestAPIClientCareplanAndTagFallbacksQueueJobs(t *testing.T) {
+	requests := make(chan capturedAPIRequest, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path, Body: body}
+		if strings.HasPrefix(r.URL.Path, "/bot/") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	t.Cleanup(server.Close)
+	client := NewAPIClient(server.URL, 10*time.Second, nil)
+
+	if err := client.SetUserCareplanWithFallback(context.Background(), SetUserCareplanRequest{
+		UserID:             "user-1",
+		OnboardingCarePlan: "general",
+	}); err != nil {
+		t.Fatalf("SetUserCareplanWithFallback: %v", err)
+	}
+	<-requests // failed API call
+	fallback := <-requests
+	if fallback.Path != "/common/enqueue_job" ||
+		fallback.Body["module_name"] != "bots.operations.voice_bot_operations" ||
+		fallback.Body["func_name"] != "set_user_careplan" ||
+		fallback.Body["sqs_queue"] != "p0-fast-l1" {
+		t.Fatalf("careplan fallback mismatch: %+v", fallback.Body)
+	}
+	kwargs, _ := fallback.Body["kwargs"].(map[string]any)
+	if kwargs["user_id"] != "user-1" || kwargs["onboarding_care_plan"] != "general" {
+		t.Fatalf("careplan fallback kwargs mismatch: %+v", kwargs)
+	}
+
+	if err := client.AddTagToUserWithFallback(context.Background(), AddTagToUserRequest{
+		UserID:  "user-1",
+		TagName: "Stage Transition Failure",
+	}); err != nil {
+		t.Fatalf("AddTagToUserWithFallback: %v", err)
+	}
+	<-requests // failed API call
+	fallback = <-requests
+	if fallback.Body["func_name"] != "add_tag_to_user" || fallback.Body["sqs_queue"] != "p0-fast-l1" {
+		t.Fatalf("tag fallback mismatch: %+v", fallback.Body)
+	}
+	kwargs, _ = fallback.Body["kwargs"].(map[string]any)
+	if kwargs["tag_name"] != "Stage Transition Failure" {
+		t.Fatalf("tag fallback kwargs mismatch: %+v", kwargs)
+	}
+}
+
 func TestNewAPIClientDefaults(t *testing.T) {
 	client := NewAPIClient("  ", 0, nil)
 	if client.baseURL != defaultAPIBaseURL {

@@ -73,6 +73,7 @@ type modelGroup struct {
 }
 
 const (
+	groupGrokFast        = "grok-4.1-fast" // onboarding variant configs' model field.
 	groupGrokSales       = "grok-4.1-fast-sales"
 	groupGPT41           = "gpt-4.1" // the sales cross-group fallback target.
 	groupGemini31        = "gemini-flash-3.1-lite"
@@ -214,6 +215,21 @@ var endpointConfigs = map[string]endpointConfig{
 // it participates in normal health-based selection (mirrors Python,
 // where it is the most stable endpoint).
 var modelGroups = map[string]modelGroup{
+	// Identical membership to grok-4.1-fast-sales in Python's
+	// MODEL_GROUPS — both exist as separate keys so their health polls
+	// and poll locks stay per-group.
+	groupGrokFast: {
+		Configs: []string{
+			"grok_4_1_fnr_eastus",
+			"grok_4_1_fnr_eastus2",
+			"grok_4_1_fnr_westus",
+			"grok_4_1_fnr_westus2",
+			"grok_4_1_fnr_westcentralus",
+			"vertex_dishaai_grok_4_1_fast_non_reasoning",
+		},
+		Fallback:      "vertex_dishaai_grok_4_1_fast_non_reasoning",
+		FallbackGroup: groupGPT41,
+	},
 	groupGrokSales: {
 		Configs: []string{
 			"grok_4_1_fnr_eastus",

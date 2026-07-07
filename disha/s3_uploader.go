@@ -58,6 +58,21 @@ func NewS3UploaderFromEnv(logger *log.Logger) JSONUploader {
 	return uploader
 }
 
+// NewUSBucketJSONUploaderFromEnv returns a JSON PUT client for the US
+// bucket (AWS_US_BUCKET_NAME in AWS_US_REGION), used for onboarding's
+// per-chunk conversation-state uploads
+// (conversation_state/{conversation_id}/{chunk_id}.json). Mirrors
+// Python's S3Service.upload_file(use_us_bucket=True), including the
+// public-read ACL.
+func NewUSBucketJSONUploaderFromEnv(logger *log.Logger) JSONUploader {
+	uploader := newS3ClientFromEnv(logger, os.Getenv("AWS_US_BUCKET_NAME"), os.Getenv("AWS_US_REGION"), defaultS3UploadTimeout)
+	if uploader == nil {
+		reportS3EnvIncomplete(logger, "us_bucket_json_upload_client", "AWS_US_BUCKET_NAME", "AWS_US_REGION")
+		return nil
+	}
+	return uploader
+}
+
 // NewS3GetClientFromEnv returns a SigV4-signed GET client for the
 // bucket/region env pair. The region env must hold the bucket's own
 // region — SigV4 and the virtual-host endpoint both encode it, and S3

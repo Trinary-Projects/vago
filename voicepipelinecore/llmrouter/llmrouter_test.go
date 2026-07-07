@@ -224,6 +224,39 @@ func TestSelectionGuidanceGroupUsesOwnFallback(t *testing.T) {
 	}
 }
 
+func TestGrokFastGroupMirrorsSalesGroup(t *testing.T) {
+	// Python MODEL_GROUPS declares grok-4.1-fast (onboarding) with the
+	// same membership and fallback as grok-4.1-fast-sales; they stay
+	// separate keys so health polls and poll locks are per-group.
+	fast, ok := modelGroups[groupGrokFast]
+	if !ok {
+		t.Fatal("grok-4.1-fast group missing")
+	}
+	sales := modelGroups[groupGrokSales]
+	if len(fast.Configs) != len(sales.Configs) {
+		t.Fatalf("configs = %d, want %d", len(fast.Configs), len(sales.Configs))
+	}
+	for i := range fast.Configs {
+		if fast.Configs[i] != sales.Configs[i] {
+			t.Fatalf("configs[%d] = %q, want %q", i, fast.Configs[i], sales.Configs[i])
+		}
+	}
+	if fast.Fallback != sales.Fallback || fast.FallbackGroup != sales.FallbackGroup {
+		t.Fatalf("fallbacks = (%q,%q), want (%q,%q)", fast.Fallback, fast.FallbackGroup, sales.Fallback, sales.FallbackGroup)
+	}
+
+	fr := newFakeRedis()
+	fr.setHealth("grok_4_1_fnr_eastus", false, 400)
+	fr.setHealth("grok_4_1_fnr_westus", false, 200)
+	sel, ok := getFastestForGroup(ctx(), fr, groupGrokFast, "us")
+	if !ok {
+		t.Fatal("expected a selection")
+	}
+	if sel.ConfigKey != "grok_4_1_fnr_westus" || sel.SelectedGroup != groupGrokFast {
+		t.Fatalf("selection = %+v, want fastest healthy grok endpoint in grok-4.1-fast", sel)
+	}
+}
+
 func TestSelectionRegionFilter(t *testing.T) {
 	// south_india azure config must never be selected for region us even
 	// if it has the best latency.
