@@ -124,6 +124,74 @@ func TestLLM_InterruptCancelsClientStream(t *testing.T) {
 	}
 }
 
+func TestLLM_InterruptBeforeFirstTokenEmitsLatencyShape(t *testing.T) {
+	blockUntil := make(chan struct{})
+	var releaseBlock sync.Once
+	defer releaseBlock.Do(func() { close(blockUntil) })
+
+	fix := newTestFixture(t)
+	p := NewLLMProcessorWithClient(fix.TaskCtx, &stubLLMClient{
+		model: "test-model",
+		responses: []stubLLMResponse{{
+			tokens:                []string{"first"},
+			blockBeforeTokenIndex: 0,
+			blockUntil:            blockUntil,
+		}},
+	})
+
+	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	source.Link(p)
+	p.Link(sink)
+	source.Start(fix.RootCtx)
+	p.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	source.QueueFrame(LLMMessagesFrame{Messages: []Message{{Role: "user", Content: "hi"}}}, Downstream)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := findFrame[LLMResponseStartFrame](sink.Captured()); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := findFrame[LLMResponseStartFrame](sink.Captured()); !ok {
+		t.Fatal("expected LLMResponseStartFrame before interrupt")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	source.QueueFrame(InterruptFrame{}, Downstream)
+
+	var data map[string]any
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if found, ok := findLLMCallResult(fix.TaskCtx.UIEvents.Snapshot(), "interrupted", "test-model"); ok {
+			data = found
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	releaseBlock.Do(func() { close(blockUntil) })
+	source.QueueFrame(EndFrame{}, Downstream)
+	time.Sleep(50 * time.Millisecond)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
+
+	if data == nil {
+		t.Fatal("expected interrupted llm_call_result server-message")
+	}
+	if _, ok := data["ttfb_ms"]; !ok {
+		t.Fatalf("ttfb_ms missing from llm_call_result: %+v", data)
+	}
+	if data["ttfb_ms"] != nil {
+		t.Fatalf("ttfb_ms = %#v, want nil before first token", data["ttfb_ms"])
+	}
+	total, ok := data["total_ms"].(float64)
+	if !ok || total <= 0 {
+		t.Fatalf("total_ms = %#v, want positive float64 in llm_call_result: %+v", data["total_ms"], data)
+	}
+}
+
 // TestLLM_EndFrameCancelsInFlight verifies EndFrame cancels the
 // in-flight LLM request via the stored cancel func.
 func TestLLM_EndFrameCancelsInFlight(t *testing.T) {
@@ -213,6 +281,11 @@ type stubLogger struct{}
 func (stubLogger) Write(p []byte) (int, error) { return len(p), nil }
 
 func hasLLMCallResult(entries []RTVIDebugLogEntry, status, model string) bool {
+	_, ok := findLLMCallResult(entries, status, model)
+	return ok
+}
+
+func findLLMCallResult(entries []RTVIDebugLogEntry, status, model string) (map[string]any, bool) {
 	for _, entry := range entries {
 		if entry.Type != "server-message" {
 			continue
@@ -222,10 +295,10 @@ func hasLLMCallResult(entries []RTVIDebugLogEntry, status, model string) bool {
 			continue
 		}
 		if data["type"] == "llm_call_result" && data["status"] == status && data["model"] == model {
-			return true
+			return data, true
 		}
 	}
-	return false
+	return nil, false
 }
 
 // TestLLM_HandlesClientError verifies LLM handles a client stream error

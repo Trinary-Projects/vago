@@ -81,6 +81,7 @@
   <p class="lede">A component-by-component comparison of Disha's Python <code>bots/onboarding_call/</code> bot against the current Vago (talk-go) codebase, and a phased plan to port it as the third bot type alongside <code>sales_call</code> and <code>follow_up</code>.</p>
   <div class="meta">
     <span>Date: 2026-07-06</span>
+    <span>Rev 3: tracker default · D1/D3 approved · hedging in scope</span>
     <span>Python ref: disha-backend @ bots/onboarding_call/</span>
     <span>Go ref: vago @ main (e1b9055)</span>
     <span>Predecessor plans: disha-integration-plan.md, sales-call-drop-in-report.html</span>
@@ -90,7 +91,8 @@
 
 <div class="verdict-banner">
   <h2>Verdict: roughly 60% of onboarding's machinery already exists in Vago. The real work is the stage machine.</h2>
-  <p>Because sales and follow-up were ported first, most of onboarding's <em>shared</em> modules already have Go equivalents — several were literally ported <em>from</em> <code>bots/onboarding_call/</code> (phonetic text filter, LLM response timeout, lazy Soniox connect, sound mixer, tool-chunk resume reordering, chunk persistence shape). The genuinely new work is the onboarding-specific stage complex: variant config, <code>ConversationState</code>, staged prompt compilation, the <code>update_stage</code> tool + StageManager, deep thinking, careplan detection, the stage-threshold reminder processor, per-chunk conversation-state S3 uploads, onboarding post-call fields, and (variant-gated) the stage-transition tracker with fuzzy matching. Three small <strong>core-surface extensions</strong> are needed and require design sign-off per AGENTS.md before implementation (§5).</p>
+  <p>Because sales and follow-up were ported first, most of onboarding's <em>shared</em> modules already have Go equivalents — several were literally ported <em>from</em> <code>bots/onboarding_call/</code> (phonetic text filter, LLM response timeout, lazy Soniox connect, sound mixer, tool-chunk resume reordering, chunk persistence shape). The genuinely new work is the onboarding-specific stage complex: variant config, <code>ConversationState</code>, staged prompt compilation, the StageManager driven by the <strong>background stage-transition tracker with fuzzy matching</strong>, deep thinking, careplan detection, per-chunk conversation-state S3 uploads, and onboarding post-call fields. Two small <strong>core-surface extensions</strong> are needed and require design sign-off per AGENTS.md before implementation (§5).</p>
+  <p><strong>* Decision (Jaideep, 2026-07-06):</strong> the stage-transition <em>tracker</em> is the default architecture for <strong>all</strong> variants going forward. The <code>update_stage</code> tool-call path is <strong>not ported</strong> — no <code>update_stage</code> tool, no tool-handler filler/<code>run_llm</code> logic, and no StageThresholdProcessor (Python wires it only for tool-call variants). This drops former design items D2 and D5 and makes the tracker (former optional phase 7) core scope. <strong>Same-day follow-ups:</strong> D1 and D3 are approved as specified; every stage prompt's <code>config_json</code> can be assumed to carry <code>trigger_statements</code>; and <strong>hedged background-LLM execution is IN scope</strong> (D4 reversed) — a reusable "background call must respond fast" primitive, logically equivalent to Python's hedged failover, interface to be designed (likely future consumer: <code>get_guidance</code>).</p>
 </div>
 
 <section id="toc">
@@ -102,9 +104,9 @@
       <li><a href="#parity">What Vago already has (parity table)</a></li>
       <li><a href="#gaps">Gap analysis — what must be built</a></li>
       <li><a href="#design">Core design decisions needing discussion first</a></li>
-      <li><a href="#phases">Migration plan — phases 0–8</a></li>
+      <li><a href="#phases">Migration plan — phases 0–7</a></li>
       <li><a href="#skip">Do-not-port list</a></li>
-      <li><a href="#questions">Open questions for Jaideep</a></li>
+      <li><a href="#questions">Decision log — questions &amp; answers</a></li>
       <li><a href="#surface">New env / config / API surface</a></li>
       <li><a href="#filemap">Reference file map (Python ↔ Go)</a></li>
     </ol>
@@ -122,7 +124,7 @@
   <p>Routing: <code>BotWorkerManager.run_bot_with_monitoring</code> treats onboarding as the <strong>default</strong> bot type (anything that isn't <code>follow_up</code> / <code>sales_call</code> / <code>post_plan_call</code> runs <code>onboarding_call_daily.run_bot</code>). <code>BotWorkerType</code> includes <code>onboarding_call</code> explicitly, and Vago's <code>create_worker_room</code> already receives <code>bot_worker_type</code>, so the Go side routes cleanly through <code>disha.NewBot("onboarding_call")</code>.</p>
   <h3>Pipeline (Python, <code>base_pipeline_manager.py</code>)</h3>
   <pre><code>transport.input() → rtvi → stt → context_aggregator.user()
-  → [StageThresholdProcessor]            # non-tracker variants only
+  → [StageThresholdProcessor]            # tool-call variants only — NOT in the Go pipeline*
   → llm → LLMResponseTimeoutProcessor(7s) → LLMOutputFilter()
   → tts → transport.output() → context_aggregator.assistant()</code></pre>
   <p>Notable vs sales/follow-up: <strong>no talk-time monitor</strong> (that is sales-only), LLMOutputFilter present (like follow-up), same 7s idle prompt + 120s pipeline idle watchdog, same greet-first kickoff, same lazy Soniox connect via <code>STTConnectFrame</code>, same Cartesia <code>sonic-3</code> Hindi voice <code>95d51f79-…</code> (identical to Vago's hardcoded voice), same office-sound output mixer.</p>
@@ -132,13 +134,13 @@
     <li><strong>Variant config</strong> — <code>user_profile.onboarding_call_variant</code> selects document <code>OB_Call_Configs/{variant}_config</code> → <code>Config{model, main_system_prompt, careplan_switcher_prompt, careplan_switcher_stage_name, start_stage, common_stages[], care_plans[], recording_enabled_percentage}</code>. Each <code>StageConfig</code> has <code>{name, prompt, next_stages[], deep_thinking[], is_end_stage, turn_threshold}</code>. Variant missing → Python forces legacy variant <code>"student"</code> with resume disabled.</li>
     <li><strong>ConversationState</strong> — <code>{variant, current_stage, selected_care_plan, variable_store, stage_turn_count, threshold flags}</code>. Serialized to S3 per user/assistant chunk as <code>conversation_state/{conversation_id}/{chunk_id}.json</code> (US bucket) and referenced by the chunk's <code>conversation_state_s3_key</code>. This is also the resume source.</li>
     <li><strong>Prompt compilation</strong> (<code>prompt_parser.py</code>) — fetch the current stage's prompt with <code>{profile_variables + variable_store}</code>, inject the result as <code>analysis</code> into the main system prompt along with <code>patient_info</code> and IST <code>current_datetime</code>. On every stage transition the system message is <em>replaced in-place</em> and the <code>update_stage</code> tool's enum is refreshed to <code>current_stage.next_stages</code>.</li>
-    <li><strong>Stage transitions</strong> — two architectures by variant:
+    <li><strong>Stage transitions</strong> — Python has two architectures by variant; <strong>per the 2026-07-06 decision, the Go port implements only the tracker*</strong>:
       <ul>
-        <li><em>Tool-call variants</em> (default): LLM calls <code>update_stage(next_stage)</code>; the handler speaks a <code>"hmm..."</code> filler if the LLM produced no text alongside the tool call, runs <code>StageManager.process_transition</code>, and decides <code>run_llm</code> from "had no text OR a new user message arrived mid-transition".</li>
-        <li><em>Tracker variants</em> (<code>student_test</code>, <code>misc1</code>): no <code>update_stage</code> tool. After every completed LLM call, a background tracker runs a rapidfuzz matcher over the assistant's last utterance against each next-stage's <code>trigger_statements</code>; <code>yes</code> → transition directly, <code>maybe</code> → small LLM classifier (<code>obcall_helpers/agenda_tracker/*</code> prompts, gemini-flash-lite failover config, 32 max tokens), <code>no</code> → skip.</li>
+        <li><em>Tracker (the Go path, and the new default for all variants)</em> — today live on <code>student_test</code>/<code>misc1</code>: no <code>update_stage</code> tool (the LLM's only tool is <code>end_call</code>). After every completed LLM call, a background tracker runs a rapidfuzz matcher over the assistant's last utterance against each next-stage's <code>trigger_statements</code> (from the stage prompt's <code>config_json</code>); <code>yes</code> → transition directly, <code>maybe</code> → small LLM classifier (<code>obcall_helpers/agenda_tracker/*</code> prompts, gemini-flash-lite failover config, 32 max tokens), <code>no</code> → skip. Stale results are dropped under a lock if the stage changed mid-flight; stages named <code>*closing*</code> or with no <code>next_stages</code> are skipped.</li>
+        <li><em>Tool-call variants (NOT ported — reference only)</em>: LLM calls <code>update_stage(next_stage)</code>; the handler speaks a <code>"hmm..."</code> filler when the LLM produced no text, and decides <code>run_llm</code> from "had no text OR a new user message arrived mid-transition". Also brings the StageThresholdProcessor ("you seem to have skipped the stage transition" reminders). All of this exists only to make the tool-call architecture work and is skipped.</li>
       </ul>
     </li>
-    <li><strong>StageManager.process_transition</strong> — careplan detection when entering the switcher stage, stage resolution, <em>blocking</em> deep thinking, <code>advance_stage</code> + recompile/apply prompt, <em>non-blocking</em> deep thinking (recompile again on completion), RTVI "Agenda changed" messages, debug-log chunk + assistant <code>tool_calls</code> chunk + <code>tool</code> result chunk (the resume-replay trio), analytics job <code>CallAgendaUpdate-{stage}</code>, and a stage-transition timing log.</li>
+    <li><strong>StageManager.process_transition</strong> — careplan detection when entering the switcher stage, stage resolution, <em>blocking</em> deep thinking, <code>advance_stage</code> + recompile/apply prompt, <em>non-blocking</em> deep thinking (recompile again on completion), RTVI "Agenda changed" messages, a debug-log chunk (<code>Agenda changed(Stage Transition Tracker) from X =&gt; Y</code>, <code>additional_data.tool_call_id = stage_transition_tracker_{uuid}</code>), analytics job <code>CallAgendaUpdate-{stage}</code>, and a stage-transition timing log. The assistant-<code>tool_calls</code>-chunk + <code>tool</code>-result-chunk pair is written <em>only for tool_call source</em> in Python, so the Go tracker path writes just the debug chunk — the existing tool-pair replay infra still covers <code>end_call</code>/follow-up chunks.</li>
     <li><strong>Deep thinking</strong> (<code>deep_thinking_manager.py</code>) — per-stage LLM analysis calls (transcript + patient profile against a doc-store prompt), blocking ones gate the prompt compile, non-blocking merge into <code>variable_store</code> later. Model: <code>gpt_oss120_fast_hedged</code> (Cerebras hedged with OpenRouter at 1s), temp 0.7, max 4000 tokens, JSON output merged into <code>variable_store</code>; result persisted as an assistant debug-log chunk.</li>
     <li><strong>Careplan</strong> (<code>careplan_manager.py</code>) — on entering the switcher stage with no plan: LLM classify (<code>careplan_switcher_prompt</code>, gpt-oss120-fast) → JSON <code>{"selected_care_plan": name}</code>, fallback <code>"general"</code>; activate unlocks that plan's stages and calls <code>POST /bot/set_user_careplan</code>.</li>
     <li><strong>Stage threshold</strong> (<code>stage_threshold_processor.py</code>) — counts assistant turns per stage; over <code>turn_threshold</code> injects a <code>&lt;system_instruction&gt;</code> reminder into the next LLM context; over threshold+3 fires Sentry + RTVI + <code>POST /bot/add_tag_to_user</code> ("Stage Transition Failure").</li>
@@ -162,7 +164,7 @@
     <tr><td>LLM output filter (kill-prefixes <code>&lt;</code> <code>_</code> <code>{</code> <code>startcall:</code>)</td><td>bots/llm_output_filter.py</td><td><code>llm_output_filter_processor.go</code> (wired in follow-up; wire in onboarding too)</td><td><span class="tag ready">Ready</span></td></tr>
     <tr><td>Health-based LLM switching, blacklist, poll trigger, call logging</td><td>custom_llm_service.py, llm_switching_service.py</td><td><code>voicepipelinecore/llmrouter/</code> + <code>disha/llm_logging.go</code> (usecase-tagged, not bot-specific)</td><td><span class="tag ready">Ready</span></td></tr>
     <tr><td>Barge-in min-words = 3, back-channel discard</td><td>MinWordsUserTurnStartStrategy(3)</td><td><code>user_context_aggregator.go</code> (<code>minBargeInWords = 3</code>)</td><td><span class="tag ready">Ready</span></td></tr>
-    <tr><td>7s idle "hello?" prompts + 120s no-activity watchdog</td><td>handle_user_idle + PipelineTask(idle_timeout_secs=120)</td><td><code>user_idle_processor.go</code> (see parity delta in §4.6 — prompt cap 7 vs Python's end-on-6th)</td><td><span class="tag extend">Extend</span></td></tr>
+    <tr><td>7s idle "hello?" prompts + 120s no-activity watchdog</td><td>handle_user_idle + PipelineTask(idle_timeout_secs=120)</td><td><code>user_idle_processor.go</code> — prompt-cap delta (7 vs Python's end-on-6th) accepted 2026-07-06, no changes</td><td><span class="tag ready">Ready</span></td></tr>
     <tr><td>Greet-first, RTVI events + S3 debug log, client-ready/ping, end_call app message</td><td>base_pipeline_manager event handlers, custom_rtvi_observer.py</td><td><code>daily_room.go</code>, <code>ui_events.go</code>, <code>s3_uploader.go</code> (<code>debug_log_data/{conversation_id}/log_data.json</code>)</td><td><span class="tag ready">Ready</span></td></tr>
     <tr><td>update_conversation lifecycle timestamps, post-call call, Daily metrics enqueue, chunk-sync enqueue, API-fail→enqueue fallback</td><td>base_pipeline_manager.perform_cleanup, voice_bot_api_service.py</td><td><code>disha/call_event_callbacks.go</code>, <code>api_client.go</code></td><td><span class="tag ready">Ready</span></td></tr>
     <tr><td><code>end_call</code> tool (graceful <code>EndTaskFrame</code> equivalent)</td><td>bots/call_tools.py</td><td><code>disha/call_tools.go</code> <code>registerEndCallTool</code></td><td><span class="tag ready">Ready</span></td></tr>
@@ -179,9 +181,9 @@
   <h3>4.1 Bot assembly</h3>
   <table>
     <tr><th>Item</th><th>Detail</th><th>Status</th></tr>
-    <tr><td><code>disha/onboarding_call.go</code></td><td><code>OnboardingCallBot</code> implementing <code>disha.Bot</code> with the established <code>plan()</code> → <code>BuildTask()</code> pattern. Pipeline: <code>source → audioSource → stt → userIdle → userAgg → [stageThreshold] → llm → llmResponseTimeout → llmOutputFilter → tts → playback → assistantAgg → sink</code>. <strong>No talk-time processor</strong> (sales-only). Register <code>OnboardingCallBotType = "onboarding_call"</code> in <code>NewBot</code>.</td><td><span class="tag new">New</span></td></tr>
+    <tr><td><code>disha/onboarding_call.go</code></td><td><code>OnboardingCallBot</code> implementing <code>disha.Bot</code> with the established <code>plan()</code> → <code>BuildTask()</code> pattern. Pipeline: <code>source → audioSource → stt → userIdle → userAgg → llm → llmResponseTimeout → llmOutputFilter → tts → playback → assistantAgg → sink</code>. <strong>No talk-time processor</strong> (sales-only) and <strong>no stage-threshold processor</strong> (tool-call-variant-only; tracker default*). Register <code>OnboardingCallBotType = "onboarding_call"</code> in <code>NewBot</code>.</td><td><span class="tag new">New</span></td></tr>
     <tr><td><code>UserProfileData</code> fields</td><td>Add <code>onboarding_call_variant</code> (required — error out like Python raises if missing rather than porting the legacy "student" forcing), plus whatever the variant flags read (verify <code>call_recording_enabled</code> relevance §4.8). <code>patient_info</code> already arrives pre-built on the conversation row.</td><td><span class="tag extend">Extend</span></td></tr>
-    <tr><td>Model group</td><td>Onboarding's group comes from the variant config's <code>model</code> field (not hardcoded). Current llmrouter groups: <code>grok-4.1-fast-sales</code>, <code>gpt-4.1</code>, <code>gemini-flash-3.1-lite</code>, <code>followup-dynamic-gemma</code>, <code>gpt-oss120-fast</code>. Dump the live variant configs and add any missing group/endpoint entries to <code>llmrouter/groups.go</code> (enum/config keys must match disha-backend <code>services/openai_config_manager.py</code>).</td><td><span class="tag verify">Verify</span></td></tr>
+    <tr><td>Model group</td><td>Onboarding's group comes from the variant config's <code>model</code> field (not hardcoded). Current llmrouter groups: <code>grok-4.1-fast-sales</code>, <code>gpt-4.1</code>, <code>gemini-flash-3.1-lite</code>, <code>followup-dynamic-gemma</code>, <code>gpt-oss120-fast</code>. Phase 0 dumps the variant configs to see what's needed; <strong>final key confirmation against disha-backend <code>services/openai_config_manager.py</code> happens just before release</strong> (phase 7), per the 2026-07-06 decision.</td><td><span class="tag verify">Verify</span></td></tr>
     <tr><td>Usecase types for LLM log sink</td><td><code>onboarding_call_conversation</code>, <code>deep_thinking_{stage}</code>, <code>care_plan_switcher</code>, <code>onboarding_call_stage_transition_tracker</code> — the existing sink already takes a usecase string per client.</td><td><span class="tag ready">Ready</span></td></tr>
   </table>
 
@@ -193,20 +195,20 @@
     <tr><td>Prompt compiler</td><td>Port <code>prompt_parser.compile_system_prompt</code>: render stage prompt with <code>{gender + variable_store}</code>, then render main system prompt with <code>{analysis, patient_info, current_datetime (IST "%B %d, %Y %I:%M %p")}</code>. Use the existing Jinja subprocess renderer. Per the strict prompt-metadata rule, every LLM call must carry <code>system_prompt_name/version/variables</code> — extend to also carry the stage prompt identity the way Python puts <code>stage_prompt_name</code> in <code>prompt_metadata</code>.</td><td><span class="tag new">New</span></td></tr>
   </table>
 
-  <h3>4.3 Stage machine (the core of the port)</h3>
+  <h3>4.3 Stage machine (the core of the port) — tracker architecture only*</h3>
   <table>
     <tr><th>Item</th><th>Detail</th><th>Status</th></tr>
-    <tr><td><code>update_stage</code> tool + handler</td><td>Tool schema with <code>next_stage</code> enum = <code>current_stage.next_stages</code>, refreshed after every transition. Handler special-cases <code>next_stage == "end_call"</code> (debug chunk + graceful end, <code>run_llm=false</code>); otherwise "hmm..." filler when the LLM produced no text, run transition, and <code>run_llm</code> = no-text OR new-user-message-during-transition. Depends on design items D1/D2 (§5).</td><td><span class="tag new">New</span> <span class="tag design">Design</span></td></tr>
-    <tr><td><code>StageManager.process_transition</code></td><td>disha-side component holding config + state + deps: careplan hook, stage resolution (RTVI error + Sentry on unknown), blocking deep thinking, advance + recompile/apply, non-blocking deep thinking with recompile-on-complete, RTVI "Agenda changed from X =&gt; Y", persistence trio (debug chunk; for tool_call source also assistant <code>tool_calls</code> chunk + <code>tool</code> result chunk so resume replay works), analytics enqueue <code>CallAgendaUpdate-{stage}</code>, stage-transition timing log enqueue.</td><td><span class="tag new">New</span></td></tr>
+    <tr><td>Stage-transition tracker + fuzzy matcher <strong>(default for all variants*)</strong></td><td>Background tracker on LLM-call completion (needs the D3 hook): skips interrupted responses, keeps a 5-turn transcript window, rapidfuzz-style scoring (token_set / partial / coverage with Devanagari-aware normalization, filler stripping, <code>[Name]</code> expansion from <code>patient_info</code>), yes/maybe/no thresholds (yes = score≥90 ∧ coverage≥85 ∧ partial≥85; no = score&lt;70 ∨ coverage&lt;40 ∨ (partial&lt;60 ∧ score&lt;85)), LLM classifier on maybe (<code>obcall_helpers/agenda_tracker/*</code> prompts, 32 tokens, usecase <code>onboarding_call_stage_transition_tracker</code>), output validated against <code>allowed_next_stages</code>, stale-result drop under a mutex if the stage changed mid-flight. Needs a Go fuzzy-match dependency or a hand port of the three ratios — Python's <code>test_stage_transition_fuzzy_matcher.py</code> becomes the parity fixture corpus.</td><td><span class="tag new">New</span></td></tr>
+    <tr><td><code>StageManager.process_transition</code></td><td>disha-side component holding config + state + deps: careplan hook, stage resolution (RTVI error + Sentry on unknown), blocking deep thinking, advance + recompile/apply, non-blocking deep thinking with recompile-on-complete, RTVI "Agenda changed from X =&gt; Y", debug-log chunk with <code>additional_data.tool_call_id = stage_transition_tracker_{uuid}</code> (tracker source writes <em>no</em> assistant/tool chunk pair — that trio is tool_call-source-only in Python), analytics enqueue <code>CallAgendaUpdate-{stage}</code>, stage-transition timing log enqueue.</td><td><span class="tag new">New</span></td></tr>
     <tr><td>Debug-log chunk writes</td><td>Vago has never written <code>is_debug_log=true</code> chunks. StageManager and DeepThinking write them (agenda-change lines, DT results). No core change: <code>disha</code> already owns Redis chunk writes — add a small <code>appendDebugChunk</code> helper next to the existing turn-persistence path.</td><td><span class="tag extend">Extend</span></td></tr>
-    <tr><td><code>StageThresholdProcessor</code></td><td>New narrow stream processor between user aggregator and LLM (matches Python placement): counts assistant turns per stage, injects the <code>&lt;system_instruction&gt;</code> reminder into the next outgoing LLM context, Sentry + RTVI + <code>add_tag_to_user</code> at threshold+3. Bot-specific behavior — keep the processor generic (callback-driven) or host it in <code>disha</code>-configured form; per AGENTS.md this is a new processor, so include in the design note (§5, D5).</td><td><span class="tag new">New</span> <span class="tag design">Design</span></td></tr>
-    <tr><td>Stage-transition tracker + fuzzy matcher (variants <code>student_test</code>, <code>misc1</code>)</td><td>Background tracker on LLM-call completion: 5-turn transcript window, rapidfuzz-style scoring (token_set / partial / coverage with Devanagari-aware normalization, filler stripping, <code>[Name]</code> expansion), yes/maybe/no thresholds, LLM classifier on maybe (<code>obcall_helpers/agenda_tracker/*</code> prompts, 32 tokens), stale-result locking. Needs a Go fuzzy-match dependency or a hand port of the three ratios. <strong>Recommend scoping by launch variants</strong> (§8 Q1) — if launch variants are tool-call-based, defer to a later phase.</td><td><span class="tag new">New</span> <span class="tag verify">Verify</span></td></tr>
+    <tr><td><code>update_stage</code> tool + handler</td><td><strong>Not ported (2026-07-06 decision).</strong> Tracker is the default for all variants; the LLM's only tool is <code>end_call</code>, which already exists. Drops the enum-refresh, "hmm..." filler, and <code>run_llm</code> handler logic (former D2), and means no mid-call tool re-registration is needed at all.</td><td><span class="tag skip">Skip</span></td></tr>
+    <tr><td><code>StageThresholdProcessor</code></td><td><strong>Not ported.</strong> Python wires it only for tool-call variants — its reminder exists to nudge the LLM into calling <code>update_stage</code>, which the tracker replaces. The <code>stage_threshold_reminded</code>/<code>stage_threshold_alerted</code> fields stay in the persisted <code>ConversationState</code> JSON (always false) for shape compatibility.</td><td><span class="tag skip">Skip</span></td></tr>
   </table>
 
   <h3>4.4 Deep thinking &amp; careplan</h3>
   <table>
     <tr><th>Item</th><th>Detail</th><th>Status</th></tr>
-    <tr><td><code>DeepThinkingManager</code></td><td>Blocking (parallel, gathered before prompt compile) + non-blocking (merge + recompile on completion) doc-store-prompted LLM calls; strip <code>&lt;think&gt;</code>; JSON → variable merge, non-JSON → <code>prompt_path_to_var_name</code> key; result as assistant debug chunk; RTVI progress messages. Python uses <em>hedged</em> failover (Cerebras + OpenRouter, 1s hedge). Vago's <code>gpt-oss120-fast</code> group exists but is health-selected with no hedging — recommend the <code>get_guidance</code> precedent: single health-selected call, Sentry on failure, no in-call hedge (§5 D4, §8 Q2).</td><td><span class="tag new">New</span></td></tr>
+    <tr><td><code>DeepThinkingManager</code></td><td>Blocking (parallel, gathered before prompt compile) + non-blocking (merge + recompile on completion) doc-store-prompted LLM calls; strip <code>&lt;think&gt;</code>; JSON → variable merge, non-JSON → <code>prompt_path_to_var_name</code> key; result as assistant debug chunk; RTVI progress messages. Python uses <em>hedged</em> failover (Cerebras + OpenRouter, 1s hedge) — <strong>decision: port the hedging</strong> as a reusable llmrouter primitive (§5 D4); deep thinking is its first consumer. Blocking-DT failure (both attempts) degrades to "transition without new variables" + Sentry.</td><td><span class="tag new">New</span></td></tr>
     <tr><td><code>CarePlanManager</code></td><td>Detect (LLM classify, JSON <code>selected_care_plan</code>, fallback <code>general</code>) + activate (unlock plan stages, prompt cache, <code>set_user_careplan</code> API). Straightforward disha-side port once the config structs exist.</td><td><span class="tag new">New</span></td></tr>
     <tr><td>API client methods</td><td><code>POST /bot/set_user_careplan</code> and <code>POST /bot/add_tag_to_user</code> with the standard API-first / enqueue-on-failure fallback, mirroring <code>VoiceBotAPIService</code>.</td><td><span class="tag extend">Extend</span></td></tr>
   </table>
@@ -226,7 +228,7 @@
   <h3>4.6 Parity deltas to settle (small but real)</h3>
   <table>
     <tr><th>Delta</th><th>Python</th><th>Vago today</th><th>Action</th></tr>
-    <tr><td>Idle prompt cap</td><td>Retries 1–5 speak "hello?", 6th ends the call</td><td><code>maxIdlePrompts = 7</code>, final fire speaks then ends</td><td>Add a config constructor (like the timeout processors' <code>With…</code> pattern) or accept the delta consciously; also Python fires a Sentry if the first idle retry sees zero audio frames with &gt;1 participant — decide whether to port that diagnostic.</td></tr>
+    <tr><td>Idle prompt cap</td><td>Retries 1–5 speak "hello?", 6th ends the call</td><td><code>maxIdlePrompts = 7</code>, final fire speaks then ends</td><td><strong>Resolved 2026-07-06: delta accepted</strong> — no config work; the zero-audio first-retry Sentry diagnostic is likewise not ported.</td></tr>
     <tr><td>Function-call frames bypass TTS/output queues</td><td><code>CustomCartesiaTTSService</code> + <code>CustomDailyOutputTransport</code> pass tool frames around the audio path so results reach the assistant aggregator immediately</td><td>Go tool execution lives inside <code>LLMProcessor</code>; tool results never traverse TTS/playback</td><td>No action — Go's architecture already has the property this hack buys in Pipecat. Note it in the parity report.</td></tr>
     <tr><td>STT variant flag</td><td><code>call_stt_variant_flag</code> plumbed but Smallest STT disabled — always Soniox</td><td>Soniox only</td><td>No action — matches the existing follow-up decision (don't read the flag, don't port Smallest).</td></tr>
     <tr><td>120s idle watchdog reset frames</td><td><code>idle_timeout_frames=(BotSpeaking, UserSpeaking, InterimTranscription)</code></td><td>Reset by TranscriptFrame / BotStarted / BotStopped</td><td>Equivalent — no action.</td></tr>
@@ -244,35 +246,39 @@
   <h3>4.8 Recording</h3>
   <table>
     <tr><th>Item</th><th>Detail</th><th>Status</th></tr>
-    <tr><td>Daily cloud recording gate</td><td>Python's local WAV recorder (<code>audio_buffer_manager.py</code>) is dormant; recording is Daily cloud recording gated by <code>recording_enabled_percentage</code> in the variant config, evaluated into <code>user_profile.call_recording_enabled</code> by <code>FeatureFlagService</code>. <strong>Verify where recording is actually started</strong> — if the backend starts it at room-creation time (likely, since flag evaluation is backend-side), the Go bot needs zero work; if the bot process starts it via the Daily API, <code>daily_bridge.py</code> needs a <code>start_recording</code> command.</td><td><span class="tag verify">Verify</span></td></tr>
+    <tr><td>Daily cloud recording gate</td><td>Python's local WAV recorder (<code>audio_buffer_manager.py</code>) is dormant; recording is Daily cloud recording gated by <code>recording_enabled_percentage</code> in the variant config, evaluated into <code>user_profile.call_recording_enabled</code> by <code>FeatureFlagService</code>. <strong>Resolved 2026-07-06: recording is started backend-side at room creation</strong> — the Go bot needs zero work and <code>daily_bridge.py</code> is unchanged.</td><td><span class="tag ready">Ready</span></td></tr>
   </table>
 </section>
 
 <section id="design">
   <h2>5. Core design decisions needing discussion first</h2>
-  <p>Per AGENTS.md, these touch frame semantics / shared surfaces / new processors — each needs a short design note (existing pattern, minimal change, alternatives, tests) agreed <em>before</em> implementation. Recommendations included.</p>
+  <p>Per AGENTS.md, these touch shared surfaces and needed sign-off before implementation. <strong>Status after the 2026-07-06 review: D1 and D3 are approved as specified below; D4's direction is approved (hedging in scope) with the interface to be settled in its design note; D2 and D5 are dropped.</strong></p>
 
-  <h3>D1 — Mid-call system-message replacement + tool-enum refresh</h3>
-  <p><strong>Problem:</strong> every stage transition replaces the system message (<code>compile_and_apply</code>) and swaps the <code>update_stage</code> enum. Verified: <code>aggregatorSharedState</code> has no replacement method (only initial-message seeding), and <code>LLMProcessor.RegisterTool</code> mutates <code>p.tools</code>/<code>p.toolMap</code> without a lock while <code>runLLM</code> copies <code>p.tools</code> on another goroutine — mid-call re-registration is a data race today.</p>
-  <p><strong>Recommendation:</strong> the minimal change is (a) an exported, mutex-guarded <code>ReplaceSystemMessage(text string)</code> on <code>ContextAggregatorPair</code> (state already has <code>mu</code>); (b) a small mutex around <code>LLMProcessor</code> tool registration + the <code>runLLM</code> snapshot so <code>RegisterTool</code> becomes safe mid-call (re-registration already replaces by name). No new frame types; the transition runs inside a tool handler, which executes before the next LLM run, so ordering is naturally safe for tool-call variants. Tracker variants transition from a background goroutine — the same mutexes cover it, with the "stale result" lock (D3) providing the ordering guard Python gets from its asyncio lock.</p>
+  <h3>D1 — Mid-call system-message replacement <span class="tag ready">Approved</span></h3>
+  <p><strong>Problem:</strong> every stage transition replaces the system message (<code>compile_and_apply</code>). Verified: <code>aggregatorSharedState</code> has no replacement method (only initial-message seeding).</p>
+  <p><strong>Recommendation:</strong> an exported, mutex-guarded <code>ReplaceSystemMessage(text string)</code> on <code>ContextAggregatorPair</code> (state already has <code>mu</code>). No new frame types. <em>Scope reduction from rev 1:</em> with the tracker default there is no <code>update_stage</code> tool, so the tool set is static (<code>end_call</code> only) and the mid-call tool re-registration race in <code>LLMProcessor.RegisterTool</code> no longer needs fixing for this port (worth a defensive mutex someday, but not on this critical path). Transitions run from the tracker's background goroutine; the shared-state mutex plus the tracker's stale-result lock (D3 consumer side) provide the ordering guard Python gets from its asyncio lock.</p>
 
-  <h3>D2 — Tool-handler context: "did the LLM speak?", "did the user speak mid-transition?", filler injection</h3>
-  <p><strong>Problem:</strong> the <code>update_stage</code> handler needs three things Vago's <code>ToolCallRequest</code> doesn't carry: whether the assistant produced text alongside the tool call (decides both the "hmm..." filler and <code>run_llm</code>), whether a new user message landed during the transition (also feeds <code>run_llm</code>), and a way to push a <code>TTSSpeakFrame</code> from inside a handler.</p>
-  <p><strong>Recommendation:</strong> extend <code>ToolCallRequest</code> with a <code>ResponseHadText bool</code> field populated by <code>LLMProcessor</code> (it already tracks streamed content for <code>llm_call_result</code>) — a field on an existing type, not a new frame. For the filler, let the handler use the existing <code>TTSSpeakFrame</code> path — expose a narrow <code>Speak(text)</code> on the processor or hand the handler a push closure; matches Pipecat's handlers pushing <code>TTSSpeakFrame</code>. For "new user message mid-transition", the cheapest faithful check is asking the aggregator pair whether the last message role is <code>user</code> at handler-exit (state is already shared + mutexed). Alternatives (a full FunctionCallParams-style context object) are more surface than needed.</p>
+  <h3>D2 — <span class="tag skip">Dropped</span> Tool-handler context (filler / run_llm logic)</h3>
+  <p>Existed only to serve the <code>update_stage</code> handler ("hmm..." filler, <code>run_llm</code> decision, mid-transition user-message check). With the tracker-default decision the tool-call path is not ported, so no <code>ToolCallRequest</code> extension, no handler speak path, and no last-message-role query are needed. Kept here so the scope cut is visible.</p>
 
-  <h3>D3 — LLM-call-completed hook (tracker variants only)</h3>
-  <p><strong>Problem:</strong> the transition tracker consumes <code>on_llm_call_complete(assistant_response, is_interrupted)</code> — the <em>generated</em> response, not the played text, so <code>OnAssistantTurnCommitted</code> is the wrong hook. Vago has no LLM-completion callback (only the RTVI <code>llm_call_result</code> event).</p>
-  <p><strong>Recommendation:</strong> if launch variants don't include <code>student_test</code>/<code>misc1</code>, defer entirely (phase 7). If needed: one optional callback on <code>CallEvents</code> (<code>OnLLMCallCompleted(text string, interrupted bool)</code>) — it's a lifecycle/turn event, which is exactly what <code>CallEvents</code> is for; no new frame, no new dispatcher.</p>
+  <h3>D3 — LLM-call-completed hook (now required) <span class="tag ready">Approved</span></h3>
+  <p><strong>Problem:</strong> the transition tracker consumes <code>on_llm_call_complete(assistant_response, is_interrupted)</code> — the <em>generated</em> response, not the played text, so <code>OnAssistantTurnCommitted</code> is the wrong hook. Vago has no LLM-completion callback (only the RTVI <code>llm_call_result</code> event). With tracker as the default architecture this is mandatory, not variant-gated.</p>
+  <p><strong>Recommendation:</strong> one optional callback on <code>CallEvents</code> (<code>OnLLMCallCompleted(text string, interrupted bool)</code>) fired by <code>LLMProcessor</code> where it already emits <code>llm_call_result</code> — it's a lifecycle/turn event, which is exactly what <code>CallEvents</code> is for; no new frame, no new dispatcher.</p>
 
-  <h3>D4 — Deep-thinking model strategy: drop hedging</h3>
-  <p><strong>Problem:</strong> Python hedges Cerebras against OpenRouter at 1s. Vago's router has no hedged execution, and the established precedent (follow-up <code>get_guidance</code>) is: no in-call failover, single health-selected call from <code>gpt-oss120-fast</code>, Sentry capture on failure/empty (except ctx cancellation).</p>
-  <p><strong>Recommendation:</strong> reuse the <code>get_guidance</code> pattern verbatim (fresh one-shot client, timeout, Sentry tag <code>disha_onboarding/deep_thinking</code>). A blocking-DT failure should degrade to "transition without new variables" — Python effectively does the same when a DT returns garbage. This avoids building hedged execution into the router for one caller.</p>
+  <h3>D4 — Hedged background-LLM execution <span class="tag extend">Direction approved · interface TBD</span></h3>
+  <p><strong>Decision (Jaideep, 2026-07-06):</strong> hedging IS needed — build something <em>logically equivalent</em> to Python's hedged failover (<code>generate_llm_response_with_hedged_failover</code>, config <code>gpt_oss120_fast_hedged</code>: primary Cerebras, hedge OpenRouter fired at 1000ms, first result wins), not necessarily interface-identical. Design it as a <strong>reusable primitive</strong> for the general case of "a background process must respond quickly so the model can move forward" — deep thinking is the first consumer, <code>get_guidance</code> is a likely second, and more such background-assist calls are expected.</p>
+  <p><strong>Proposed shape (to be settled in the design note):</strong> two layers, both in <code>llmrouter</code> (the sub-package already allowed to own HTTP/provider concerns — this never touches <code>voicepipelinecore</code> proper):</p>
+  <ul>
+    <li><em>Generic hedge helper</em> — start the primary attempt; arm a timer at <code>hedgeDelay</code>; if the primary hasn't produced a result when it fires, launch the secondary concurrently; return the first success and cancel the loser's context; if both fail, return the primary's error. Plain goroutines + <code>select</code>, no new frame types, no pipeline involvement.</li>
+    <li><em>Router surface</em> — a hedged one-shot completion mode that takes an ordered endpoint pair (or a group whose health-ranked top-2 become primary/secondary — matching how Python's hedged config lists Cerebras then OpenRouter) plus a hedge delay, reusing the existing per-provider request shaping. Expose it behind the <strong>same one-shot client interface <code>get_guidance</code> uses today</strong>, so consumers swap a constructor rather than learning a new API.</li>
+  </ul>
+  <p><strong>Questions the design note must settle:</strong> hedge trigger definition (elapsed time to completion vs time-to-first-byte — Python hedges on the whole non-streaming call at 1000ms; recommend the same for simplicity), whether a lost/slow hedge attempt blacklists its endpoint (recommend <strong>no</strong> — slow-but-healthy is what hedging exists for; real errors keep the existing blacklist path), LogSink behavior (recommend logging only the winning call, with a field noting a hedge fired, to avoid double-counting usage), and the cancellation contract (loser must be ctx-cancelled promptly; parent ctx cancellation — barge-in/EndFrame — cancels both and is never treated as an endpoint error, matching the existing rule).</p>
+  <div class="callout"><p><strong>Supersession note:</strong> if <code>get_guidance</code> adopts this primitive, that replaces the standing "no in-call failover for get_guidance" decision (AGENTS.md). Flagged in §8 as an explicit choice — adopt at the same time or keep get_guidance single-call until the primitive has soaked on deep thinking.</p></div>
 
-  <h3>D5 — StageThresholdProcessor placement</h3>
-  <p><strong>Problem:</strong> a new processor between user aggregator and LLM. AGENTS.md says new processors are architectural changes.</p>
-  <p><strong>Recommendation:</strong> mirror the accepted <code>LLMResponseTimeoutProcessor</code>/<code>LLMOutputFilterProcessor</code> precedent: a narrow stream processor in <code>voicepipelinecore</code> that counts turns and mutates the outgoing <code>LLMMessagesFrame</code>, with all policy (threshold value, reminder text, Sentry/tagging callbacks) injected by the bot at construction. Core stays business-free; onboarding wires it, sales/follow-up don't.</p>
+  <h3>D5 — <span class="tag skip">Dropped</span> StageThresholdProcessor</h3>
+  <p>Python wires it only for tool-call variants — its <code>&lt;system_instruction&gt;</code> reminder exists to nudge the LLM into calling <code>update_stage</code>, and its Sentry/tagging alarm detects that tool call failing to happen. With the tracker default there is nothing to remind or alarm on; transition failure modes are covered by the tracker's own Sentry paths (invalid output, config errors). No new core processor is needed for this port.</p>
 
-  <div class="callout info"><p><strong>Everything else needs no core change.</strong> StageManager, DeepThinking, CarePlan, config, state, resume, S3 state upload, new API methods, debug chunks — all live in <code>disha/</code>, using surfaces that already exist (Redis client, API client, DocumentStore, Jinja renderer, S3 uploader, UIEvents, tool registration, CallEvents).</p></div>
+  <div class="callout info"><p><strong>Net new shared surfaces: two in core, one in the router.</strong> <code>ReplaceSystemMessage</code> (D1) and <code>OnLLMCallCompleted</code> (D3) in <code>voicepipelinecore</code>; the hedged one-shot execution mode (D4) in <code>llmrouter</code>, which is already the sanctioned home for HTTP/provider machinery. Everything else — tracker, fuzzy matcher, StageManager, DeepThinking, CarePlan, config, state, resume, S3 state upload, new API methods, debug chunks — lives in <code>disha/</code>, using surfaces that already exist (Redis client, API client, DocumentStore, Jinja renderer, S3 uploader, UIEvents, CallEvents, the static <code>end_call</code> tool).</p></div>
 </section>
 
 <section id="phases">
@@ -283,12 +289,13 @@
     <span class="effort">recon · small</span>
     <h3>Phase 0 — Recon &amp; decisions</h3>
     <ul>
-      <li>Dump the live variant configs (<code>OB_Call_Configs/onboarding_call_release_config</code> + each <code>{variant}_config</code>) from staging Redis/doc store: which variants are live, what <code>model</code> group each uses, stage graphs, deep-thinking prompts, <code>turn_threshold</code>s, <code>recording_enabled_percentage</code>.</li>
-      <li>Answer §8 questions (launch variants → tracker in/out of scope; DT hedging; recording start point; idle-cap parity).</li>
+      <li>Dump the live variant configs (<code>OB_Call_Configs/onboarding_call_release_config</code> + each <code>{variant}_config</code>) from staging Redis/doc store: which variants are live, what <code>model</code> group each uses, stage graphs + <code>trigger_statements</code> per stage prompt config, deep-thinking prompts, <code>recording_enabled_percentage</code>. <strong>Assumption (per Jaideep):</strong> every stage prompt's <code>config_json</code> will carry <code>trigger_statements</code> by cutover — no readiness gate; defensively, a stage missing them gets Sentry + skipped transition attempt (Python's <code>StageTransitionConfigError</code> handling), never a crash.</li>
+      <li>All former phase-0 questions are resolved (§8 decision log); only the get_guidance hedging-adoption timing remains open, and it doesn't block anything.</li>
       <li>Verify enqueue-job callables for stage-transition logs + analytics events (module path, queue, kwargs, unbound-safe).</li>
-      <li>Write the D1–D5 design notes and get sign-off.</li>
+      <li>Write the D4 design note (hedge trigger, blacklist policy, LogSink behavior, cancellation contract, exact interface) — D1/D3 are already approved as specified in §5.</li>
+      <li>Pick the fuzzy-match approach: Go rapidfuzz-equivalent library vs hand-porting token_set/partial/coverage; either way <code>test_stage_transition_fuzzy_matcher.py</code> is the acceptance fixture set.</li>
     </ul>
-    <p><em>Exit:</em> scoped variant list, confirmed model groups, approved design notes.</p>
+    <p><em>Exit:</em> variant configs dumped (model groups noted for the pre-release check), D4 design note approved, matcher approach chosen.</p>
   </div>
 
   <div class="phase">
@@ -305,21 +312,21 @@
 
   <div class="phase">
     <span class="effort">core · small, design-gated</span>
-    <h3>Phase 2 — Core surface extensions (D1, D2, D5; D3 only if tracker in scope)</h3>
+    <h3>Phase 2 — Shared surface extensions (D1 + D3 in core, D4 in llmrouter)</h3>
     <ul>
-      <li><code>ContextAggregatorPair.ReplaceSystemMessage</code>; mutex tool registration in <code>LLMProcessor</code> + safe mid-call re-registration test (race detector).</li>
-      <li><code>ToolCallRequest.ResponseHadText</code> + handler speak path + last-message-role query.</li>
-      <li>Generic <code>StageThresholdProcessor</code> (callback-injected policy) + processor tests in the Pipecat-parity harness.</li>
-      <li>(If needed) <code>CallEvents.OnLLMCallCompleted</code>.</li>
+      <li><code>ContextAggregatorPair.ReplaceSystemMessage</code> (mutex-guarded on the existing shared-state lock) + race-detector test with a concurrent LLM run. <em>(Approved.)</em></li>
+      <li><code>CallEvents.OnLLMCallCompleted(text, interrupted)</code> fired from <code>LLMProcessor</code> alongside the existing <code>llm_call_result</code> emit. <em>(Approved.)</em></li>
+      <li>Hedged one-shot execution in <code>llmrouter</code> per the approved D4 design note: generic hedge helper (timer-armed secondary, first-success-wins, loser ctx-cancelled) + a hedged one-shot client behind the same interface <code>get_guidance</code> uses. Tests with httptest fake endpoints: fast primary (no hedge fired), slow primary (hedge wins), primary error (immediate secondary), both fail (primary error returned), parent-ctx cancellation cancels both, LogSink sees only the winner.</li>
+      <li><em>Dropped from rev 1:</em> tool-registration mutex, <code>ToolCallRequest.ResponseHadText</code>, handler speak path, StageThresholdProcessor — all belonged to the un-ported tool-call architecture.</li>
     </ul>
-    <p><em>Exit:</em> <code>go test -race</code> green including new concurrency tests; AGENTS.md updated with the decided surfaces.</p>
+    <p><em>Exit:</em> <code>go test -race</code> green including new concurrency and hedge tests; AGENTS.md updated with the decided surfaces.</p>
   </div>
 
   <div class="phase">
     <span class="effort">bot · medium</span>
     <h3>Phase 3 — OnboardingCallBot skeleton (callable end-to-end, single stage)</h3>
     <ul>
-      <li><code>disha/onboarding_call.go</code>: <code>plan()</code> (startup, variant/config load, prompt compile, fresh initial messages <code>[system, user:"hello?"]</code>), <code>BuildTask()</code> (pipeline wiring incl. output filter + threshold slot, no talk-time), <code>NewBot</code> registration.</li>
+      <li><code>disha/onboarding_call.go</code>: <code>plan()</code> (startup, variant/config load, prompt compile, fresh initial messages <code>[system, user:"hello?"]</code>), <code>BuildTask()</code> (pipeline wiring incl. output filter; no talk-time, no threshold processor), <code>NewBot</code> registration.</li>
       <li><code>end_call</code> tool wiring; prompt metadata (system + stage prompt identity + exact variables) on every conversation LLM call.</li>
       <li>Local smoke: browser call through <code>/bot/create_worker_room</code> with a real staging variant config against local Redis — bot greets from the start stage.</li>
     </ul>
@@ -328,22 +335,22 @@
 
   <div class="phase">
     <span class="effort">bot · large</span>
-    <h3>Phase 4 — Stage machine</h3>
+    <h3>Phase 4 — Stage machine (tracker architecture*)</h3>
     <ul>
-      <li><code>disha/onboarding_stage_manager.go</code>: <code>process_transition</code> (resolution, advance, recompile/apply, enum refresh, RTVI messages, Sentry paths).</li>
-      <li><code>update_stage</code> handler: end_call special case, "hmm..." filler, <code>run_llm</code> logic.</li>
-      <li>Persistence trio (debug chunk + assistant tool_calls chunk + tool result chunk), analytics + timing-log enqueues.</li>
-      <li>Threshold processor wiring (turn counts from state, reminder text, tag/Sentry at +3).</li>
-      <li>Tests: transition happy path, invalid stage, redundant transition, threshold reminder injection, chunk shapes byte-compared to Python fixtures.</li>
+      <li>Fuzzy matcher port: normalization (zero-width chars, Devanagari danda, casefold, filler stripping, <code>[Name]</code>/<code>&lt;Name&gt;</code> expansion), token_set/partial/coverage scoring, yes/maybe/no thresholds, over-length trigger Sentry. Port <code>test_stage_transition_fuzzy_matcher.py</code> cases 1:1 as Go table tests.</li>
+      <li><code>disha/onboarding_stage_tracker.go</code>: driven by <code>OnLLMCallCompleted</code> — skip interrupted responses, 5-turn transcript window, skip <code>*closing*</code>/terminal stages, maybe-path LLM classifier (<code>obcall_helpers/agenda_tracker/*</code>, 32 tokens, get_guidance-style one-shot client), output validation against <code>allowed_next_stages</code>, stale-result lock.</li>
+      <li><code>disha/onboarding_stage_manager.go</code>: <code>process_transition</code> (resolution, advance, recompile + <code>ReplaceSystemMessage</code>, RTVI messages, Sentry paths) with <code>source="stage_transition_tracker"</code>.</li>
+      <li>Persistence: agenda-change debug chunk (<code>tool_call_id = stage_transition_tracker_{uuid}</code>) — no assistant/tool chunk pair on the tracker path; analytics + timing-log enqueues.</li>
+      <li>Tests: matcher fixture parity, transition happy path, invalid tracker output, redundant transition, stale-result drop, chunk shapes byte-compared to Python fixtures.</li>
     </ul>
-    <p><em>Exit:</em> multi-stage local call traverses the real stage graph; a Python-resumable chunk trail (verify by resuming the Go call from the Python backend once phase 5's state upload lands).</p>
+    <p><em>Exit:</em> multi-stage local call traverses the real stage graph via tracker-detected transitions; matcher output parity with Python on the fixture corpus.</p>
   </div>
 
   <div class="phase">
     <span class="effort">bot · medium</span>
     <h3>Phase 5 — Deep thinking, careplan, state persistence, resume</h3>
     <ul>
-      <li><code>DeepThinkingManager</code> (blocking gather + non-blocking recompile, get_guidance-pattern LLM calls, <code>&lt;think&gt;</code> strip, debug chunk, RTVI progress).</li>
+      <li><code>DeepThinkingManager</code> (blocking gather + non-blocking recompile, <code>&lt;think&gt;</code> strip, debug chunk, RTVI progress) using the phase-2 hedged client (Cerebras primary / OpenRouter hedge at 1s, mirroring <code>gpt_oss120_fast_hedged</code>); both-fail degrades to transition-without-new-variables + Sentry.</li>
       <li><code>CarePlanManager</code> (detect/activate, <code>set_user_careplan</code>).</li>
       <li>Per-chunk conversation-state S3 upload + <code>conversation_state_s3_key</code> on every user/assistant chunk (<strong>launch blocker</strong> — see §4.5 callout).</li>
       <li>Onboarding resume: state download, <code>from_resume</code>, onboarding resume instructions, replay incl. tool pairs.</li>
@@ -357,26 +364,16 @@
     <h3>Phase 6 — Post-call &amp; lifecycle parity</h3>
     <ul>
       <li>Populate <code>onboarding_call_done</code>, <code>latest_onboarding_call_stage</code>, intensity levels, <code>conversation_variables</code> in post-call (state snapshot handed to callbacks at build time).</li>
-      <li>Idle-cap parity decision applied (config constructor or accepted delta).</li>
-      <li>Recording verification outcome applied (likely no-op).</li>
+      <li>Idle cap and recording need no work (deltas accepted / backend-side per the §8 decision log).</li>
     </ul>
     <p><em>Exit:</em> Python post-call manager runs its onboarding branch correctly on a Go call (verify UserProfile fields + scheduled jobs on staging).</p>
   </div>
 
   <div class="phase">
-    <span class="effort">optional · large</span>
-    <h3>Phase 7 — Stage-transition tracker variants (only if scoped in)</h3>
-    <ul>
-      <li><code>OnLLMCallCompleted</code> hook (D3), 5-turn window, fuzzy matcher port (evaluate Go libs vs hand-porting token_set/partial/coverage with the Devanagari normalizer — Python's own tests become the fixture corpus), maybe-path LLM classifier, stale-result lock.</li>
-      <li>Port <code>test_stage_transition_fuzzy_matcher.py</code> cases 1:1 as Go table tests.</li>
-    </ul>
-    <p><em>Exit:</em> matcher fixture parity with Python outputs; tracker variant call transitions without <code>update_stage</code>.</p>
-  </div>
-
-  <div class="phase">
     <span class="effort">rollout · medium</span>
-    <h3>Phase 8 — QA, parity report, staged rollout</h3>
+    <h3>Phase 7 — QA, parity report, staged rollout</h3>
     <ul>
+      <li><strong>Pre-release model-group check</strong> (per decision): confirm every launch variant config's <code>model</code> key against disha-backend <code>services/openai_config_manager.py</code> and reconcile <code>llmrouter/groups.go</code> entries/env keys.</li>
       <li>Drop-in readiness report (same format as sales-call-drop-in-report.html) + AGENTS.md decision updates.</li>
       <li>Staging smoke via the existing worker deployment; follow-up-rollout playbook applies (flag split, QA baselines, log-analysis gotchas — see vago-followup-rollout memory).</li>
       <li>Rollout knob: onboarding routing lives in Disha's <code>BotWorkerManager</code>/pod selection — plan the same experiment-flag split used for the follow-up rollout.</li>
@@ -396,18 +393,27 @@
     <tr><td><code>interruption_strategy.py</code></td><td>Defined but not wired; current config uses MinWords(3), which Vago already matches.</td></tr>
     <tr><td><code>prompts/</code> directory</td><td>Legacy local prompts, unreferenced; live prompts come from the document store.</td></tr>
     <tr><td>Legacy "student" variant forcing</td><td>Lives in <code>bot_session_manager</code> (stays Python); Go treats missing variant as a startup error.</td></tr>
+    <tr><td><code>update_stage</code> tool-call transition path*</td><td>2026-07-06 decision: tracker is the default for all variants. Drops the tool schema/enum refresh, handler filler + <code>run_llm</code> logic, and the tool-call persistence trio.</td></tr>
+    <tr><td><code>stage_threshold_processor.py</code>*</td><td>Only exists to police the tool-call architecture; obsolete under the tracker default. State JSON keeps its flags (always false) for shape compatibility.</td></tr>
   </table>
 </section>
 
 <section id="questions">
-  <h2>8. Open questions for Jaideep</h2>
+  <h2>8. Decision log — questions &amp; answers (2026-07-06)</h2>
+  <table>
+    <tr><th>Question</th><th>Decision</th></tr>
+    <tr><td>Stage-transition architecture</td><td><strong>Tracker is the default for all variants.</strong> The <code>update_stage</code> tool-call path (handler filler/<code>run_llm</code> logic, enum refresh, StageThresholdProcessor) is not ported.</td></tr>
+    <tr><td>Trigger-statement readiness</td><td><strong>Assume present</strong> in every stage prompt's <code>config_json</code> (incl. phase 0). Defensive behavior only: Sentry + skip the transition attempt when a stage lacks them, never crash.</td></tr>
+    <tr><td>Core surfaces D1 / D3</td><td><strong>Approved as specified</strong> (<code>ReplaceSystemMessage</code>; <code>CallEvents.OnLLMCallCompleted</code>).</td></tr>
+    <tr><td>Deep-thinking hedging (D4)</td><td><strong>Hedging is required.</strong> Build a reusable, logically-equivalent hedged execution primitive in <code>llmrouter</code> (interface to be settled in the design note); intended for the general "background call must respond fast so the model can move forward" pattern — deep thinking first, <code>get_guidance</code> and future background-assist calls later.</td></tr>
+    <tr><td>Idle-prompt cap</td><td><strong>Accept the delta</strong> (Go's 7 prompts vs Python's end-on-6th). No config constructor; the zero-audio first-retry Sentry diagnostic is likewise not ported.</td></tr>
+    <tr><td>Recording</td><td><strong>Daily cloud recording is started backend-side at room creation.</strong> The Go bot does nothing; no <code>daily_bridge.py</code> change.</td></tr>
+    <tr><td>Model group naming</td><td><strong>Check just before release</strong> — confirm the variant configs' group keys against <code>services/openai_config_manager.py</code> and add any missing entries to <code>llmrouter/groups.go</code> as a pre-release step (phase 7), not a phase-0 gate.</td></tr>
+    <tr><td>post_plan_call</td><td><strong>Out of scope</strong> for this migration.</td></tr>
+  </table>
+  <h3>Remaining open item</h3>
   <ol>
-    <li><strong>Launch variants:</strong> which <code>onboarding_call_variant</code>s must the Go bot support at cutover? If <code>student_test</code>/<code>misc1</code> (tracker variants) are out, phase 7 is deferred and D3 is dropped — a big scope reduction.</li>
-    <li><strong>Deep-thinking hedging:</strong> OK to replace Python's 1s hedged failover with the <code>get_guidance</code> pattern (single health-selected <code>gpt-oss120-fast</code> call + Sentry on failure)? Blocking-DT failure would degrade to "transition without new variables".</li>
-    <li><strong>Idle-prompt cap:</strong> align Go to Python (end on 6th idle fire) via a config constructor, or accept the 7-prompt delta?</li>
-    <li><strong>Recording:</strong> confirm Daily cloud recording is started backend-side at room creation (bot does nothing). If the bot starts it, <code>daily_bridge.py</code> grows a command.</li>
-    <li><strong>Model group naming:</strong> once phase 0 dumps the variant configs, confirm the exact group keys to add to <code>llmrouter/groups.go</code> so they stay in lock-step with <code>services/openai_config_manager.py</code>.</li>
-    <li><strong>post_plan_call:</strong> out of scope for this migration, correct? (It shares the same infra; noting so the bot boundary doesn't accidentally absorb it.)</li>
+    <li><strong>get_guidance hedging adoption timing:</strong> adopting the D4 primitive for <code>get_guidance</code> supersedes the standing "no in-call failover for get_guidance" decision. Recommend letting the primitive soak on deep thinking first, then switching <code>get_guidance</code> to it in a follow-up — but the interface should be designed so that switch is a constructor swap.</li>
   </ol>
 </section>
 
@@ -436,7 +442,7 @@
       <ul>
         <li><code>OB_Call_Configs/{variant}_config</code> (config JSON)</li>
         <li>Main system prompt, per-stage prompts, deep-thinking prompts, careplan switcher prompt (names from config)</li>
-        <li><code>obcall_helpers/agenda_tracker/agenda_tracker_sys</code> / <code>_user</code> (tracker variants only)</li>
+        <li><code>obcall_helpers/agenda_tracker/agenda_tracker_sys</code> / <code>_user</code> (every call — tracker is the default*)</li>
       </ul>
       <h4>S3 writes</h4>
       <ul>
@@ -461,8 +467,8 @@
     <tr><td>bots/onboarding_call/conversation_state.py</td><td>disha/onboarding_state.go (planned)</td><td><span class="tag new">New</span></td></tr>
     <tr><td>bots/onboarding_call/prompt_parser.py</td><td>disha/onboarding_prompts.go (planned) + jinja_renderer.go</td><td><span class="tag new">New</span></td></tr>
     <tr><td>bots/onboarding_call/stage_manager.py</td><td>disha/onboarding_stage_manager.go (planned)</td><td><span class="tag new">New</span></td></tr>
-    <tr><td>bots/onboarding_call/stage_threshold_processor.py</td><td>voicepipelinecore/stage_threshold_processor.go (planned, callback-driven)</td><td><span class="tag new">New</span> <span class="tag design">Design</span></td></tr>
-    <tr><td>bots/onboarding_call/stage_transition_tracker_processor.py + stage_transition_fuzzy_matcher.py</td><td>disha/onboarding_stage_tracker.go (+ matcher) — phase 7</td><td><span class="tag new">New</span> <span class="tag verify">Verify</span></td></tr>
+    <tr><td>bots/onboarding_call/stage_transition_tracker_processor.py + stage_transition_fuzzy_matcher.py</td><td>disha/onboarding_stage_tracker.go (+ matcher) — phase 4, default for all variants*</td><td><span class="tag new">New</span></td></tr>
+    <tr><td>bots/onboarding_call/stage_threshold_processor.py</td><td>— (tool-call-variant-only; tracker default makes it obsolete)</td><td><span class="tag skip">Skip</span></td></tr>
     <tr><td>bots/onboarding_call/deep_thinking_manager.py</td><td>disha/onboarding_deep_thinking.go (planned)</td><td><span class="tag new">New</span></td></tr>
     <tr><td>bots/onboarding_call/careplan_manager.py</td><td>disha/onboarding_careplan.go (planned)</td><td><span class="tag new">New</span></td></tr>
     <tr><td>bots/onboarding_call/conversation_context_manager.py</td><td>disha/call_startup.go + tool_context_chunks.go (replay done) + onboarding resume additions</td><td><span class="tag extend">Extend</span></td></tr>

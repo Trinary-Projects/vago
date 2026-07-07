@@ -160,9 +160,10 @@ func (p *LLMProcessor) cancelInFlight() {
 func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	p.metrics.Start(MetricTTFB)
 	p.metrics.Start(MetricProcessing)
-	p.PushFrame(NewLLMResponseStartFrame(time.Now()), Downstream)
+	startedAt := time.Now()
+	p.PushFrame(NewLLMResponseStartFrame(startedAt), Downstream)
 
-	var ttfbMs float64
+	var ttfbMs *float64
 	firstToken := true
 	onToken := func(content string) {
 		if content == "" {
@@ -171,7 +172,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		if firstToken {
 			firstToken = false
 			if mf := p.metrics.Stop(MetricTTFB); mf != nil {
-				ttfbMs = mf.Data[0].ValueMs
+				ttfbMs = float64Ptr(mf.Data[0].ValueMs)
 				p.PushFrame(*mf, Downstream)
 			}
 		}
@@ -185,18 +186,21 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	}
 	result, err := p.client.Stream(ctx, req, onToken)
 	if firstToken && result.TTFB > 0 {
-		ttfbMs = float64(result.TTFB.Microseconds()) / 1000.0
+		ttfbMs = float64Ptr(float64(result.TTFB.Microseconds()) / 1000.0)
 		_ = p.metrics.Stop(MetricTTFB)
 	}
+	totalMs := float64Ptr(millisecondsSince(startedAt))
 
 	// Cancellation (barge-in / EndFrame) takes precedence: the interrupt/
 	// end path already reset TTS + playback, so we must NOT emit terminal
 	// frames here (they'd be processed after the reset).
 	if ctx.Err() != nil {
-		p.emitLLMCallResult(result.Model, ttfbMs, 0, "interrupted")
+		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		return
 	}
 	if err != nil {
+		_ = p.metrics.Stop(MetricTTFB)
+		_ = p.metrics.Stop(MetricProcessing)
 		// Live endpoint error (the router has already blacklisted +
 		// triggered a re-poll). The turn fails but the call continues
 		// (Python parity: the next turn re-selects). Close the turn so
@@ -207,13 +211,12 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// until the 120s watchdog.
 		p.taskCtx.Logger.Println("LLM stream failed:", err)
 		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
-		p.emitLLMCallResult(result.Model, ttfbMs, 0, "interrupted")
+		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		return
 	}
 
-	var totalMs float64
 	if mf := p.metrics.Stop(MetricProcessing); mf != nil {
-		totalMs = mf.Data[0].ValueMs
+		totalMs = float64Ptr(mf.Data[0].ValueMs)
 		p.PushFrame(*mf, Downstream)
 	}
 	p.PushFrame(NewLLMResponseEndFrame(), Downstream)
@@ -373,20 +376,30 @@ func (p *LLMProcessor) reportToolResultError(functionName, toolCallID string, er
 // emitLLMCallResult publishes the Python-compatible RTVI server-message
 // reporting which model served the turn and its latency. Mirrors
 // CustomOpenAILLMService.on_llm_call_complete -> rtvi llm_call_result.
-func (p *LLMProcessor) emitLLMCallResult(model string, ttfbMs, totalMs float64, status string) {
+func (p *LLMProcessor) emitLLMCallResult(model string, ttfbMs, totalMs *float64, status string) {
 	if p.taskCtx == nil || p.taskCtx.UIEvents == nil {
 		return
 	}
 	data := map[string]any{
-		"type":   "llm_call_result",
-		"status": status,
-		"model":  model,
+		"type":     "llm_call_result",
+		"status":   status,
+		"model":    model,
+		"ttfb_ms":  nil,
+		"total_ms": nil,
 	}
-	if ttfbMs > 0 {
-		data["ttfb_ms"] = ttfbMs
+	if ttfbMs != nil {
+		data["ttfb_ms"] = *ttfbMs
 	}
-	if totalMs > 0 {
-		data["total_ms"] = totalMs
+	if totalMs != nil {
+		data["total_ms"] = *totalMs
 	}
 	p.taskCtx.UIEvents.ServerMessage(data, time.Now())
+}
+
+func millisecondsSince(start time.Time) float64 {
+	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+func float64Ptr(v float64) *float64 {
+	return &v
 }
