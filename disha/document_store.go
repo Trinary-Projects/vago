@@ -128,6 +128,32 @@ func (s *DocumentStore) GetDocumentWithConfig(ctx context.Context, name string, 
 	return rendered.Output, doc.Version, cloneDocumentConfig(doc.ConfigJSON), nil
 }
 
+// GetDocumentConfig resolves a document WITHOUT rendering it and returns
+// its config_json, mirroring Python's document_manager.get_document_config:
+// a copy of config_json with the resolved "version" and document "id"
+// injected as top-level keys (overriding same-named keys, like Python).
+// The onboarding stage tracker uses this to read trigger statements —
+// rendering with empty variables would fire the missing-jinja-variable
+// Sentry path for no reason. Uses the same resolve/caching as GetDocument.
+func (s *DocumentStore) GetDocumentConfig(ctx context.Context, name string, version int) (map[string]any, int, error) {
+	if s == nil {
+		return nil, 0, errors.New("disha: document store is nil")
+	}
+	doc, err := s.resolve(ctx, name, version)
+	if err != nil {
+		return nil, 0, err
+	}
+	config := cloneDocumentConfig(doc.ConfigJSON)
+	if config == nil {
+		config = map[string]any{}
+	}
+	config["version"] = doc.Version
+	if doc.ID != "" {
+		config["id"] = doc.ID
+	}
+	return config, doc.Version, nil
+}
+
 func cloneDocumentConfig(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil

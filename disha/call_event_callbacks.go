@@ -30,6 +30,12 @@ type CallEventCallbacks struct {
 	// .name on every chunk). Nil for bots without stages; the value is a
 	// provider, not a snapshot, because the stage advances mid-call.
 	currentAgenda func() string
+
+	// llmCallCompleted receives each finished LLM generation (Python's
+	// OnboardingPipelineManager.on_llm_call_complete delegating to the
+	// stage-transition tracker). Nil for bots without a stage tracker;
+	// OnLLMCallCompleted then no-ops.
+	llmCallCompleted func(text string, interrupted bool)
 }
 
 func NewCallEventCallbacks(startup CallStartup, redis RedisClient, api *APIClient, debugLogUploader DebugLogUploader) *CallEventCallbacks {
@@ -53,6 +59,24 @@ func (c *CallEventCallbacks) SetCurrentAgendaProvider(fn func() string) {
 	c.currentAgenda = fn
 }
 
+// SetLLMCallCompletedHandler wires the onboarding stage tracker's
+// LLM-completion hook; other bots leave it unset.
+func (c *CallEventCallbacks) SetLLMCallCompletedHandler(fn func(text string, interrupted bool)) {
+	if c == nil {
+		return
+	}
+	c.llmCallCompleted = fn
+}
+
+// OnLLMCallCompleted delegates a finished LLM generation to the
+// registered handler (the onboarding stage tracker); no-op when unset.
+func (c *CallEventCallbacks) OnLLMCallCompleted(text string, interrupted bool) {
+	if c.llmCallCompleted == nil {
+		return
+	}
+	c.llmCallCompleted(text, interrupted)
+}
+
 func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
 	if c == nil {
 		return voicepipelinecore.CallEvents{}
@@ -66,6 +90,7 @@ func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
 		OnUserTurnCommitted:      c.OnUserTurnCommitted,
 		OnAssistantTurnCommitted: c.OnAssistantTurnCommitted,
 		OnToolResultCommitted:    c.OnToolResultCommitted,
+		OnLLMCallCompleted:       c.OnLLMCallCompleted,
 		OnCallEnded:              c.OnCallEnded,
 	}
 }
@@ -138,6 +163,20 @@ func (c *CallEventCallbacks) appendConversationChunk(text, role string, at time.
 }
 
 func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any) {
+	c.appendChunk(text, role, at, metrics, promptKey, additionalData, false)
+}
+
+// AppendDebugLogChunk persists an is_debug_log=true assistant chunk,
+// mirroring Python's conversation_persistence_processor.on_debug_log.
+// The onboarding stage manager uses it for the tracker-source
+// agenda-change debug chunk (additional_data.tool_call_id). The chunk's
+// current_agenda comes from the live agenda provider, so it carries the
+// NEW stage — the state has already advanced, same as Python.
+func (c *CallEventCallbacks) AppendDebugLogChunk(text string, at time.Time, promptKey string, additionalData any) {
+	c.appendChunk(text, "assistant", at, voicepipelinecore.TurnMetrics{}, promptKey, additionalData, true)
+}
+
+func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool) {
 	if c == nil || c.redis == nil {
 		return
 	}
@@ -164,7 +203,7 @@ func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, rol
 		V2VLatencyMs:                     assistantMetricSeconds(role, metrics.E2ELatencyMs),
 		TextAggregationMs:                assistantMetricSeconds(role, metrics.TTSTextAggregationMs),
 		Created:                          at.Format(time.RFC3339Nano),
-		IsDebugLog:                       false,
+		IsDebugLog:                       isDebugLog,
 		AdditionalData:                   additionalData,
 		MainAgentSystemPromptLangfuseKey: promptKeyPtr,
 	}

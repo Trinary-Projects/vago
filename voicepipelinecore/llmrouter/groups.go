@@ -84,6 +84,11 @@ const (
 	gpt41Model = "gpt-4.1"
 )
 
+// EndpointOpenRouterGemini25FlashLite is the fixed-endpoint config key for
+// the onboarding stage-transition tracker's one-shot classifier (used via
+// Config.FixedEndpoint, never in a health-selected group).
+const EndpointOpenRouterGemini25FlashLite = "openrouter_gemini_2_5_flash_lite"
+
 func floatPtr(v float64) *float64 { return &v }
 func intPtr(v int) *int           { return &v }
 
@@ -207,6 +212,18 @@ var endpointConfigs = map[string]endpointConfig{
 		Model: "openai/gpt-oss-120b", Region: "us",
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		MaxTokens: intPtr(500),
+	},
+
+	// --- onboarding stage-transition tracker classifier ---
+	// Fixed-endpoint-only: used via Config.FixedEndpoint by the Disha
+	// onboarding stage tracker's one-shot "maybe" classifier and never a
+	// member of a health-selected group's Configs list, so Python-side
+	// polling for it is optional (same note as the hedged throughput
+	// config below).
+	EndpointOpenRouterGemini25FlashLite: {
+		Key: EndpointOpenRouterGemini25FlashLite, Provider: providerOpenRouter,
+		Model: "google/gemini-2.5-flash-lite", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 	},
 
 	// --- hedged one-shot hedge endpoint ---

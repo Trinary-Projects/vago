@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	vpc "github.com/jaideep329/talk-go/voicepipelinecore"
@@ -76,6 +77,14 @@ type Router struct {
 	cfg            Config
 	httpClient     *http.Client
 	pollTriggerURL string
+
+	// promptMetadata starts as Config.PromptMetadata and can be replaced
+	// mid-session with SetPromptMetadata (Python updates
+	// context.prompt_metadata on every onboarding prompt recompile, so
+	// logged metadata reflects the prompts actually in use). Reads at log
+	// time go through the same mutex.
+	metaMu         sync.Mutex
+	promptMetadata map[string]any
 }
 
 // New builds a Router for the given model group. The poll-trigger URL is
@@ -107,7 +116,25 @@ func New(cfg Config) (*Router, error) {
 		cfg:            cfg,
 		httpClient:     httpClient,
 		pollTriggerURL: strings.TrimSpace(os.Getenv(pollTriggerURLEnv)),
+		promptMetadata: cfg.PromptMetadata,
 	}, nil
+}
+
+// SetPromptMetadata replaces the prompt metadata attached to subsequent
+// call logs. The Disha onboarding stage manager calls this after each
+// stage transition so the conversation router's logged prompt identity
+// tracks the recompiled system prompt; the stage tracker's classifier
+// sets it per one-shot call.
+func (r *Router) SetPromptMetadata(metadata map[string]any) {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	r.promptMetadata = metadata
+}
+
+func (r *Router) currentPromptMetadata() map[string]any {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	return r.promptMetadata
 }
 
 // selectEndpoint resolves the endpoint for one call: the pinned config
@@ -168,7 +195,7 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 			Request:          llmReq,
 			ResponseContent:  responseContent.String(),
 			ToolCalls:        res.ToolCalls,
-			PromptMetadata:   r.cfg.PromptMetadata,
+			PromptMetadata:   r.currentPromptMetadata(),
 			PromptTokens:     usage.PromptTokens,
 			CompletionTokens: usage.CompletionTokens,
 			TTFBMs:           msFromDuration(res.TTFB),

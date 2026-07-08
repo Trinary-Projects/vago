@@ -200,6 +200,30 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 		return nil, err
 	}
 
+	// Stage machine (phase 4): manager + tracker are constructed before
+	// NewPipelineTask because the CallEvents mapping is consumed there,
+	// but they need the aggregator pair / router / UI emitter, which only
+	// exist later — those are injected via SetInfrastructure (Python's
+	// set_infrastructure pattern). Until then their entry points no-op.
+	classifier, err := newOnboardingStageClassifier(deps, pl)
+	if err != nil {
+		return nil, err
+	}
+	stageManager := NewOnboardingStageManager(
+		pl.State, pl.Config, pl.Compiler, pl.Callbacks, deps.API,
+		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID, pl.PromptKey,
+	)
+	stageTracker := NewOnboardingStageTracker(
+		pl.State, pl.Config, deps.Documents, stageManager, classifier,
+		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
+		pl.Startup.Data.Conversation.PatientInfo,
+	)
+	// CallEventCallbacks owns every callback in Events(); the tracker is
+	// wired as its OnLLMCallCompleted handler (Python's pipeline manager
+	// receiving on_llm_call_complete and delegating to the tracker) so the
+	// mapping below stays the plain Events() used by sales/follow-up.
+	pl.Callbacks.SetLLMCallCompletedHandler(stageTracker.OnLLMCallCompleted)
+
 	task, err := voicepipelinecore.NewPipelineTask(ctx, voicepipelinecore.TaskConfig{
 		Logger:     pl.Startup.Logger,
 		SessionID:  pl.Startup.ConversationID,
@@ -237,6 +261,14 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	}
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
 	registerOnboardingTools(llm, task, pl)
+
+	// Late-bind the stage machine's infrastructure now that the pair,
+	// conversation router, and UI event sender exist — before task
+	// assembly completes, so the first LLM completion can already be
+	// tracked.
+	stageManager.SetInfrastructure(contextAggregators, llmClient, taskCtx.UIEvents)
+	stageTracker.SetInfrastructure(taskCtx.Ctx, contextAggregators, taskCtx.UIEvents)
+
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
 	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
@@ -297,7 +329,10 @@ func registerOnboardingTools(llm *voicepipelinecore.LLMProcessor, task *voicepip
 // newOnboardingLLMClient builds the health-based router on the variant
 // config's model group (student_test: grok-4.1-fast). Temperature stays
 // the router default 0, matching Python's InputParams(temperature=0).
-func newOnboardingLLMClient(deps Deps, pl *onboardingCallPlan) (voicepipelinecore.LLMClient, error) {
+// It returns the concrete *llmrouter.Router (not the LLMClient
+// interface) because the stage manager refreshes its prompt metadata via
+// SetPromptMetadata after every stage transition.
+func newOnboardingLLMClient(deps Deps, pl *onboardingCallPlan) (*llmrouter.Router, error) {
 	return llmrouter.New(llmrouter.Config{
 		Group:          pl.Config.Model,
 		Region:         "us",
@@ -305,5 +340,24 @@ func newOnboardingLLMClient(deps Deps, pl *onboardingCallPlan) (voicepipelinecor
 		Logger:         pl.Startup.Logger,
 		LogSink:        newLLMLogSink(deps.API, pl.Startup.Logger, onboardingUsecaseType, pl.Startup.UserID, pl.Startup.ConversationID),
 		PromptMetadata: pl.PromptMetadata,
+	})
+}
+
+// newOnboardingStageClassifier builds the one-shot fixed-endpoint client
+// for the stage tracker's "maybe" classifier, mirroring Python's
+// generate_llm_response_with_failover(config_key=onboarding_stage_
+// transition_tracker, max_tokens=32, temperature=0). PromptMetadata is
+// set per call by the tracker (SetPromptMetadata) with the rendered
+// prompt identity, so none is pinned here.
+func newOnboardingStageClassifier(deps Deps, pl *onboardingCallPlan) (*llmrouter.Router, error) {
+	temperature := 0.0
+	maxTokens := 32
+	return llmrouter.New(llmrouter.Config{
+		FixedEndpoint: llmrouter.EndpointOpenRouterGemini25FlashLite,
+		Redis:         deps.Redis,
+		Logger:        pl.Startup.Logger,
+		LogSink:       newLLMLogSink(deps.API, pl.Startup.Logger, stageTrackerUsecaseType, pl.Startup.UserID, pl.Startup.ConversationID),
+		Temperature:   &temperature,
+		MaxTokens:     &maxTokens,
 	})
 }

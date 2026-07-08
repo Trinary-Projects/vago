@@ -58,8 +58,16 @@ func (s *aggregatorSharedState) replaceSystemMessage(text string) {
 	s.messages = append([]Message{{Role: "system", Content: text}}, s.messages...)
 }
 
-func (s *aggregatorSharedState) messagesForTest() []Message {
+// snapshot returns a deep copy of the shared conversation history,
+// mutex-guarded the same as replaceSystemMessage. Callers own the
+// returned slice/messages outright; mutating them (including a
+// message's ToolCalls) cannot affect shared state.
+func (s *aggregatorSharedState) snapshot() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneMessages(s.messages)
+}
+
+func (s *aggregatorSharedState) messagesForTest() []Message {
+	return s.snapshot()
 }

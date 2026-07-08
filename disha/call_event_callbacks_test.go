@@ -87,3 +87,52 @@ func TestCallEventCallbacksPersistToolContextChunks(t *testing.T) {
 		t.Fatalf("tool reconstructed message = %+v", toolMsg)
 	}
 }
+
+// TestCallEventCallbacksLLMCallCompletedDelegation verifies the
+// OnLLMCallCompleted entry in the Events() mapping: without a registered
+// handler it no-ops safely, and with SetLLMCallCompletedHandler the
+// text/interrupted values reach the handler through the mapping (the path
+// the onboarding stage tracker is wired into).
+func TestCallEventCallbacksLLMCallCompletedDelegation(t *testing.T) {
+	_, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        OnboardingCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	if events.OnLLMCallCompleted == nil {
+		t.Fatal("Events().OnLLMCallCompleted must be registered")
+	}
+
+	// No handler set: must be a safe no-op.
+	events.OnLLMCallCompleted("ignored text", false)
+
+	type call struct {
+		text        string
+		interrupted bool
+	}
+	var got []call
+	callbacks.SetLLMCallCompletedHandler(func(text string, interrupted bool) {
+		got = append(got, call{text, interrupted})
+	})
+
+	// Fire through the Events() mapping, not the handler directly, so the
+	// delegation path is what's exercised.
+	events.OnLLMCallCompleted("namaste, kaise hain aap", false)
+	events.OnLLMCallCompleted("half a sen", true)
+
+	want := []call{
+		{"namaste, kaise hain aap", false},
+		{"half a sen", true},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("handler calls = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("handler call %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
