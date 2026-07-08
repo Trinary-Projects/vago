@@ -24,6 +24,12 @@ type CallEventCallbacks struct {
 	conversationID string
 	userID         string
 	botType        string
+
+	// currentAgenda supplies the live onboarding stage name at
+	// chunk-write time (Python persists conversation_state.current_stage
+	// .name on every chunk). Nil for bots without stages; the value is a
+	// provider, not a snapshot, because the stage advances mid-call.
+	currentAgenda func() string
 }
 
 func NewCallEventCallbacks(startup CallStartup, redis RedisClient, api *APIClient, debugLogUploader DebugLogUploader) *CallEventCallbacks {
@@ -36,6 +42,15 @@ func NewCallEventCallbacks(startup CallStartup, redis RedisClient, api *APIClien
 		userID:           startup.UserID,
 		botType:          startup.BotType,
 	}
+}
+
+// SetCurrentAgendaProvider wires the onboarding stage-name provider used
+// to fill current_agenda on persisted chunks.
+func (c *CallEventCallbacks) SetCurrentAgendaProvider(fn func() string) {
+	if c == nil {
+		return
+	}
+	c.currentAgenda = fn
 }
 
 func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
@@ -130,10 +145,17 @@ func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, rol
 	if promptKey != "" {
 		promptKeyPtr = &promptKey
 	}
+	var currentAgenda *string
+	if c.currentAgenda != nil {
+		if agenda := c.currentAgenda(); agenda != "" {
+			currentAgenda = &agenda
+		}
+	}
 	chunk := ConversationChunk{
 		ID:                               uuid.NewString(),
 		Text:                             text,
 		Role:                             role,
+		CurrentAgenda:                    currentAgenda,
 		BotType:                          c.botType,
 		ConversationID:                   c.conversationID,
 		UserID:                           c.userID,
