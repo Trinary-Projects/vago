@@ -136,6 +136,44 @@ func TestConversationStateIntensityLevels(t *testing.T) {
 	}
 }
 
+// TestConversationStateIntensityLevelsNonStringSkipped verifies
+// GetIntensityLevels only recognizes string values (onboarding assumes the
+// variable store holds strings or nil for these keys): a non-string value
+// (a JSON-decoded number or bool) is skipped exactly like a missing key,
+// with no numeric/bool coercion.
+func TestConversationStateIntensityLevelsNonStringSkipped(t *testing.T) {
+	cfg := parseStudentTestConfig(t)
+	state := NewConversationState(cfg, "student_test")
+
+	state.MergeVariables(map[string]any{
+		"diet_intensity_level":    float64(2),
+		"fitness_intensity_level": "advanced",
+	})
+	got := state.GetIntensityLevels()
+	if _, ok := got["diet_plan_intensity_level"]; ok {
+		t.Fatalf("diet_plan_intensity_level present for non-string value: %#v", got)
+	}
+	if got["fitness_plan_intensity_level"] != "advanced" {
+		t.Fatalf("fitness_plan_intensity_level = %q, want %q", got["fitness_plan_intensity_level"], "advanced")
+	}
+
+	// A bool value is skipped the same way.
+	state2 := NewConversationState(cfg, "student_test")
+	state2.MergeVariables(map[string]any{"diet_intensity_level": true})
+	got2 := state2.GetIntensityLevels()
+	if _, ok := got2["diet_plan_intensity_level"]; ok {
+		t.Fatalf("diet_plan_intensity_level present for bool value: %#v", got2)
+	}
+
+	// Missing key stays absent (not just skipped-when-empty).
+	state3 := NewConversationState(cfg, "student_test")
+	state3.MergeVariables(map[string]any{"diet_intensity_level": "2"})
+	got3 := state3.GetIntensityLevels()
+	if _, ok := got3["fitness_plan_intensity_level"]; ok {
+		t.Fatalf("fitness_plan_intensity_level present without a value: %#v", got3)
+	}
+}
+
 func TestConversationStateFromResume(t *testing.T) {
 	cfg := parseStudentTestConfig(t)
 

@@ -3,6 +3,7 @@ package disha
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +17,71 @@ const (
 	onboardingTestMainPrompt  = "onboarding_callV3_4/00_main_call_agent_sys"
 	onboardingTestStagePrompt = "onboarding_callV3_4/01_introduction_and_call_overview"
 )
+
+// TestBuildOnboardingResumeMessage pins onboarding's distinct resume
+// texts (conversation_context_manager.py) and confirms it shares
+// buildResumeSystemMessage's gate exactly (same false cases), while the
+// returned text is byte-exact to onboarding's wording — notably "1.If"
+// with no space, unlike the shared "1. If" sales/follow-up text — and
+// wrapped in <system_instruction> (not the shared <system_message> tag),
+// ready to append verbatim via buildInitialMessages.
+func TestBuildOnboardingResumeMessage(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	chunkID := "chunk-1"
+	boolPtr := func(v bool) *bool { return &v }
+	resumedChunk := func(age time.Duration) map[string]any {
+		return map[string]any{"created": now.Add(-age).Format(time.RFC3339Nano)}
+	}
+	wrap := func(text string) string { return "<system_instruction>" + text + "</system_instruction>" }
+	cases := []struct {
+		name string
+		data *ConversationData
+		want string
+	}{
+		{"nil data", nil, ""},
+		{"no resumed chunk id", &ConversationData{
+			ResumedChunk: resumedChunk(time.Minute),
+		}, ""},
+		{"gracefully nil emits nothing", &ConversationData{
+			Conversation: ConversationRow{ResumedFromChunkID: &chunkID},
+			ResumedChunk: resumedChunk(time.Minute),
+		}, ""},
+		{"gracefully false emits nothing", &ConversationData{
+			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(false)},
+			ResumedChunk: resumedChunk(time.Minute),
+		}, ""},
+		{"missing created timestamp emits nothing", &ConversationData{
+			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
+			ResumedChunk: map[string]any{},
+		}, ""},
+		{"gracefully true within window", &ConversationData{
+			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
+			ResumedChunk: resumedChunk(time.Minute),
+		}, wrap(onboardingResumeMessageWithinWindow)},
+		{"gracefully true after window", &ConversationData{
+			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
+			ResumedChunk: resumedChunk(10 * time.Minute),
+		}, wrap(onboardingResumeMessageAfterWindow)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildOnboardingResumeMessage(tc.data, now); got != tc.want {
+				t.Fatalf("buildOnboardingResumeMessage = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	within := buildOnboardingResumeMessage(&ConversationData{
+		Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
+		ResumedChunk: resumedChunk(time.Minute),
+	}, now)
+	if !strings.Contains(within, "1.If the interruption was user initiated(like") {
+		t.Fatalf("onboarding within-window text missing the byte-exact '1.If' line: %q", within)
+	}
+	if strings.Contains(within, "1. If the interruption") {
+		t.Fatalf("onboarding within-window text must not use the shared sales/follow-up '1. If' wording: %q", within)
+	}
+}
 
 // seedOnboardingFixtures loads the captured student_test staging config
 // and all its stage prompts into miniredis under their real document
@@ -300,4 +366,288 @@ func messageRoles(msgs []voicepipelinecore.Message) []string {
 		roles[i] = m.Role
 	}
 	return roles
+}
+
+// --- loadOnboardingResumeState ---------------------------------------
+
+func TestLoadOnboardingResumeStateHappyPath(t *testing.T) {
+	getter := fakeS3GetClient{objects: map[string][]byte{
+		"conversation_state/conv-1/chunk-1.json": []byte(`{"agenda":"introduction","variable_store":{"k":"v"}}`),
+	}}
+	state, err := loadOnboardingResumeState(context.Background(), getter, "conversation_state/conv-1/chunk-1.json", nil)
+	if err != nil {
+		t.Fatalf("loadOnboardingResumeState: %v", err)
+	}
+	if state["agenda"] != "introduction" {
+		t.Fatalf("state[agenda] = %v, want introduction", state["agenda"])
+	}
+	store, _ := state["variable_store"].(map[string]any)
+	if store["k"] != "v" {
+		t.Fatalf("state[variable_store] = %v", state["variable_store"])
+	}
+}
+
+func TestLoadOnboardingResumeStateDownloadError(t *testing.T) {
+	getter := fakeS3GetClient{objects: map[string][]byte{}}
+	if _, err := loadOnboardingResumeState(context.Background(), getter, "missing.json", nil); err == nil {
+		t.Fatal("download error: want error")
+	}
+}
+
+func TestLoadOnboardingResumeStateInvalidJSON(t *testing.T) {
+	getter := fakeS3GetClient{objects: map[string][]byte{
+		"bad.json": []byte("not json"),
+	}}
+	if _, err := loadOnboardingResumeState(context.Background(), getter, "bad.json", nil); err == nil {
+		t.Fatal("invalid JSON: want error")
+	}
+}
+
+func TestLoadOnboardingResumeStateNilGetter(t *testing.T) {
+	if _, err := loadOnboardingResumeState(context.Background(), nil, "key.json", nil); err == nil {
+		t.Fatal("nil getter: want error")
+	}
+}
+
+// --- plan()-level resume ----------------------------------------------
+
+// stubOnboardingResumeGetter overrides the package-level S3-getter seam
+// (like sttDialURL/ttsDialURL) so plan() exercises a fake client instead
+// of building one from AWS env/network.
+func stubOnboardingResumeGetter(t *testing.T, getter S3GetClient) {
+	t.Helper()
+	prev := onboardingResumeS3Getter
+	onboardingResumeS3Getter = func(*log.Logger) S3GetClient { return getter }
+	t.Cleanup(func() { onboardingResumeS3Getter = prev })
+}
+
+// seedOnboardingResumeConversation seeds conversation_data for a resumed
+// onboarding call: a resumed_chunk carrying conversation_state_s3_key
+// plus prior transcript chunks to replay.
+func seedOnboardingResumeConversation(t *testing.T, server *miniredis.Miniredis, conversationID string, resumedID string, gracefully *bool, created string, s3Key string) {
+	t.Helper()
+	variant := "student_test"
+	resumedChunk := map[string]any{
+		"id":      resumedID,
+		"created": created,
+	}
+	if s3Key != "" {
+		resumedChunk["conversation_state_s3_key"] = s3Key
+	}
+	seedConversationData(t, server, conversationID, ConversationData{
+		Conversation: ConversationRow{
+			ID:                 conversationID,
+			UserID:             "user-ob",
+			BotType:            OnboardingCallBotType,
+			PatientInfo:        "Riya, age 32, wants better sleep",
+			ResumedFromChunkID: &resumedID,
+			ResumeGracefully:   gracefully,
+		},
+		Chunks: [][]any{
+			{"chunk-prev-1", "user", "I was telling you about my sleep", false, nil},
+			{"chunk-prev-2", "assistant", "Got it, let's continue", false, nil},
+		},
+		ResumedChunk: resumedChunk,
+		UserProfile: UserProfileData{
+			UserID:                "user-ob",
+			OnboardingCallVariant: &variant,
+			Gender:                "female",
+		},
+	})
+}
+
+func TestOnboardingCallBotPlanResumesFromValidState(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	seedOnboardingFixtures(t, redisServer)
+
+	gracefully := true
+	recent := time.Now().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	conversationID := "conv-ob-resume"
+	s3Key := "conversation_state/" + conversationID + "/chunk-prev.json"
+	seedOnboardingResumeConversation(t, redisServer, conversationID, "chunk-prev", &gracefully, recent, s3Key)
+
+	getter := fakeS3GetClient{objects: map[string][]byte{
+		s3Key: []byte(`{"agenda":"problem_rca_discussion","variable_store":{"x":"y"}}`),
+	}}
+	stubOnboardingResumeGetter(t, getter)
+
+	pl, err := OnboardingCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	if pl.State.CurrentStage().Name != "problem_rca_discussion" {
+		t.Fatalf("resumed stage = %q, want problem_rca_discussion", pl.State.CurrentStage().Name)
+	}
+	if plan := pl.State.SelectedCarePlan(); plan == nil || plan.Name != "general" {
+		t.Fatalf("resumed care plan = %v, want general (discovered)", plan)
+	}
+	if pl.PromptMetadata["stage_prompt_name"] != "onboarding_callV3_4/general/01_problem_rca_discussion" {
+		t.Fatalf("stage_prompt_name = %v, want the resumed stage's prompt, not the start stage's", pl.PromptMetadata["stage_prompt_name"])
+	}
+
+	// Compiled system prompt embeds the RESUMED stage's analysis, not the
+	// start stage's introduction prompt.
+	if !containsAll(pl.InitialMessages[0].Content, "Problem RCA Discussion") ||
+		strings.Contains(pl.InitialMessages[0].Content, "Introduction and Call Overview") {
+		t.Fatalf("compiled system prompt did not switch to the resumed stage:\n%.500s", pl.InitialMessages[0].Content)
+	}
+
+	// Chunk history is replayed regardless of which state won.
+	if len(pl.InitialMessages) != 4 ||
+		pl.InitialMessages[1].Role != "user" || pl.InitialMessages[1].Content != "I was telling you about my sleep" ||
+		pl.InitialMessages[2].Role != "assistant" || pl.InitialMessages[2].Content != "Got it, let's continue" {
+		t.Fatalf("InitialMessages replay mismatch: %+v", pl.InitialMessages)
+	}
+
+	// The onboarding resume nudge is the final message, wrapped in
+	// <system_instruction> (not the shared <system_message> tag).
+	last := pl.InitialMessages[3]
+	if last.Role != "user" ||
+		!containsAll(last.Content, "<system_instruction>", "hanji to aap keh", "</system_instruction>") {
+		t.Fatalf("resume nudge missing or wrongly wrapped: %+v", last)
+	}
+}
+
+func TestOnboardingCallBotPlanResumeGracefullyFalseSkipsNudge(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	seedOnboardingFixtures(t, redisServer)
+
+	gracefully := false
+	recent := time.Now().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	conversationID := "conv-ob-resume-explicit-chunk"
+	s3Key := "conversation_state/" + conversationID + "/chunk-prev.json"
+	seedOnboardingResumeConversation(t, redisServer, conversationID, "chunk-prev", &gracefully, recent, s3Key)
+
+	getter := fakeS3GetClient{objects: map[string][]byte{
+		s3Key: []byte(`{"agenda":"problem_rca_discussion"}`),
+	}}
+	stubOnboardingResumeGetter(t, getter)
+
+	pl, err := OnboardingCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	// State still resumes (resume_gracefully only gates the nudge, not
+	// state restoration) and chunks are still replayed...
+	if pl.State.CurrentStage().Name != "problem_rca_discussion" {
+		t.Fatalf("resumed stage = %q, want problem_rca_discussion", pl.State.CurrentStage().Name)
+	}
+	if len(pl.InitialMessages) != 3 {
+		t.Fatalf("InitialMessages = %+v, want system + 2 replayed chunks with no nudge", pl.InitialMessages)
+	}
+	for _, msg := range pl.InitialMessages {
+		if strings.Contains(msg.Content, "system_instruction") {
+			t.Fatalf("resume nudge must not be emitted when resume_gracefully=false: %+v", pl.InitialMessages)
+		}
+	}
+}
+
+func TestOnboardingCallBotPlanFallsBackToFreshStateOnDownloadFailure(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	seedOnboardingFixtures(t, redisServer)
+
+	gracefully := true
+	recent := time.Now().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	conversationID := "conv-ob-resume-download-fail"
+	s3Key := "conversation_state/" + conversationID + "/chunk-prev.json"
+	seedOnboardingResumeConversation(t, redisServer, conversationID, "chunk-prev", &gracefully, recent, s3Key)
+
+	// The fake client has no object for s3Key, so GetObject errors and
+	// resolveOnboardingState must fall back to a fresh state rather than
+	// failing plan() outright.
+	getter := fakeS3GetClient{objects: map[string][]byte{}}
+	stubOnboardingResumeGetter(t, getter)
+
+	pl, err := OnboardingCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("plan: want no error on resume-state download failure, got %v", err)
+	}
+	if pl.State.CurrentStage().Name != "introduction" {
+		t.Fatalf("fallback stage = %q, want fresh start stage introduction", pl.State.CurrentStage().Name)
+	}
+	// Chunk history is still replayed even though state resume failed.
+	if len(pl.InitialMessages) != 4 ||
+		pl.InitialMessages[1].Content != "I was telling you about my sleep" ||
+		pl.InitialMessages[2].Content != "Got it, let's continue" {
+		t.Fatalf("InitialMessages replay mismatch after fallback: %+v", pl.InitialMessages)
+	}
+}
+
+func TestOnboardingCallBotPlanMissingAgendaFallsBackToStartStage(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	seedOnboardingFixtures(t, redisServer)
+
+	gracefully := true
+	recent := time.Now().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	conversationID := "conv-ob-resume-no-agenda"
+	s3Key := "conversation_state/" + conversationID + "/chunk-prev.json"
+	seedOnboardingResumeConversation(t, redisServer, conversationID, "chunk-prev", &gracefully, recent, s3Key)
+
+	// No "agenda" key at all: Python's setdefault("agenda", "Introduction")
+	// applies, but student_test's start stage is named "introduction"
+	// (lower-case), so the capitalized default does not resolve either —
+	// ConversationStateFromResume's own fallback to the configured start
+	// stage is what actually wins here.
+	getter := fakeS3GetClient{objects: map[string][]byte{
+		s3Key: []byte(`{"variable_store":{"k":"v"}}`),
+	}}
+	stubOnboardingResumeGetter(t, getter)
+
+	pl, err := OnboardingCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if pl.State.CurrentStage().Name != pl.Config.StartStage.Name {
+		t.Fatalf("stage = %q, want start-stage fallback %q", pl.State.CurrentStage().Name, pl.Config.StartStage.Name)
+	}
+}
+
+func TestResolveOnboardingStateNoResumedChunkIsFresh(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	seedOnboardingFixtures(t, redisServer)
+	cfg := newOnboardingTestConfig(t, redisClient)
+
+	state := resolveOnboardingState(context.Background(), &ConversationData{}, cfg, "student_test", nil)
+	if state.CurrentStage().Name != cfg.StartStage.Name {
+		t.Fatalf("no resumed chunk: stage = %q, want start stage %q", state.CurrentStage().Name, cfg.StartStage.Name)
+	}
+}
+
+func TestResolveOnboardingStateEmptyBodyFallsBack(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	seedOnboardingFixtures(t, redisServer)
+	cfg := newOnboardingTestConfig(t, redisClient)
+
+	resumedID := "chunk-prev"
+	s3Key := "conversation_state/conv/chunk-prev.json"
+	data := &ConversationData{
+		Conversation: ConversationRow{ResumedFromChunkID: &resumedID},
+		ResumedChunk: map[string]any{
+			"id":                        resumedID,
+			"conversation_state_s3_key": s3Key,
+		},
+	}
+	getter := fakeS3GetClient{objects: map[string][]byte{s3Key: []byte(`{}`)}}
+	stubOnboardingResumeGetter(t, getter)
+
+	state := resolveOnboardingState(context.Background(), data, cfg, "student_test", nil)
+	if state.CurrentStage().Name != cfg.StartStage.Name {
+		t.Fatalf("empty resume state: stage = %q, want start stage fallback %q", state.CurrentStage().Name, cfg.StartStage.Name)
+	}
 }

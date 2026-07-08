@@ -1,9 +1,11 @@
 package disha
 
-// OnboardingStageManager is the phase-4 Go port of Disha's
+// OnboardingStageManager is the Go port of Disha's
 // bots/onboarding_call/stage_manager.py process_transition +
 // _persist_and_track, scoped to the tracker-source transition path.
-// Careplan detection and deep thinking are phase 5.
+// Phase 5 wires in careplan detection/activation (OnboardingCarePlanManager)
+// and deep thinking (OnboardingDeepThinkingManager) around the existing
+// phase-4 stage-resolve/compile/persist flow.
 
 import (
 	"context"
@@ -36,6 +38,8 @@ type OnboardingStageManager struct {
 	compiler       *onboardingPromptCompiler
 	callbacks      *CallEventCallbacks
 	api            *APIClient
+	dtManager      *OnboardingDeepThinkingManager
+	careplan       *OnboardingCarePlanManager
 	logger         *log.Logger
 	userID         string
 	conversationID string
@@ -57,6 +61,8 @@ func NewOnboardingStageManager(
 	compiler *onboardingPromptCompiler,
 	callbacks *CallEventCallbacks,
 	api *APIClient,
+	dtManager *OnboardingDeepThinkingManager,
+	careplan *OnboardingCarePlanManager,
 	logger *log.Logger,
 	userID, conversationID, promptKey string,
 ) *OnboardingStageManager {
@@ -66,6 +72,8 @@ func NewOnboardingStageManager(
 		compiler:       compiler,
 		callbacks:      callbacks,
 		api:            api,
+		dtManager:      dtManager,
+		careplan:       careplan,
 		logger:         logger,
 		userID:         userID,
 		conversationID: conversationID,
@@ -117,12 +125,35 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		// Python does not return: the redundant transition still runs.
 	}
 
-	// phase 5: Python detects/activates a care plan here
-	// (CarePlanManager.detect on the transcript + set_selected_care_plan)
-	// when the careplan-switcher stage is entered without a selection.
-	// Not ported yet — resolve as-is so QA on non-careplan flows works.
+	// Careplan detection: when the careplan-switcher stage is entered
+	// without a selection yet, classify the transcript and activate the
+	// resulting plan before resolving the stage (Python: detect/activate
+	// run before resolve_stage, so the just-selected plan is visible to
+	// it). A detection error aborts the transition entirely — no advance,
+	// no compile, no timing log — mirroring Python's exception
+	// propagating out of detect() and leaving the plan unset for a later
+	// trigger to retry.
 	if nextStageName == m.config.CareplanSwitcherStageName && m.state.SelectedCarePlan() == nil {
-		m.logf("disha: careplan switcher stage %q reached but careplan detection is not ported yet (phase 5); resolving as-is", nextStageName)
+		name, detected, err := m.careplan.Detect(ctx, transcript)
+		if err != nil {
+			m.logf("disha: careplan detection failed for stage=%s: %v", nextStageName, err)
+			if !isContextCancellation(ctx, err) {
+				sentryutil.Capture(sentryutil.Event{
+					Err: fmt.Errorf("disha: careplan detection failed: %w", err),
+					Tags: map[string]string{
+						"component": "disha_onboarding",
+						"operation": "careplan_detect",
+					},
+					Details: map[string]any{
+						"conversation_id": m.conversationID,
+						"user_id":         m.userID,
+						"stage":           nextStageName,
+					},
+				})
+			}
+			return
+		}
+		m.state.SetSelectedCarePlan(m.careplan.Activate(ctx, name, detected))
 	}
 
 	nextStage := m.config.ResolveStage(nextStageName, m.state.SelectedCarePlan())
@@ -143,9 +174,22 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		return
 	}
 
-	// phase 5: deep thinking (dt_manager.run_blocking/run_non_blocking +
-	// merge_variables) is skipped entirely; the timing log records
-	// dt_blocking_time_ms=0 and is_dt_blocking_llm_call=false.
+	// Blocking deep thinking for the stage being ENTERED: run and wait
+	// before compiling, then merge results into the variable store BEFORE
+	// AdvanceStage/CompileSystemPrompt so the new stage's prompt renders
+	// with the fresh values (Python: dt_manager.run_blocking + merge_
+	// variables happen before advance_stage/compile_and_apply).
+	isDTBlockingLLMCall := false
+	for _, dt := range nextStage.DeepThinking {
+		if dt.Blocking {
+			isDTBlockingLLMCall = true
+			break
+		}
+	}
+	dtStart := time.Now()
+	dtResults := m.dtManager.RunBlocking(ctx, nextStage, transcript, nextStageName, m.state.VariableStoreSnapshot())
+	dtBlockingMs := float64(time.Since(dtStart)) / float64(time.Millisecond)
+	m.state.MergeVariables(dtResults)
 
 	m.state.AdvanceStage(nextStage)
 
@@ -176,6 +220,15 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	}
 	m.sendRTVI("[PROCESS] System prompt updated")
 
+	// Non-blocking deep thinking for the stage just entered: fired after
+	// the compiled prompt is already applied, on a FRESH variable-store
+	// snapshot (which already includes the blocking results merged
+	// above — Python takes this snapshot at the equivalent point, after
+	// compile_and_apply). Each result is merged into the variable store
+	// and, if it actually changed anything, recompiles the CURRENT stage's
+	// prompt whenever it lands.
+	m.dtManager.RunNonBlocking(ctx, nextStage, transcript, nextStageName, m.state.VariableStoreSnapshot(), m.onNonBlockingDTComplete(ctx))
+
 	m.sendRTVI(fmt.Sprintf("Agenda changed from %s => %s", currentName, nextStageName))
 
 	// Python: asyncio.create_task(self._persist_and_track(...)).
@@ -184,7 +237,55 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	// Python: StageTransitionLogService().log_stage_transition fires the
 	// enqueue from a create_task too (fire-and-forget, best-effort).
 	totalMs := float64(time.Since(start)) / float64(time.Millisecond)
-	go m.enqueueStageTransitionTimingLog(currentName, nextStageName, totalMs)
+	go m.enqueueStageTransitionTimingLog(currentName, nextStageName, totalMs, dtBlockingMs, isDTBlockingLLMCall)
+}
+
+// onNonBlockingDTComplete returns the RunNonBlocking completion callback
+// for the transition that spawned it, mirroring StageManager.
+// _on_non_blocking_dt_complete. Merging happens unconditionally; only a
+// changed variable store triggers a recompile. Results can land after a
+// LATER transition has already advanced the stage further — that's
+// correct Python behavior (no stale-guard here, unlike the tracker's
+// classifier path): the merge still applies and, if it changes anything,
+// the CURRENT (newer) stage's prompt is recompiled with it.
+func (m *OnboardingStageManager) onNonBlockingDTComplete(ctx context.Context) func(map[string]any) {
+	return func(results map[string]any) {
+		if !m.state.MergeVariables(results) {
+			return
+		}
+
+		m.infraMu.Lock()
+		pair, router := m.pair, m.router
+		m.infraMu.Unlock()
+		if pair == nil {
+			// Infrastructure not yet set (or torn down) — no-op safely.
+			return
+		}
+
+		currentStage := m.state.CurrentStage()
+		compiled, err := m.compiler.CompileSystemPrompt(ctx, currentStage, m.state.VariableStoreSnapshot())
+		if err != nil {
+			sentryutil.Capture(sentryutil.Event{
+				Err: fmt.Errorf("disha: non-blocking DT recompile failed: %w", err),
+				Tags: map[string]string{
+					"component": "disha_onboarding",
+					"operation": "non_blocking_dt_recompile",
+				},
+				Details: map[string]any{
+					"conversation_id": m.conversationID,
+					"user_id":         m.userID,
+					"current_stage":   currentStage.Name,
+				},
+			})
+			m.logf("disha: non-blocking DT recompile failed for stage=%s: %v", currentStage.Name, err)
+			return
+		}
+		pair.ReplaceSystemMessage(compiled.Text)
+		if router != nil {
+			router.SetPromptMetadata(buildOnboardingPromptMetadata(m.config, currentStage, compiled))
+		}
+		m.sendRTVI("[PROCESS] System prompt recompiled due to variable update")
+	}
 }
 
 // persistAndTrack mirrors StageManager._persist_and_track for the
@@ -236,7 +337,7 @@ func (m *OnboardingStageManager) persistAndTrack(fromStage, toStage, toolCallID 
 // enqueueStageTransitionTimingLog mirrors StageTransitionLogService.
 // log_stage_transition → _persist: enqueue the unbound-safe staticmethod
 // _save_to_db on llm-logs-parallel. Best-effort (failure → Sentry + log).
-func (m *OnboardingStageManager) enqueueStageTransitionTimingLog(fromStage, toStage string, totalMs float64) {
+func (m *OnboardingStageManager) enqueueStageTransitionTimingLog(fromStage, toStage string, totalMs, dtBlockingMs float64, isDTBlockingLLMCall bool) {
 	defer m.recoverToSentry("stage_transition_timing_log")
 	if m.api == nil {
 		return
@@ -254,8 +355,8 @@ func (m *OnboardingStageManager) enqueueStageTransitionTimingLog(fromStage, toSt
 			"current_stage":           fromStage,
 			"next_stage":              toStage,
 			"total_time_ms":           totalMs,
-			"dt_blocking_time_ms":     0.0,   // phase 5: deep thinking not ported
-			"is_dt_blocking_llm_call": false, // phase 5: deep thinking not ported
+			"dt_blocking_time_ms":     dtBlockingMs,
+			"is_dt_blocking_llm_call": isDTBlockingLLMCall,
 			"data_s3_key":             nil,
 			"bucket_name":             nil,
 		},

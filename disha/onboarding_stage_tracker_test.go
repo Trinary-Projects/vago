@@ -130,8 +130,20 @@ type stageMachineHarness struct {
 
 // newStageMachineHarness stands up the real fixtures + real manager +
 // real fuzzy matcher around an injectable classifier — the phase-4 stage
-// machine wired exactly like BuildTask, minus the pipeline.
+// machine wired exactly like BuildTask, minus the pipeline. It builds no
+// deep-thinking/careplan managers (both nil), matching every phase-4 test
+// that never touches the careplan-switcher stage or a DT-configured stage.
 func newStageMachineHarness(t *testing.T, classifier voicepipelinecore.LLMClient) *stageMachineHarness {
+	return newStageMachineHarnessWithManagers(t, classifier, nil, nil)
+}
+
+// newStageMachineHarnessWithManagers is newStageMachineHarness plus
+// injectable one-shot client factories for deep thinking and careplan
+// detection (phase 5). A nil factory means "don't build that manager" —
+// the stage manager's own nil-safety (dtManager methods self-guard;
+// careplan calls are gated on the config's careplan-switcher stage name)
+// keeps every phase-4 test working unchanged.
+func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelinecore.LLMClient, dtFactory, careplanFactory deepThinkingClientFactory) *stageMachineHarness {
 	t.Helper()
 	t.Setenv("ENVIRONMENT", "staging")
 	redisServer, redisClient := newRedisTestClient(t)
@@ -168,7 +180,7 @@ func newStageMachineHarness(t *testing.T, classifier voicepipelinecore.LLMClient
 		BotType:        OnboardingCallBotType,
 		Logger:         logger,
 	}, redisClient, api, nil)
-	callbacks.SetCurrentAgendaProvider(func() string { return state.CurrentStage().Name })
+	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(state, nil, stageTestUserID, stageTestConversationID, logger))
 
 	pair := voicepipelinecore.NewContextAggregatorPair(
 		&voicepipelinecore.TaskContext{Logger: logger},
@@ -178,7 +190,20 @@ func newStageMachineHarness(t *testing.T, classifier voicepipelinecore.LLMClient
 	ui := voicepipelinecore.NewUIEventSender(logger)
 	routerMeta := &stubMetadataRecorder{}
 
-	manager := NewOnboardingStageManager(state, cfg, compiler, callbacks, api, logger,
+	var dtManager *OnboardingDeepThinkingManager
+	if dtFactory != nil {
+		dtManager = NewOnboardingDeepThinkingManager(deps.Documents, callbacks, dtFactory, logger,
+			stageTestUserID, stageTestConversationID, stageTestPatientInfo, promptKey)
+		dtManager.SetUI(ui)
+	}
+	var careplanManager *OnboardingCarePlanManager
+	if careplanFactory != nil {
+		careplanManager = NewOnboardingCarePlanManager(cfg, deps.Documents, api, careplanFactory, logger,
+			stageTestUserID, stageTestConversationID, stageTestPatientInfo)
+		careplanManager.SetUI(ui)
+	}
+
+	manager := NewOnboardingStageManager(state, cfg, compiler, callbacks, api, dtManager, careplanManager, logger,
 		stageTestUserID, stageTestConversationID, promptKey)
 	tracker := NewOnboardingStageTracker(state, cfg, deps.Documents, manager, classifier, logger,
 		stageTestUserID, stageTestConversationID, stageTestPatientInfo)
@@ -423,8 +448,15 @@ func TestStageTrackerFuzzyYesTransitionHappyPath(t *testing.T) {
 	if _, ok := timingKwargs["total_time_ms"].(float64); !ok {
 		t.Fatalf("total_time_ms = %#v, want number", timingKwargs["total_time_ms"])
 	}
-	if timingKwargs["dt_blocking_time_ms"] != 0.0 || timingKwargs["is_dt_blocking_llm_call"] != false {
-		t.Fatalf("deep-thinking timing fields = %v/%v, want 0/false",
+	// The target stage (problem_discovery_and_exploration) has no
+	// configured deep thinking, so is_dt_blocking_llm_call is false; the
+	// timing value is still a real (near-zero, non-negative) measurement
+	// around RunBlocking rather than a hardcoded phase-4 placeholder.
+	if v, ok := timingKwargs["dt_blocking_time_ms"].(float64); !ok || v < 0 {
+		t.Fatalf("dt_blocking_time_ms = %#v, want non-negative float64", timingKwargs["dt_blocking_time_ms"])
+	}
+	if timingKwargs["is_dt_blocking_llm_call"] != false {
+		t.Fatalf("deep-thinking timing fields = %v/%v, want .../false",
 			timingKwargs["dt_blocking_time_ms"], timingKwargs["is_dt_blocking_llm_call"])
 	}
 	for _, key := range []string{"data_s3_key", "bucket_name"} {

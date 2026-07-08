@@ -2,11 +2,14 @@ package disha
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 	"github.com/jaideep329/talk-go/voicepipelinecore/llmrouter"
 )
@@ -21,13 +24,69 @@ const (
 	// onboardingDatetimeFormat mirrors Python's
 	// `%B %d, %Y %I:%M %p` (prompt_parser.py) in IST.
 	onboardingDatetimeFormat = "January 02, 2006 03:04 PM"
+
+	// onboardingResumeDefaultAgenda mirrors Python's
+	// resumed_chunk_state.setdefault("agenda", "Introduction") before
+	// ConversationState.from_resume. Note this is Python's literal
+	// default value, not necessarily a stage name present in every
+	// variant config (student_test's start stage is "introduction",
+	// lower-case) — a miss here falls through to the start-stage
+	// fallback in ConversationStateFromResume, matching Python's own
+	// behavior when the default doesn't resolve either.
+	onboardingResumeDefaultAgenda = "Introduction"
+
+	// onboardingTestUserExclusionID mirrors onboarding_pipeline_manager.
+	// _is_call_completed's hardcoded QA/test-user exclusion: this user's
+	// calls are never reported as onboarding_call_done, even on an end
+	// stage with talk time, so QA traffic on this user doesn't trip
+	// completion-dependent downstream automation.
+	onboardingTestUserExclusionID = "4da9a570-e993-48fe-b1dd-7e1823488325"
+
+	// Onboarding-specific resume texts, byte-exact ports of
+	// bots/onboarding_call/conversation_context_manager.py's resume
+	// branches (distinct wording/formatting from the shared sales/
+	// follow-up texts in call_startup.go, including the "1.If" typo with
+	// no space).
+	onboardingResumeMessageWithinWindow = "The conversation might have interrupted a few mins ago. Here's how to resume, follow carefully:\n" +
+		"1.If the interruption was user initiated(like \"ill call you back, give me a min\") then say something like 'hanji to aap keh rhe the' and resume. Make sure to not acknowledge their interrupt request(this already happened), just continue.\n" +
+		"2. If not, make sure to first acknowledge the call being disconnected and then continue."
+
+	onboardingResumeMessageAfterWindow = "This conversation was interrupted because the call ended. Now you have to resume this conversation by saying hi and acknowledge the things that have been discussed very briefly and inform the next agenda. Then ask the user if we should continue further"
 )
 
+// buildOnboardingResumeMessage is buildResumeSystemMessage (call_startup.go)
+// with onboarding's distinct resume texts (conversation_context_manager.py's
+// resume branches differ in wording/formatting from the shared sales/
+// follow-up ones). Gate logic — graceful-only, parseable `created`, the
+// 5-minute window — is identical and shared via resumeMessageGate. Returns
+// "" when no resume nudge is needed; otherwise the text is wrapped in
+// <system_instruction>...</system_instruction> and is ready to append
+// verbatim via buildInitialMessages.
+func buildOnboardingResumeMessage(data *ConversationData, now time.Time) string {
+	withinWindow, ok := resumeMessageGate(data, now)
+	if !ok {
+		return ""
+	}
+	text := onboardingResumeMessageAfterWindow
+	if withinWindow {
+		text = onboardingResumeMessageWithinWindow
+	}
+	return "<system_instruction>" + text + "</system_instruction>"
+}
+
+// onboardingResumeS3Getter builds the client used to download onboarding
+// resume state from the US bucket. A package var — like sttDialURL/
+// ttsDialURL — so tests can inject a fake S3GetClient instead of
+// exercising real S3/network.
+var onboardingResumeS3Getter = func(logger *log.Logger) S3GetClient {
+	return NewS3GetClientFromEnv(logger, "AWS_US_BUCKET_NAME", "AWS_US_REGION")
+}
+
 // OnboardingCallBot is the Disha onboarding-call assembly (the tracker
-// architecture port of bots/onboarding_call). Phase 3 scope: fresh calls
-// on the variant's start stage — the stage tracker (phase 4), deep
-// thinking/careplan/resume (phase 5), and post-call state (phase 6) land
-// on top of this skeleton.
+// architecture port of bots/onboarding_call): stage machine (phase 4),
+// deep thinking/careplan/resume (phase 5), and post-call state (phase 6:
+// onboarding_call_done/latest_onboarding_call_stage/intensity levels/
+// conversation_variables) are wired in on top of the phase-3 skeleton.
 type OnboardingCallBot struct{}
 
 var _ Bot = OnboardingCallBot{}
@@ -148,9 +207,7 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		return nil, err
 	}
 
-	// Phase 3: fresh state on the start stage only. Resume
-	// (ConversationStateFromResume + chunk replay) lands in phase 5.
-	state := NewConversationState(config, variant)
+	state := resolveOnboardingState(ctx, startup.Data, config, variant, startup.Logger)
 	stage := state.CurrentStage()
 	startup.Logger.Printf("disha: onboarding variant=%s model=%s start_stage=%s\n", variant, config.Model, stage.Name)
 
@@ -171,14 +228,18 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		deps.API,
 		NewDebugLogUploaderFromEnv(startup.Logger, startup.ConversationID),
 	)
-	callbacks.SetCurrentAgendaProvider(func() string { return state.CurrentStage().Name })
+	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(
+		state, NewUSBucketJSONUploaderFromEnv(startup.Logger), startup.UserID, startup.ConversationID, startup.Logger,
+	))
+	callbacks.SetPostCallDecorator(newOnboardingPostCallDecorator(state, startup.UserID))
 
+	resumeMsg := buildOnboardingResumeMessage(startup.Data, time.Now())
 	pl := &onboardingCallPlan{
 		Startup:         startup,
 		Config:          config,
 		State:           state,
 		Compiler:        compiler,
-		InitialMessages: buildInitialMessages(compiled.Text, nil, ""),
+		InitialMessages: buildInitialMessages(compiled.Text, startup.Data.Chunks, resumeMsg),
 		PromptKey:       PromptKey(config.MainSystemPrompt.Name, compiled.MainVersion),
 		PromptMetadata:  buildOnboardingPromptMetadata(config, stage, compiled),
 		Tools:           []voicepipelinecore.ToolDefinition{onboardingEndCallTool()},
@@ -188,6 +249,72 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
 	return pl, nil
+}
+
+// newOnboardingChunkDecorator returns the onboarding CallEventCallbacks
+// chunk_decorator: it stamps the live stage name onto every persisted
+// chunk (current_agenda, Python's conversation_state.current_stage.name)
+// and, when uploader is available, uploads a conversation-state snapshot
+// to S3 BEFORE the chunk is written to Redis (the key must never point to
+// a missing object), mirroring Python's ConversationPersistenceProcessor.
+// A nil uploader (env incomplete) still sets current_agenda but skips the
+// upload — the chunk keeps a null conversation_state_s3_key.
+func newOnboardingChunkDecorator(state *ConversationState, uploader JSONUploader, userID, conversationID string, logger *log.Logger) func(*ConversationChunk) {
+	return func(chunk *ConversationChunk) {
+		agenda := state.CurrentStage().Name
+		chunk.CurrentAgenda = &agenda
+		if uploader == nil {
+			return
+		}
+		stateDict := state.ToPersistDict()
+		stateDict["user_id"] = userID
+		stateDict["conversation_id"] = conversationID
+		objectKey := fmt.Sprintf("conversation_state/%s/%s.json", conversationID, chunk.ID)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultS3UploadTimeout)
+		defer cancel()
+		if err := uploader.UploadJSON(ctx, objectKey, stateDict); err != nil {
+			wrapped := fmt.Errorf("disha: conversation state upload: %w", err)
+			sentryutil.Capture(sentryutil.Event{
+				Err:  wrapped,
+				Tags: map[string]string{"component": "disha_s3", "operation": "conversation_state_upload"},
+				Details: map[string]any{
+					"conversation_id": conversationID,
+					"chunk_id":        chunk.ID,
+				},
+			})
+			if logger != nil {
+				logger.Printf("disha: conversation state upload failed conversation=%s chunk=%s: %v\n", conversationID, chunk.ID, wrapped)
+			}
+			return
+		}
+		chunk.ConversationStateS3Key = &objectKey
+	}
+}
+
+// newOnboardingPostCallDecorator returns the onboarding CallEventCallbacks
+// post_call_decorator: it reads the live stage/variable-store snapshot at
+// invocation time (call end) and fills the onboarding-only
+// run_post_call_operations fields, mirroring base_pipeline_manager.
+// perform_cleanup + onboarding_pipeline_manager._is_call_completed. Any
+// still-in-flight non-blocking deep thinking is racy in Python too, so Go
+// does not wait for it either.
+func newOnboardingPostCallDecorator(state *ConversationState, userID string) func(*PostCallOperationsRequest) {
+	return func(req *PostCallOperationsRequest) {
+		stage := state.CurrentStage()
+		stageName := stage.Name
+		req.LatestOnboardingCallStage = &stageName
+		intensity := state.GetIntensityLevels()
+		if v, ok := intensity["diet_plan_intensity_level"]; ok {
+			req.DietPlanIntensityLevel = &v
+		}
+		if v, ok := intensity["fitness_plan_intensity_level"]; ok {
+			req.FitnessPlanIntensityLevel = &v
+		}
+		req.ConversationVariables = state.GetConversationVariables()
+		req.OnboardingCallDone = stage.IsEndStage &&
+			req.TotalUserDuration > 0 &&
+			userID != onboardingTestUserExclusionID
+	}
 }
 
 // BuildTask assembles the onboarding pipeline: the follow-up shape
@@ -209,8 +336,22 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	if err != nil {
 		return nil, err
 	}
+	// Deep thinking + careplan detection (phase 5): built with the
+	// production hedged-client factories before the stage manager, which
+	// only holds references to them (SetUI is wired on each manager
+	// directly below, once the UI event sender exists).
+	dtManager := NewOnboardingDeepThinkingManager(
+		deps.Documents, pl.Callbacks, newDeepThinkingClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),
+		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
+		pl.Startup.Data.Conversation.PatientInfo, pl.PromptKey,
+	)
+	careplanManager := NewOnboardingCarePlanManager(
+		pl.Config, deps.Documents, deps.API, newCarePlanClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),
+		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
+		pl.Startup.Data.Conversation.PatientInfo,
+	)
 	stageManager := NewOnboardingStageManager(
-		pl.State, pl.Config, pl.Compiler, pl.Callbacks, deps.API,
+		pl.State, pl.Config, pl.Compiler, pl.Callbacks, deps.API, dtManager, careplanManager,
 		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID, pl.PromptKey,
 	)
 	stageTracker := NewOnboardingStageTracker(
@@ -268,6 +409,8 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	// tracked.
 	stageManager.SetInfrastructure(contextAggregators, llmClient, taskCtx.UIEvents)
 	stageTracker.SetInfrastructure(taskCtx.Ctx, contextAggregators, taskCtx.UIEvents)
+	dtManager.SetUI(taskCtx.UIEvents)
+	careplanManager.SetUI(taskCtx.UIEvents)
 
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
@@ -359,5 +502,110 @@ func newOnboardingStageClassifier(deps Deps, pl *onboardingCallPlan) (*llmrouter
 		LogSink:       newLLMLogSink(deps.API, pl.Startup.Logger, stageTrackerUsecaseType, pl.Startup.UserID, pl.Startup.ConversationID),
 		Temperature:   &temperature,
 		MaxTokens:     &maxTokens,
+	})
+}
+
+// resolveOnboardingState is the Go port of onboarding_pipeline_manager's
+// resume path: when the conversation was resumed from a chunk carrying a
+// conversation_state_s3_key, download and rebuild state from it via
+// ConversationStateFromResume; on ANY failure along that path (no
+// resumed chunk, missing/blank key, download error, invalid/empty JSON,
+// or ConversationStateFromResume itself erroring), fall back to a fresh
+// state on the variant's start stage and log + Sentry-report the
+// fallback. The call always proceeds — chunk history replay
+// (buildInitialMessages over startup.Data.Chunks) is driven
+// independently by the caller and happens regardless of which state
+// wins here, matching Python's "never abort on a bad resume" behavior.
+func resolveOnboardingState(ctx context.Context, data *ConversationData, config *OnboardingConfig, variant string, logger *log.Logger) *ConversationState {
+	fresh := func() *ConversationState { return NewConversationState(config, variant) }
+
+	if data == nil {
+		return fresh()
+	}
+	if strings.TrimSpace(derefString(data.Conversation.ResumedFromChunkID)) == "" {
+		return fresh()
+	}
+	if len(data.ResumedChunk) == 0 {
+		return fresh()
+	}
+	s3Key, _ := data.ResumedChunk["conversation_state_s3_key"].(string)
+	s3Key = strings.TrimSpace(s3Key)
+	if s3Key == "" {
+		return fresh()
+	}
+
+	getter := onboardingResumeS3Getter(logger)
+	resumeData, err := loadOnboardingResumeState(ctx, getter, s3Key, logger)
+	if err != nil {
+		reportOnboardingResumeFallback(logger, variant, s3Key, err)
+		return fresh()
+	}
+	if len(resumeData) == 0 {
+		reportOnboardingResumeFallback(logger, variant, s3Key, errors.New("onboarding resume state is empty"))
+		return fresh()
+	}
+	// Python: resumed_chunk_state.setdefault("agenda", "Introduction").
+	if agenda, _ := resumeData["agenda"].(string); strings.TrimSpace(agenda) == "" {
+		resumeData["agenda"] = onboardingResumeDefaultAgenda
+	}
+
+	// Python's cache_care_plan_prompts pre-warms a local Langfuse doc
+	// cache here after a care plan is restored; Go's DocumentStore reads
+	// pre-rendered Redis keys on demand with its own TTL cache, so there
+	// is nothing to pre-warm.
+	state, err := ConversationStateFromResume(config, variant, resumeData, logger)
+	if err != nil {
+		reportOnboardingResumeFallback(logger, variant, s3Key, err)
+		return fresh()
+	}
+	return state
+}
+
+// loadOnboardingResumeState downloads and parses the conversation-state
+// JSON blob a prior onboarding call chunk wrote to the US bucket
+// (conversation_state/{conversation_id}/{chunk_id}.json). Returns an
+// error — never partial state — so callers can uniformly fall back to a
+// fresh state.
+func loadOnboardingResumeState(ctx context.Context, getter S3GetClient, s3Key string, logger *log.Logger) (map[string]any, error) {
+	if getter == nil {
+		return nil, errors.New("disha: onboarding resume state client is unavailable")
+	}
+	s3Key = strings.TrimSpace(s3Key)
+	if s3Key == "" {
+		return nil, errors.New("disha: onboarding resume state s3 key is empty")
+	}
+	body, err := getter.GetObject(ctx, "", s3Key)
+	if err != nil {
+		return nil, fmt.Errorf("disha: download onboarding resume state %q: %w", s3Key, err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(body, &state); err != nil {
+		return nil, fmt.Errorf("disha: parse onboarding resume state %q: %w", s3Key, err)
+	}
+	if logger != nil {
+		logger.Printf("disha: onboarding resume state loaded from %s (%d bytes)\n", s3Key, len(body))
+	}
+	return state, nil
+}
+
+// reportOnboardingResumeFallback logs and Sentry-reports a resume
+// failure that falls back to a fresh onboarding state. Never fatal —
+// the call proceeds on the start stage with chunk history still
+// replayed.
+func reportOnboardingResumeFallback(logger *log.Logger, variant, s3Key string, err error) {
+	wrapped := fmt.Errorf("disha: onboarding resume state fallback (variant=%s key=%s): %w", variant, s3Key, err)
+	if logger != nil {
+		logger.Println(wrapped.Error())
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Err: wrapped,
+		Tags: map[string]string{
+			"component": "disha_onboarding",
+			"operation": "onboarding_resume_state",
+		},
+		Details: map[string]any{
+			"variant": variant,
+			"s3_key":  s3Key,
+		},
 	})
 }

@@ -194,16 +194,17 @@ func (s *ConversationState) GetConversationVariables() map[string]any {
 }
 
 // GetIntensityLevels extracts diet/fitness intensity variables for the
-// post-call request. Values are strings when present; nil/empty are
-// skipped like Python's `not in (None, "")`.
+// post-call request. Values are assumed to be strings or absent/nil
+// (onboarding only ever stores these as strings); a non-string value or an
+// empty string is skipped like Python's `not in (None, "")`.
 func (s *ConversationState) GetIntensityLevels() map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make(map[string]string)
-	if v, _ := s.variableStore["diet_intensity_level"].(string); v != "" {
+	if v, ok := s.variableStore["diet_intensity_level"].(string); ok && v != "" {
 		result["diet_plan_intensity_level"] = v
 	}
-	if v, _ := s.variableStore["fitness_intensity_level"].(string); v != "" {
+	if v, ok := s.variableStore["fitness_intensity_level"].(string); ok && v != "" {
 		result["fitness_plan_intensity_level"] = v
 	}
 	return result

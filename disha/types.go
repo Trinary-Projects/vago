@@ -77,6 +77,15 @@ type UpdateConversationRequest struct {
 	BotFirstSpeechAt  *time.Time `json:"bot_first_speech_at,omitempty"`
 }
 
+// PostCallOperationsRequest mirrors VoiceBotAPIService.run_post_call_
+// operations. The onboarding-only fields (DietPlanIntensityLevel,
+// FitnessPlanIntensityLevel, LatestOnboardingCallStage,
+// ConversationVariables, OnboardingCallDone) are populated only when
+// CallEventCallbacks has a post-call decorator wired (see
+// CallEventCallbacks.SetPostCallDecorator; onboarding is the only current
+// user); sales/follow-up never wire one, so those fields stay at their
+// zero value and serialize as explicit JSON null/false, matching today's
+// wire shape exactly (no omitempty on this struct).
 type PostCallOperationsRequest struct {
 	ConversationID                 string         `json:"conversation_id"`
 	EndReason                      *string        `json:"end_reason"`

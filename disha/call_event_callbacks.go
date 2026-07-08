@@ -25,17 +25,27 @@ type CallEventCallbacks struct {
 	userID         string
 	botType        string
 
-	// currentAgenda supplies the live onboarding stage name at
-	// chunk-write time (Python persists conversation_state.current_stage
-	// .name on every chunk). Nil for bots without stages; the value is a
-	// provider, not a snapshot, because the stage advances mid-call.
-	currentAgenda func() string
-
 	// llmCallCompleted receives each finished LLM generation (Python's
 	// OnboardingPipelineManager.on_llm_call_complete delegating to the
 	// stage-transition tracker). Nil for bots without a stage tracker;
 	// OnLLMCallCompleted then no-ops.
 	llmCallCompleted func(text string, interrupted bool)
+
+	// chunkDecorator lets bot-specific code enrich a chunk immediately
+	// before it is written to Redis (e.g. onboarding calls attach the
+	// current stage name and a conversation-state S3 key to every
+	// persisted chunk). Nil for bots that need no enrichment; the
+	// decorator may block briefly, since it runs inline on the call-events
+	// dispatcher goroutine, same as the rest of appendChunk's work.
+	chunkDecorator func(*ConversationChunk)
+
+	// postCallDecorator lets bot-specific code enrich the
+	// run_post_call_operations request immediately before it is sent (e.g.
+	// onboarding calls fill onboarding_call_done and the stage/variable-
+	// store snapshot fields). Nil for bots that need no enrichment, which
+	// leaves those request fields at their zero value (explicit JSON
+	// null).
+	postCallDecorator func(*PostCallOperationsRequest)
 }
 
 func NewCallEventCallbacks(startup CallStartup, redis RedisClient, api *APIClient, debugLogUploader DebugLogUploader) *CallEventCallbacks {
@@ -50,13 +60,28 @@ func NewCallEventCallbacks(startup CallStartup, redis RedisClient, api *APIClien
 	}
 }
 
-// SetCurrentAgendaProvider wires the onboarding stage-name provider used
-// to fill current_agenda on persisted chunks.
-func (c *CallEventCallbacks) SetCurrentAgendaProvider(fn func() string) {
+// SetChunkDecorator wires bot-specific chunk enrichment, invoked on every
+// persisted chunk (committed turns, tool-context chunks, and debug-log
+// chunks) right before the Redis write. Example: onboarding calls use this
+// to attach the current stage name and a per-chunk conversation-state S3
+// key.
+func (c *CallEventCallbacks) SetChunkDecorator(fn func(*ConversationChunk)) {
 	if c == nil {
 		return
 	}
-	c.currentAgenda = fn
+	c.chunkDecorator = fn
+}
+
+// SetPostCallDecorator wires bot-specific enrichment of the
+// run_post_call_operations request, invoked once all shared fields are
+// set. Example: onboarding calls use this to fill onboarding_call_done,
+// latest_onboarding_call_stage, the intensity-level fields, and
+// conversation_variables.
+func (c *CallEventCallbacks) SetPostCallDecorator(fn func(*PostCallOperationsRequest)) {
+	if c == nil {
+		return
+	}
+	c.postCallDecorator = fn
 }
 
 // SetLLMCallCompletedHandler wires the onboarding stage tracker's
@@ -170,8 +195,10 @@ func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, rol
 // mirroring Python's conversation_persistence_processor.on_debug_log.
 // The onboarding stage manager uses it for the tracker-source
 // agenda-change debug chunk (additional_data.tool_call_id). The chunk's
-// current_agenda comes from the live agenda provider, so it carries the
-// NEW stage — the state has already advanced, same as Python.
+// bot-specific fields (e.g. onboarding's current_agenda) are filled by the
+// registered chunkDecorator, which reads live state at decoration time, so
+// they carry the NEW stage — the state has already advanced, same as
+// Python.
 func (c *CallEventCallbacks) AppendDebugLogChunk(text string, at time.Time, promptKey string, additionalData any) {
 	c.appendChunk(text, "assistant", at, voicepipelinecore.TurnMetrics{}, promptKey, additionalData, true)
 }
@@ -184,17 +211,11 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 	if promptKey != "" {
 		promptKeyPtr = &promptKey
 	}
-	var currentAgenda *string
-	if c.currentAgenda != nil {
-		if agenda := c.currentAgenda(); agenda != "" {
-			currentAgenda = &agenda
-		}
-	}
+	chunkID := uuid.NewString()
 	chunk := ConversationChunk{
-		ID:                               uuid.NewString(),
+		ID:                               chunkID,
 		Text:                             text,
 		Role:                             role,
-		CurrentAgenda:                    currentAgenda,
 		BotType:                          c.botType,
 		ConversationID:                   c.conversationID,
 		UserID:                           c.userID,
@@ -206,6 +227,9 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 		IsDebugLog:                       isDebugLog,
 		AdditionalData:                   additionalData,
 		MainAgentSystemPromptLangfuseKey: promptKeyPtr,
+	}
+	if c.chunkDecorator != nil {
+		c.chunkDecorator(&chunk)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
 	defer cancel()
@@ -231,6 +255,9 @@ func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndR
 	}
 	if req.EndedAt.IsZero() {
 		req.EndedAt = time.Now()
+	}
+	if c.postCallDecorator != nil {
+		c.postCallDecorator(&req)
 	}
 	if err := c.api.RunPostCallOperationsWithFallback(ctx, req); err != nil && c.logger != nil {
 		c.logger.Printf("disha: run_post_call_operations failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
