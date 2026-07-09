@@ -123,6 +123,7 @@ func (p *LLMOutputFilterProcessor) startSuppressionFromPrefix(frame TextFrame, d
 
 	if !p.state.anyTextPushed && strings.TrimSpace(before) == "" {
 		sentryutil.Capture(sentryutil.Event{
+			Hub: p.taskCtx.SentryHub(),
 			Message: fmt.Sprintf(
 				"LLMOutputFilter: entire response suppressed by kill-prefix %q (response_id=%d)",
 				prefix,

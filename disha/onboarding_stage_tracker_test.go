@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
@@ -126,6 +127,15 @@ type stageMachineHarness struct {
 	manager     *OnboardingStageManager
 	tracker     *OnboardingStageTracker
 	promptKey   string
+
+	// hub is a private, network-free Sentry hub (own client + mock
+	// transport, like sentryutil_test.go's newTestHub) wired into every
+	// manager via SetInfrastructure/SetSentryHub exactly like BuildTask
+	// wires taskCtx.SentryHub(). hubTransport lets tests assert that a
+	// manager's Sentry.Capture actually routed through this hub instead
+	// of the process-global one.
+	hub          *sentry.Hub
+	hubTransport *sentry.MockTransport
 }
 
 // newStageMachineHarness stands up the real fixtures + real manager +
@@ -190,41 +200,52 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 	ui := voicepipelinecore.NewUIEventSender(logger)
 	routerMeta := &stubMetadataRecorder{}
 
+	hubTransport := &sentry.MockTransport{}
+	hubClient, err := sentry.NewClient(sentry.ClientOptions{Transport: hubTransport})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	hub := sentry.NewHub(hubClient, sentry.NewScope())
+
 	var dtManager *OnboardingDeepThinkingManager
 	if dtFactory != nil {
 		dtManager = NewOnboardingDeepThinkingManager(deps.Documents, callbacks, dtFactory, logger,
 			stageTestUserID, stageTestConversationID, stageTestPatientInfo, promptKey)
 		dtManager.SetUI(ui)
+		dtManager.SetSentryHub(hub)
 	}
 	var careplanManager *OnboardingCarePlanManager
 	if careplanFactory != nil {
 		careplanManager = NewOnboardingCarePlanManager(cfg, deps.Documents, api, careplanFactory, logger,
 			stageTestUserID, stageTestConversationID, stageTestPatientInfo)
 		careplanManager.SetUI(ui)
+		careplanManager.SetSentryHub(hub)
 	}
 
 	manager := NewOnboardingStageManager(state, cfg, compiler, callbacks, api, dtManager, careplanManager, logger,
 		stageTestUserID, stageTestConversationID, promptKey)
 	tracker := NewOnboardingStageTracker(state, cfg, deps.Documents, manager, classifier, logger,
 		stageTestUserID, stageTestConversationID, stageTestPatientInfo)
-	manager.SetInfrastructure(pair, routerMeta, ui)
-	tracker.SetInfrastructure(context.Background(), pair, ui)
+	manager.SetInfrastructure(pair, routerMeta, ui, hub)
+	tracker.SetInfrastructure(context.Background(), pair, ui, hub)
 
 	return &stageMachineHarness{
-		t:           t,
-		logBuf:      logBuf,
-		redisServer: redisServer,
-		redisClient: redisClient,
-		apiRecorder: apiRecorder,
-		deps:        deps,
-		config:      cfg,
-		state:       state,
-		pair:        pair,
-		ui:          ui,
-		routerMeta:  routerMeta,
-		manager:     manager,
-		tracker:     tracker,
-		promptKey:   promptKey,
+		t:            t,
+		logBuf:       logBuf,
+		redisServer:  redisServer,
+		redisClient:  redisClient,
+		apiRecorder:  apiRecorder,
+		deps:         deps,
+		config:       cfg,
+		state:        state,
+		pair:         pair,
+		ui:           ui,
+		routerMeta:   routerMeta,
+		manager:      manager,
+		tracker:      tracker,
+		promptKey:    promptKey,
+		hub:          hub,
+		hubTransport: hubTransport,
 	}
 }
 

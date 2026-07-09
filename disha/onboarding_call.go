@@ -369,6 +369,12 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 		Logger:     pl.Startup.Logger,
 		SessionID:  pl.Startup.ConversationID,
 		CallEvents: pl.Callbacks.Events(),
+		SentryTags: map[string]string{
+			"conversation_id":         pl.Startup.ConversationID,
+			"user_id":                 pl.Startup.UserID,
+			"bot_type":                OnboardingCallBotType,
+			"onboarding_call_variant": pl.State.Variant(),
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -411,10 +417,12 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	// conversation router, and UI event sender exist — before task
 	// assembly completes, so the first LLM completion can already be
 	// tracked.
-	stageManager.SetInfrastructure(contextAggregators, llmClient, taskCtx.UIEvents)
-	stageTracker.SetInfrastructure(taskCtx.Ctx, contextAggregators, taskCtx.UIEvents)
+	stageManager.SetInfrastructure(contextAggregators, llmClient, taskCtx.UIEvents, taskCtx.SentryHub())
+	stageTracker.SetInfrastructure(taskCtx.Ctx, contextAggregators, taskCtx.UIEvents, taskCtx.SentryHub())
 	dtManager.SetUI(taskCtx.UIEvents)
+	dtManager.SetSentryHub(taskCtx.SentryHub())
 	careplanManager.SetUI(taskCtx.UIEvents)
+	careplanManager.SetSentryHub(taskCtx.SentryHub())
 
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)

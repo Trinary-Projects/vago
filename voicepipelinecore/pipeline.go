@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/getsentry/sentry-go"
+	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
 // captureGoroutineStacks returns a textual dump of every live
@@ -86,6 +89,21 @@ type TaskContext struct {
 	callStats  *callStatsTracker
 	callEvents *callEventDispatcher
 	metrics    *perTurnMetrics
+	sentryHub  *sentry.Hub
+}
+
+// SentryHub returns the task-scoped Sentry hub built from
+// TaskConfig.SentryTags. Every capture site in voicepipelinecore that has
+// a TaskContext in reach should pass this as sentryutil.Event.Hub so
+// shared-core Sentry events (STT/TTS/Daily/aggregator/idle/...) carry
+// this call's identity tags, correctly isolated from other concurrent
+// PipelineTasks. Never nil: NewPipelineTask always populates it (a hub
+// with a nil client is a safe no-op capture target).
+func (t *TaskContext) SentryHub() *sentry.Hub {
+	if t == nil {
+		return nil
+	}
+	return t.sentryHub
 }
 
 // TaskConfig carries the shared, non-processor settings needed to stand
@@ -108,6 +126,13 @@ type TaskConfig struct {
 	// OnCleanup runs after all processor goroutines have exited. Use
 	// this to remove the task from binary-level registries.
 	OnCleanup func()
+
+	// SentryTags are identity tags the bot wants on every Sentry event
+	// emitted by this task's core processors (e.g. conversation_id,
+	// user_id, bot_type). This is pure data: core builds a task-scoped
+	// Sentry hub from it (see TaskContext.SentryHub) but never interprets
+	// the keys/values itself.
+	SentryTags map[string]string
 }
 
 // PipelineTask is the lifecycle owner of a single voice-call pipeline.
@@ -189,6 +214,7 @@ func NewPipelineTask(parentCtx context.Context, cfg TaskConfig) (*PipelineTask, 
 		wg:        &task.wg,
 		callStats: callStats,
 		metrics:   turnMetrics,
+		sentryHub: sentryutil.NewTaskHub(cfg.SentryTags),
 	}
 	taskCtx.callEvents = newCallEventDispatcher(logger, cfg.CallEvents)
 	task.TaskCtx = taskCtx

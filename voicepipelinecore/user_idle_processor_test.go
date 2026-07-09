@@ -184,6 +184,30 @@ func TestUserIdle_DeadMicSentryOnFirstFire(t *testing.T) {
 	}
 }
 
+// TestUserIdle_DeadMicSentryCarriesTaskHub proves the sentry-task-hub
+// wiring reaches the dead-mic capture: with a task-scoped hub set on
+// TaskContext (as NewPipelineTask would from TaskConfig.SentryTags), the
+// captured Event.Hub must be that same hub rather than nil/global.
+func TestUserIdle_DeadMicSentryCarriesTaskHub(t *testing.T) {
+	fix := newTestFixture(t)
+	stats := newCallStatsTracker()
+	stats.MarkUserJoined(time.Now())
+	fix.TaskCtx.callStats = stats
+	hub := sentryutil.NewTaskHub(map[string]string{"conversation_id": "conv-hub-test"})
+	fix.TaskCtx.sentryHub = hub
+	p := NewUserIdleProcessor(fix.TaskCtx)
+	captured := withCapturedDeadMicSentry(t)
+
+	p.onIdleTimeout()
+
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 Sentry capture, got %d", len(*captured))
+	}
+	if got := (*captured)[0].Hub; got != hub {
+		t.Fatalf("captured event Hub = %p, want the task-scoped hub %p", got, hub)
+	}
+}
+
 // TestUserIdle_NoDeadMicSentryWhenAudioReceived verifies the capture is
 // skipped once any audible user audio frame has been recorded.
 func TestUserIdle_NoDeadMicSentryWhenAudioReceived(t *testing.T) {

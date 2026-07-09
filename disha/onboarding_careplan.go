@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 	"github.com/jaideep329/talk-go/voicepipelinecore/llmrouter"
@@ -31,10 +32,12 @@ type OnboardingCarePlanManager struct {
 	conversationID string
 	patientInfo    string
 
-	// Late-bound UI (same nil-safe pattern as the tracker/stage manager/DT
-	// manager): RTVI sends are skipped until wired.
+	// Late-bound UI + Sentry hub (same nil-safe pattern as the
+	// tracker/stage manager/DT manager): RTVI sends/hub-scoped captures
+	// are skipped/fall back to global until wired.
 	infraMu sync.Mutex
 	ui      serverMessageEmitter
+	hub     *sentry.Hub
 }
 
 func NewOnboardingCarePlanManager(
@@ -71,6 +74,25 @@ func (m *OnboardingCarePlanManager) getUI() serverMessageEmitter {
 	m.infraMu.Lock()
 	defer m.infraMu.Unlock()
 	return m.ui
+}
+
+// SetSentryHub injects the task-scoped Sentry hub (sentry-task-hub),
+// called alongside SetUI once NewPipelineTask exists. nil is safe and
+// falls back to global capture, which covers any call in the window
+// before this is wired.
+func (m *OnboardingCarePlanManager) SetSentryHub(hub *sentry.Hub) {
+	if m == nil {
+		return
+	}
+	m.infraMu.Lock()
+	defer m.infraMu.Unlock()
+	m.hub = hub
+}
+
+func (m *OnboardingCarePlanManager) getHub() *sentry.Hub {
+	m.infraMu.Lock()
+	defer m.infraMu.Unlock()
+	return m.hub
 }
 
 // careplanSwitcherUsecaseType matches Python's care-plan-switcher LLM
@@ -133,6 +155,7 @@ func (m *OnboardingCarePlanManager) Detect(ctx context.Context, transcript strin
 	detected, err := parseCareplanOutput(out.String())
 	if err != nil {
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.getHub(),
 			Err: fmt.Errorf("disha: care plan detection parse failed: %w", err),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -190,6 +213,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 	}
 	if plan == nil {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.getHub(),
 			Message: "care plan not found, proceeding without selection",
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -221,6 +245,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 			// Residual failure (API + enqueue fallback both failed) never
 			// fails activation — Python parity.
 			sentryutil.Capture(sentryutil.Event{
+				Hub: m.getHub(),
 				Err: fmt.Errorf("disha: set_user_careplan failed: %w", err),
 				Tags: map[string]string{
 					"component": "disha_onboarding",
@@ -255,6 +280,12 @@ func (m *OnboardingCarePlanManager) sendRTVI(message string) {
 // the "primary is just slow" case with a parallel hedge after 1s.
 // Temperature/MaxTokens are left nil (endpoint defaults) because Python
 // uses the default temperature=0 and no max_tokens for this call.
+//
+// Like newDeepThinkingClientFactory, this closure is built in
+// onboarding_call.go BuildTask before NewPipelineTask exists, so its
+// construction-failure capture below has no lexical path to the
+// manager's late-bound Sentry hub (sentry-task-hub) and deliberately
+// stays on the global hub.
 func newCarePlanClientFactory(deps Deps, logger *log.Logger, userID, conversationID string) deepThinkingClientFactory {
 	return func(promptMetadata map[string]any, usecaseType string) voicepipelinecore.LLMClient {
 		client, err := llmrouter.NewHedged(llmrouter.HedgedConfig{

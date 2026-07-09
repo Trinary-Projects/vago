@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
@@ -46,13 +47,14 @@ type OnboardingStageManager struct {
 	promptKey      string
 
 	// Late-bound infrastructure (Python's set_infrastructure): the
-	// aggregator pair, conversation router handle, and RTVI emitter only
-	// exist after NewPipelineTask. processTransition before
-	// SetInfrastructure no-ops safely.
+	// aggregator pair, conversation router handle, RTVI emitter, and
+	// task-scoped Sentry hub only exist after NewPipelineTask.
+	// processTransition before SetInfrastructure no-ops safely.
 	infraMu sync.Mutex
 	pair    *voicepipelinecore.ContextAggregatorPair
 	router  promptMetadataSetter
 	ui      serverMessageEmitter
+	hub     *sentry.Hub
 }
 
 func NewOnboardingStageManager(
@@ -83,8 +85,11 @@ func NewOnboardingStageManager(
 
 // SetInfrastructure injects the aggregator pair (ReplaceSystemMessage),
 // the conversation router handle (SetPromptMetadata refresh after
-// recompiles), and the RTVI emitter.
-func (m *OnboardingStageManager) SetInfrastructure(pair *voicepipelinecore.ContextAggregatorPair, router promptMetadataSetter, ui serverMessageEmitter) {
+// recompiles), the RTVI emitter, and the task-scoped Sentry hub (routes
+// this manager's Sentry captures through the call's identity tags —
+// sentry-task-hub; nil hub is safe and falls back to global capture,
+// which covers any call in the window before this is wired).
+func (m *OnboardingStageManager) SetInfrastructure(pair *voicepipelinecore.ContextAggregatorPair, router promptMetadataSetter, ui serverMessageEmitter, hub *sentry.Hub) {
 	if m == nil {
 		return
 	}
@@ -93,6 +98,15 @@ func (m *OnboardingStageManager) SetInfrastructure(pair *voicepipelinecore.Conte
 	m.pair = pair
 	m.router = router
 	m.ui = ui
+	m.hub = hub
+}
+
+// getHub returns the late-bound task-scoped Sentry hub (nil before
+// SetInfrastructure runs).
+func (m *OnboardingStageManager) getHub() *sentry.Hub {
+	m.infraMu.Lock()
+	defer m.infraMu.Unlock()
+	return m.hub
 }
 
 // processTransition mirrors StageManager.process_transition (phase-4
@@ -115,6 +129,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	currentName := m.state.CurrentStage().Name
 	if currentName != "" && strings.EqualFold(currentName, nextStageName) {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.getHub(),
 			Message: "Redundant stage transition attempted",
 			Tags: map[string]string{
 				"current_agenda": currentName,
@@ -139,6 +154,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 			m.logf("disha: careplan detection failed for stage=%s: %v", nextStageName, err)
 			if !isContextCancellation(ctx, err) {
 				sentryutil.Capture(sentryutil.Event{
+					Hub: m.getHub(),
 					Err: fmt.Errorf("disha: careplan detection failed: %w", err),
 					Tags: map[string]string{
 						"component": "disha_onboarding",
@@ -160,6 +176,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	if nextStage == nil {
 		m.sendRTVI(fmt.Sprintf("[ERROR] Invalid stage: %s", nextStageName))
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.getHub(),
 			Message: fmt.Sprintf("Invalid stage: %s", nextStageName),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -198,6 +215,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		// State has already advanced — Python has the same ordering
 		// (advance_stage before compile_and_apply) and does not roll back.
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.getHub(),
 			Err: fmt.Errorf("disha: stage transition prompt compile failed: %w", err),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -266,6 +284,7 @@ func (m *OnboardingStageManager) onNonBlockingDTComplete(ctx context.Context) fu
 		compiled, err := m.compiler.CompileSystemPrompt(ctx, currentStage, m.state.VariableStoreSnapshot())
 		if err != nil {
 			sentryutil.Capture(sentryutil.Event{
+				Hub: m.getHub(),
 				Err: fmt.Errorf("disha: non-blocking DT recompile failed: %w", err),
 				Tags: map[string]string{
 					"component": "disha_onboarding",
@@ -320,6 +339,7 @@ func (m *OnboardingStageManager) persistAndTrack(fromStage, toStage, toolCallID 
 	if err != nil {
 		m.logf("disha: agenda analytics enqueue failed conversation=%s: %v", m.conversationID, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.getHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -365,6 +385,7 @@ func (m *OnboardingStageManager) enqueueStageTransitionTimingLog(fromStage, toSt
 	if err != nil {
 		m.logf("[STAGE_TRANSITION_LOG] %s => %s | Failed to persist: %v", fromStage, toStage, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.getHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -390,6 +411,7 @@ func (m *OnboardingStageManager) recoverToSentry(operation string) {
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	m.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
+		Hub: m.getHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",
