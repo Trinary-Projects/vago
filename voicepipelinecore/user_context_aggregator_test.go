@@ -643,3 +643,117 @@ func TestUserContextAggregator_UserFirstSpeechLifecycleFiresOnce(t *testing.T) {
 	default:
 	}
 }
+
+// serverMessageStrings returns the string-payload server-message RTVI
+// entries from a snapshot, in order.
+func serverMessageStrings(entries []RTVIDebugLogEntry) []string {
+	var out []string
+	for _, e := range entries {
+		if e.Type != "server-message" {
+			continue
+		}
+		if s, ok := e.Data.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUserContextAggregator_BargeInEmitsUserTurnStartedRTVI verifies the
+// Python-parity "User turn started" RTVI line
+// (base_pipeline_manager.py:425-431, MinWordsUserTurnStartStrategy
+// crossing the 3-word bot-speaking threshold) fires at Go's barge-in
+// trigger point.
+func TestUserContextAggregator_BargeInEmitsUserTurnStartedRTVI(t *testing.T) {
+	fix := newTestFixture(t)
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	runProcessorTest(t, fix, runConfig{
+		processor: a,
+		framesToSend: []Frame{
+			BotStartedSpeakingFrame{},
+			TranscriptFrame{Text: "one two three", IsFinal: false, ResponseID: 1},
+		},
+		settleDelay:  30 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	msgs := serverMessageStrings(fix.TaskCtx.UIEvents.Snapshot())
+	if !containsString(msgs, "User turn started") {
+		t.Errorf("expected 'User turn started' RTVI line, got %v", msgs)
+	}
+}
+
+// TestUserContextAggregator_NormalTurnEmitsUserTurnStartedRTVI verifies
+// the same RTVI line fires for a normal (bot-silent) user turn — Go's
+// equivalent of Python's min_words=1-when-bot-silent threshold crossing.
+func TestUserContextAggregator_NormalTurnEmitsUserTurnStartedRTVI(t *testing.T) {
+	fix := newTestFixture(t)
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	runProcessorTest(t, fix, runConfig{
+		processor: a,
+		framesToSend: []Frame{
+			TranscriptFrame{Text: "hello", IsFinal: true},
+			TranscriptFrame{Text: "<end>", IsFinal: true},
+		},
+		sendEndFrame: true,
+	})
+
+	msgs := serverMessageStrings(fix.TaskCtx.UIEvents.Snapshot())
+	if !containsString(msgs, "User turn started") {
+		t.Errorf("expected 'User turn started' RTVI line, got %v", msgs)
+	}
+}
+
+// TestUserContextAggregator_BargeInContinuationDoesNotDuplicateUserTurnStartedRTVI
+// verifies a barge-in turn's eventual final-transcript submission does NOT
+// emit a second "User turn started" line — Python fires the event exactly
+// once per turn (at threshold crossing), not again when the turn commits.
+func TestUserContextAggregator_BargeInContinuationDoesNotDuplicateUserTurnStartedRTVI(t *testing.T) {
+	fix := newTestFixture(t)
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
+	source.Link(a)
+	a.Link(sink)
+	source.Start(fix.RootCtx)
+	a.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	sink.QueueFrame(BotStartedSpeakingFrame{}, Upstream)
+	time.Sleep(20 * time.Millisecond)
+
+	// Cross the barge-in threshold (fires InterruptFrame + "User turn started").
+	source.QueueFrame(TranscriptFrame{Text: "one two three", IsFinal: false, ResponseID: 1}, Downstream)
+	time.Sleep(20 * time.Millisecond)
+
+	// The same turn's final transcript commits.
+	source.QueueFrame(TranscriptFrame{Text: "one two three", IsFinal: true, ResponseID: 1}, Downstream)
+	source.QueueFrame(TranscriptFrame{Text: "<end>", IsFinal: true, ResponseID: 1}, Downstream)
+	time.Sleep(20 * time.Millisecond)
+
+	source.QueueFrame(EndFrame{}, Downstream)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
+
+	msgs := serverMessageStrings(fix.TaskCtx.UIEvents.Snapshot())
+	count := 0
+	for _, m := range msgs {
+		if m == "User turn started" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 'User turn started' line for the whole barge-in turn, got %d: %v", count, msgs)
+	}
+}

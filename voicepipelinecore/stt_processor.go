@@ -133,7 +133,6 @@ func sttConfigPayload() map[string]interface{} {
 		"num_channels":              1,
 		"language_hints":            []string{"hi"},
 		"enable_endpoint_detection": true,
-		"max_endpoint_delay_ms":     300,
 	}
 }
 

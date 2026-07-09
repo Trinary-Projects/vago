@@ -1,8 +1,11 @@
 package voicepipelinecore
 
 import (
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
 // TestUserIdle_TimerInjectsPromptAfterBotStops verifies the timer fires
@@ -105,8 +108,8 @@ func TestUserIdle_FinalPromptEndsTask(t *testing.T) {
 	}
 
 	// Drive the count up to maxIdlePrompts-1 so the next fire is the
-	// final one. Then directly call the timer's startIdleTimer path by
-	// firing the callback synchronously via a tiny delay.
+	// final one. Then directly call the timer's onIdleTimeout body
+	// instead of waiting on the real 7s timer.
 	p.idlePromptCount.Store(int32(maxIdlePrompts - 1))
 
 	source := newQueueProcessor(fix.TaskCtx, "src", Upstream)
@@ -117,19 +120,7 @@ func TestUserIdle_FinalPromptEndsTask(t *testing.T) {
 	p.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
-	// Replace the timer duration via a manual call rather than the real
-	// 7s wait: invoke the timer body once directly. We do this by
-	// constructing the time.AfterFunc with a 1ms delay through
-	// startIdleTimer-equivalent inline code.
-	p.idleTimer = time.AfterFunc(1*time.Millisecond, func() {
-		count := p.idlePromptCount.Add(1)
-		if count == int32(maxIdlePrompts) {
-			p.PushFrame(NewTTSSpeakFrame(idlePromptText), Downstream)
-			if fix.TaskCtx.EndTask != nil {
-				fix.TaskCtx.EndTask(EndReasonUserIdle)
-			}
-		}
-	})
+	p.idleTimer = time.AfterFunc(1*time.Millisecond, p.onIdleTimeout)
 
 	select {
 	case <-doneCh:
@@ -146,6 +137,145 @@ func TestUserIdle_FinalPromptEndsTask(t *testing.T) {
 
 	if endedWith != EndReasonUserIdle {
 		t.Errorf("EndTask reason = %q, want %q", endedWith, EndReasonUserIdle)
+	}
+}
+
+// withCapturedDeadMicSentry redirects captureDeadMicSentry for the
+// duration of the test and returns the slice its calls append to.
+func withCapturedDeadMicSentry(t *testing.T) *[]sentryutil.Event {
+	t.Helper()
+	captured := &[]sentryutil.Event{}
+	old := captureDeadMicSentry
+	captureDeadMicSentry = func(e sentryutil.Event) { *captured = append(*captured, e) }
+	t.Cleanup(func() { captureDeadMicSentry = old })
+	return captured
+}
+
+// TestUserIdle_DeadMicSentryOnFirstFire verifies the Python parity dead-mic
+// alert (base_pipeline_manager.py:153-157): on the FIRST idle fire, if no
+// audible audio frame was ever received AND the user is currently present,
+// Sentry is captured exactly once with Python's exact message.
+func TestUserIdle_DeadMicSentryOnFirstFire(t *testing.T) {
+	fix := newTestFixture(t)
+	stats := newCallStatsTracker()
+	stats.MarkUserJoined(time.Now())
+	fix.TaskCtx.callStats = stats
+	p := NewUserIdleProcessor(fix.TaskCtx)
+	captured := withCapturedDeadMicSentry(t)
+
+	p.onIdleTimeout()
+
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 Sentry capture on first fire, got %d", len(*captured))
+	}
+	if got := (*captured)[0].Message; got != "No audio frames received after user idle timeout, try reconnecting" {
+		t.Errorf("capture message = %q", got)
+	}
+	if got := (*captured)[0].Tags["operation"]; got != "user_idle_no_audio" {
+		t.Errorf("capture tag operation = %q, want user_idle_no_audio", got)
+	}
+
+	// Second fire must NOT capture again — Python's condition is retry<=1
+	// only, and count is monotonically increasing so this is naturally
+	// once per call.
+	p.onIdleTimeout()
+	if len(*captured) != 1 {
+		t.Errorf("expected still 1 Sentry capture after second fire, got %d", len(*captured))
+	}
+}
+
+// TestUserIdle_NoDeadMicSentryWhenAudioReceived verifies the capture is
+// skipped once any audible user audio frame has been recorded.
+func TestUserIdle_NoDeadMicSentryWhenAudioReceived(t *testing.T) {
+	fix := newTestFixture(t)
+	stats := newCallStatsTracker()
+	stats.MarkUserJoined(time.Now())
+	stats.MarkFirstUserAudio(time.Now())
+	fix.TaskCtx.callStats = stats
+	p := NewUserIdleProcessor(fix.TaskCtx)
+	captured := withCapturedDeadMicSentry(t)
+
+	p.onIdleTimeout()
+
+	if len(*captured) != 0 {
+		t.Errorf("expected no Sentry capture when audio was received, got %d", len(*captured))
+	}
+}
+
+// TestUserIdle_NoDeadMicSentryWhenUserNotPresent verifies the capture is
+// skipped when no non-bot participant is currently in the room (mirrors
+// Python's len(participants) > 1 check).
+func TestUserIdle_NoDeadMicSentryWhenUserNotPresent(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.callStats = newCallStatsTracker() // never joined
+	p := NewUserIdleProcessor(fix.TaskCtx)
+	captured := withCapturedDeadMicSentry(t)
+
+	p.onIdleTimeout()
+
+	if len(*captured) != 0 {
+		t.Errorf("expected no Sentry capture when user is not present, got %d", len(*captured))
+	}
+}
+
+// TestUserIdle_NudgeEmitsRTVILine verifies the RTVI server-message line
+// mirrors Python's f"User idle nudge (retry {n}): hello?"
+// (base_pipeline_manager.py:158) using Go's own retry count.
+func TestUserIdle_NudgeEmitsRTVILine(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewUserIdleProcessor(fix.TaskCtx)
+
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+
+	want := []string{
+		"User idle nudge (retry 1): hello?",
+		"User idle nudge (retry 2): hello?",
+	}
+	var got []string
+	for _, e := range fix.TaskCtx.UIEvents.Snapshot() {
+		if e.Type == "server-message" {
+			if s, ok := e.Data.(string); ok {
+				got = append(got, s)
+			}
+		}
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected RTVI server-message %q, got %v", w, got)
+		}
+	}
+}
+
+// TestUserIdle_FinalNudgeEmitsRTVILineWithFinalRetryCount verifies the
+// final (Go's own end-on-7th delta) idle fire still emits the nudge RTVI
+// line with the correct retry count before ending the task.
+func TestUserIdle_FinalNudgeEmitsRTVILineWithFinalRetryCount(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewUserIdleProcessor(fix.TaskCtx)
+	fix.TaskCtx.EndTask = func(reason EndReason) {}
+	p.idlePromptCount.Store(int32(maxIdlePrompts - 1))
+
+	p.onIdleTimeout()
+
+	want := fmt.Sprintf("User idle nudge (retry %d): hello?", maxIdlePrompts)
+	found := false
+	for _, e := range fix.TaskCtx.UIEvents.Snapshot() {
+		if e.Type == "server-message" {
+			if s, ok := e.Data.(string); ok && s == want {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected final RTVI nudge line %q", want)
 	}
 }
 

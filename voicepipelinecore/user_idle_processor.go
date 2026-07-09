@@ -2,9 +2,17 @@ package voicepipelinecore
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
+
+// captureDeadMicSentry is a package-level var (like sttDialURL/ttsDialURL)
+// so tests can redirect Sentry capture without hitting the real SDK.
+var captureDeadMicSentry = sentryutil.Capture
 
 const (
 	idleTimeout    = 7 * time.Second
@@ -90,28 +98,72 @@ func (p *UserIdleProcessor) startIdleTimer() {
 	if p.idlePromptCount.Load() >= maxIdlePrompts {
 		return
 	}
-	p.idleTimer = time.AfterFunc(idleTimeout, func() {
-		count := p.idlePromptCount.Add(1)
-		if count > maxIdlePrompts {
-			// We've already issued the final prompt and asked the
-			// pipeline to end; ignore any straggling fires.
-			return
-		}
-		if count == maxIdlePrompts {
-			// Final attempt: speak the prompt one last time, then ask
-			// the pipeline source to inject EndFrame so every processor
-			// shuts down in order. Matches Python sales_call's
-			// handle_idle returning False after retry == 6.
-			p.taskCtx.Logger.Printf("User idle (%d/%d), final prompt; ending task\n", count, maxIdlePrompts)
-			p.PushFrame(NewTTSSpeakFrame(idlePromptText), Downstream)
-			if p.taskCtx.EndTask != nil {
-				p.taskCtx.EndTask(EndReasonUserIdle)
-			}
-			return
-		}
-		p.taskCtx.Logger.Printf("User idle (%d/%d), injecting prompt\n", count, maxIdlePrompts)
+	p.idleTimer = time.AfterFunc(idleTimeout, p.onIdleTimeout)
+}
+
+// onIdleTimeout is the idle timer's fire body, pulled out of the
+// time.AfterFunc closure so tests can invoke it directly/deterministically
+// instead of waiting on the real idleTimeout.
+func (p *UserIdleProcessor) onIdleTimeout() {
+	count := p.idlePromptCount.Add(1)
+	if count > maxIdlePrompts {
+		// We've already issued the final prompt and asked the
+		// pipeline to end; ignore any straggling fires.
+		return
+	}
+
+	// Dead-mic Sentry check: Python's base_pipeline_manager.py fires this
+	// only on the FIRST idle retry, when zero audio frames were ever
+	// received AND more than the bot alone is in the room:
+	//   if (self.transport.input().total_audio_frame_count == 0
+	//       and self._idle_retry_count <= 1
+	//       and len(self.transport.participants().keys()) > 1):
+	//       sentry_sdk.capture_exception(Exception(
+	//           "No audio frames received after user idle timeout, try reconnecting"))
+	// Go's proxy for "any audio frame ever received" is the first-AUDIBLE-
+	// frame mark (AudioSourceProcessor only marks it above a magnitude
+	// threshold), and "more than the bot in the room" is callStatsTracker's
+	// current-presence flag. count==1 is naturally once-only since count is
+	// monotonically increasing.
+	if count == 1 && p.taskCtx.callStats.FirstUserAudioFrameAt().IsZero() && p.taskCtx.callStats.Present() {
+		p.taskCtx.Logger.Println("User is idle, no audio frames received")
+		captureDeadMicSentry(sentryutil.Event{
+			Message: "No audio frames received after user idle timeout, try reconnecting",
+			Tags: map[string]string{
+				"component": "voicepipeline",
+				"operation": "user_idle_no_audio",
+				"session":   sessionIdentity(p.taskCtx),
+			},
+		})
+	}
+
+	if count == maxIdlePrompts {
+		// Final attempt: speak the prompt one last time, then ask
+		// the pipeline source to inject EndFrame so every processor
+		// shuts down in order. Matches Python sales_call's
+		// handle_idle returning False after retry == 6.
+		p.taskCtx.Logger.Printf("User idle (%d/%d), final prompt; ending task\n", count, maxIdlePrompts)
+		p.taskCtx.UIEvents.ServerMessage(fmt.Sprintf("User idle nudge (retry %d): hello?", count), time.Now())
 		p.PushFrame(NewTTSSpeakFrame(idlePromptText), Downstream)
-	})
+		if p.taskCtx.EndTask != nil {
+			p.taskCtx.EndTask(EndReasonUserIdle)
+		}
+		return
+	}
+	p.taskCtx.Logger.Printf("User idle (%d/%d), injecting prompt\n", count, maxIdlePrompts)
+	p.taskCtx.UIEvents.ServerMessage(fmt.Sprintf("User idle nudge (retry %d): hello?", count), time.Now())
+	p.PushFrame(NewTTSSpeakFrame(idlePromptText), Downstream)
+}
+
+// sessionIdentity returns whatever call/session identity core has
+// available. Core has no conversation_id; disha's call logger is
+// constructed with a "[conv=<id>] " prefix (call_startup.go), so the
+// trimmed Logger prefix is the closest generic identity available here.
+func sessionIdentity(taskCtx *TaskContext) string {
+	if taskCtx == nil || taskCtx.Logger == nil {
+		return ""
+	}
+	return strings.TrimSpace(taskCtx.Logger.Prefix())
 }
 
 func (p *UserIdleProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {

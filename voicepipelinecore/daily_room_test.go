@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -125,6 +126,113 @@ func TestDailyRoomWriteAudioPCMRecordsTimingWhenDiagnosticsEnabled(t *testing.T)
 	}
 }
 
+// TestDailyRoomParticipantLeftEndsTaskWhenConfigured verifies the
+// existing sales/follow-up behavior is unchanged: EndOnParticipantLeft:
+// true ends the task immediately on the non-bot participant leaving.
+func TestDailyRoomParticipantLeftEndsTaskWhenConfigured(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.callStats = newCallStatsTracker()
+	var ended []EndReason
+	fix.TaskCtx.EndTask = func(reason EndReason) { ended = append(ended, reason) }
+
+	room := &DailyRoom{
+		roomName:             "room-1",
+		taskCtx:              fix.TaskCtx,
+		endOnParticipantLeft: true,
+	}
+	room.markUserJoined("user-1")
+	room.handleEvent(dailyBridgeEvent{Event: "participant_left", ParticipantID: "user-1", Reason: "left"})
+
+	if len(ended) != 1 || ended[0] != EndReasonClientDisconnect {
+		t.Fatalf("expected EndTask(client_disconnect) exactly once, got %v", ended)
+	}
+}
+
+// TestDailyRoomParticipantLeftDoesNotEndTaskWhenDisabled verifies
+// onboarding's rejoin policy (item 5): a participant leaving with
+// EndOnParticipantLeft: false records the leave + RTVI but does not end
+// the task, mirrors Python's on_participant_left, and a rejoin followed
+// by a second leave still does not end the task while call stats
+// correctly accumulate both join/leave spans.
+func TestDailyRoomParticipantLeftDoesNotEndTaskWhenDisabled(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.callStats = newCallStatsTracker()
+	var ended []EndReason
+	fix.TaskCtx.EndTask = func(reason EndReason) { ended = append(ended, reason) }
+
+	room := &DailyRoom{
+		roomName:             "room-1",
+		taskCtx:              fix.TaskCtx,
+		endOnParticipantLeft: false,
+	}
+
+	room.markUserJoined("user-1")
+	if !fix.TaskCtx.callStats.Present() {
+		t.Fatal("expected user present after join")
+	}
+	room.handleEvent(dailyBridgeEvent{Event: "participant_left", ParticipantID: "user-1", Reason: "left"})
+
+	if len(ended) != 0 {
+		t.Fatalf("expected no EndTask call, got %v", ended)
+	}
+	if fix.TaskCtx.callStats.Present() {
+		t.Error("expected user marked not present after leave")
+	}
+
+	found := false
+	for _, e := range fix.TaskCtx.UIEvents.Snapshot() {
+		if e.Type == "server-message" {
+			if s, ok := e.Data.(string); ok && strings.HasPrefix(s, "Participant left:") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("expected 'Participant left: ...' RTVI message even without ending the task")
+	}
+
+	// Rejoin: call stats accumulate a second span, no second lifecycle
+	// event, and a second leave still must not end the task.
+	room.markUserJoined("user-1")
+	if !fix.TaskCtx.callStats.Present() {
+		t.Fatal("expected user present after rejoin")
+	}
+	room.handleEvent(dailyBridgeEvent{Event: "participant_left", ParticipantID: "user-1", Reason: "left again"})
+	if len(ended) != 0 {
+		t.Fatalf("expected still no EndTask call after second leave, got %v", ended)
+	}
+	if got := fix.TaskCtx.callStats.TotalDurationSec(time.Now()); got <= 0 {
+		t.Errorf("expected accumulated duration across both join/leave spans, got %.3f", got)
+	}
+}
+
+// TestDailyRoomParticipantJoinedLifecycleFiresOnceAcrossRejoin verifies
+// OnUserJoined stays once-only even when the user rejoins mid-call
+// (needed once EndOnParticipantLeft: false allows a rejoin to happen).
+func TestDailyRoomParticipantJoinedLifecycleFiresOnceAcrossRejoin(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.callStats = newCallStatsTracker()
+	var fires int
+	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+		OnUserJoined: func(at time.Time) { fires++ },
+	})
+	defer fix.TaskCtx.callEvents.stopAndDrain()
+
+	room := &DailyRoom{
+		roomName:             "room-1",
+		taskCtx:              fix.TaskCtx,
+		endOnParticipantLeft: false,
+	}
+	room.markUserJoined("user-1")
+	room.handleEvent(dailyBridgeEvent{Event: "participant_left", ParticipantID: "user-1", Reason: "left"})
+	room.markUserJoined("user-1")
+	fix.TaskCtx.callEvents.stopAndDrain()
+
+	if fires != 1 {
+		t.Errorf("expected OnUserJoined to fire exactly once across rejoin, got %d", fires)
+	}
+}
+
 func TestJoinDailyRoomRetriesBridgeJoin(t *testing.T) {
 	fix := newTestFixture(t)
 	tmp := t.TempDir()
@@ -166,7 +274,7 @@ printf '%s\n' '{"event":"left"}'
 	})
 
 	audioSource := NewAudioSourceProcessor(fix.TaskCtx)
-	room, err := JoinDailyRoom("https://example.daily.co/test-room", "token", fix.TaskCtx, audioSource)
+	room, err := JoinDailyRoom("https://example.daily.co/test-room", "token", fix.TaskCtx, audioSource, DailyRoomOptions{EndOnParticipantLeft: true})
 	if err != nil {
 		t.Fatalf("JoinDailyRoom: %v", err)
 	}

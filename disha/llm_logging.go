@@ -62,6 +62,17 @@ func newLLMLogSink(api *APIClient, logger *log.Logger, usecaseType, userID, conv
 			},
 			"completed":   c.Completed,
 			"status_code": c.StatusCode,
+			// finish_reason nests inside the existing response_payload
+			// dict rather than becoming a new top-level kwarg: Python's
+			// llm_logging_service.log_llm_call has a strict typed
+			// parameter list with no **kwargs catch-all, so an unknown
+			// TOP-LEVEL kwarg would TypeError the SQS job. response_payload
+			// itself is Dict[str, Any] passed straight through into the S3
+			// "response" blob with no field-level validation anywhere
+			// (verified: _save_to_db's DB row doesn't even reference
+			// response_payload), so adding a key here is safe today with
+			// no backend deploy required.
+			"finish_reason": c.FinishReason,
 		}
 		if c.ErrorMessage != "" {
 			responsePayload["error"] = map[string]any{
