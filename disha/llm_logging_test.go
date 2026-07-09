@@ -108,4 +108,7 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 	if !ok || usage["prompt_tokens"] != float64(11) || usage["completion_tokens"] != float64(7) || usage["total_tokens"] != float64(18) {
 		t.Fatalf("usage = %#v, want 11/7/18", responsePayload["usage"])
 	}
+	if got := responsePayload["finish_reason"]; got != "stop" {
+		t.Fatalf("response_payload[finish_reason] = %#v, want %q", got, "stop")
+	}
 }

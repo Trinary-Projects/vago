@@ -73,6 +73,7 @@ type modelGroup struct {
 }
 
 const (
+	groupGrokFast        = "grok-4.1-fast" // onboarding variant configs' model field.
 	groupGrokSales       = "grok-4.1-fast-sales"
 	groupGPT41           = "gpt-4.1" // the sales cross-group fallback target.
 	groupGemini31        = "gemini-flash-3.1-lite"
@@ -82,6 +83,11 @@ const (
 	grokModel  = "grok-4-1-fast-non-reasoning"
 	gpt41Model = "gpt-4.1"
 )
+
+// EndpointOpenRouterGemini25FlashLite is the fixed-endpoint config key for
+// the onboarding stage-transition tracker's one-shot classifier (used via
+// Config.FixedEndpoint, never in a health-selected group).
+const EndpointOpenRouterGemini25FlashLite = "openrouter_gemini_2_5_flash_lite"
 
 func floatPtr(v float64) *float64 { return &v }
 func intPtr(v int) *int           { return &v }
@@ -207,6 +213,53 @@ var endpointConfigs = map[string]endpointConfig{
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		MaxTokens: intPtr(500),
 	},
+
+	// --- onboarding stage-transition tracker classifier ---
+	// Fixed-endpoint-only: used via Config.FixedEndpoint by the Disha
+	// onboarding stage tracker's one-shot "maybe" classifier and never a
+	// member of a health-selected group's Configs list, so Python-side
+	// polling for it is optional (same note as the hedged throughput
+	// config below).
+	EndpointOpenRouterGemini25FlashLite: {
+		Key: EndpointOpenRouterGemini25FlashLite, Provider: providerOpenRouter,
+		Model: "google/gemini-2.5-flash-lite", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+	},
+
+	// --- hedged one-shot hedge endpoint ---
+	// Python's gpt_oss120_fast_hedged pair uses OpenRouter with
+	// provider_sort="throughput" for the hedge leg. It gets its own key
+	// (instead of reusing openrouter_gpt_oss_120b) so blacklist
+	// write-back for hedge attempts lands on the config that actually
+	// misbehaved and get_guidance's health entries stay untouched.
+	"openrouter_gpt_oss_120b_throughput": {
+		Key: "openrouter_gpt_oss_120b_throughput", Provider: providerOpenRouter,
+		Model: "openai/gpt-oss-120b", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+		MaxTokens: intPtr(500),
+		ExtraBody: map[string]any{
+			"provider": map[string]any{"sort": "throughput"},
+		},
+	},
+}
+
+// hedgedPair is a fixed ordered primary/hedge endpoint pair for the
+// hedged one-shot client (Python FAILOVER_CONFIGS: config_list[0]/[1],
+// not health-ranked).
+type hedgedPair struct {
+	Primary string
+	Hedge   string
+}
+
+// GroupGPTOSS120FastHedged mirrors Python's gpt_oss120_fast_hedged
+// failover config: Cerebras primary, OpenRouter throughput-sorted hedge.
+const GroupGPTOSS120FastHedged = "gpt-oss120-fast-hedged"
+
+var hedgedPairs = map[string]hedgedPair{
+	GroupGPTOSS120FastHedged: {
+		Primary: "cerebras_gpt_oss_120b",
+		Hedge:   "openrouter_gpt_oss_120b_throughput",
+	},
 }
 
 // modelGroups is the Go port of MODEL_GROUPS for the Disha call bots.
@@ -214,6 +267,21 @@ var endpointConfigs = map[string]endpointConfig{
 // it participates in normal health-based selection (mirrors Python,
 // where it is the most stable endpoint).
 var modelGroups = map[string]modelGroup{
+	// Identical membership to grok-4.1-fast-sales in Python's
+	// MODEL_GROUPS — both exist as separate keys so their health polls
+	// and poll locks stay per-group.
+	groupGrokFast: {
+		Configs: []string{
+			"grok_4_1_fnr_eastus",
+			"grok_4_1_fnr_eastus2",
+			"grok_4_1_fnr_westus",
+			"grok_4_1_fnr_westus2",
+			"grok_4_1_fnr_westcentralus",
+			"vertex_dishaai_grok_4_1_fast_non_reasoning",
+		},
+		Fallback:      "vertex_dishaai_grok_4_1_fast_non_reasoning",
+		FallbackGroup: groupGPT41,
+	},
 	groupGrokSales: {
 		Configs: []string{
 			"grok_4_1_fnr_eastus",

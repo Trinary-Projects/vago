@@ -224,6 +224,39 @@ func TestSelectionGuidanceGroupUsesOwnFallback(t *testing.T) {
 	}
 }
 
+func TestGrokFastGroupMirrorsSalesGroup(t *testing.T) {
+	// Python MODEL_GROUPS declares grok-4.1-fast (onboarding) with the
+	// same membership and fallback as grok-4.1-fast-sales; they stay
+	// separate keys so health polls and poll locks are per-group.
+	fast, ok := modelGroups[groupGrokFast]
+	if !ok {
+		t.Fatal("grok-4.1-fast group missing")
+	}
+	sales := modelGroups[groupGrokSales]
+	if len(fast.Configs) != len(sales.Configs) {
+		t.Fatalf("configs = %d, want %d", len(fast.Configs), len(sales.Configs))
+	}
+	for i := range fast.Configs {
+		if fast.Configs[i] != sales.Configs[i] {
+			t.Fatalf("configs[%d] = %q, want %q", i, fast.Configs[i], sales.Configs[i])
+		}
+	}
+	if fast.Fallback != sales.Fallback || fast.FallbackGroup != sales.FallbackGroup {
+		t.Fatalf("fallbacks = (%q,%q), want (%q,%q)", fast.Fallback, fast.FallbackGroup, sales.Fallback, sales.FallbackGroup)
+	}
+
+	fr := newFakeRedis()
+	fr.setHealth("grok_4_1_fnr_eastus", false, 400)
+	fr.setHealth("grok_4_1_fnr_westus", false, 200)
+	sel, ok := getFastestForGroup(ctx(), fr, groupGrokFast, "us")
+	if !ok {
+		t.Fatal("expected a selection")
+	}
+	if sel.ConfigKey != "grok_4_1_fnr_westus" || sel.SelectedGroup != groupGrokFast {
+		t.Fatalf("selection = %+v, want fastest healthy grok endpoint in grok-4.1-fast", sel)
+	}
+}
+
 func TestSelectionRegionFilter(t *testing.T) {
 	// south_india azure config must never be selected for region us even
 	// if it has the best latency.
@@ -728,5 +761,109 @@ func TestVertexTokenMintAndCache(t *testing.T) {
 	}
 	if loads != 1 {
 		t.Errorf("creds loader calls = %d, want 1 (loaded once)", loads)
+	}
+}
+
+// --- prompt metadata (SetPromptMetadata) ---
+
+func TestSetPromptMetadataSwapsLogMetadata(t *testing.T) {
+	server := sseServer(t, []string{"ok"})
+	defer server.Close()
+	t.Setenv("GROK_4_1_FNR_EASTUS_API_KEY", "k")
+	t.Setenv("GROK_4_1_FNR_EASTUS_ENDPOINT", server.URL)
+
+	fr := newFakeRedis()
+	fr.setHealth("grok_4_1_fnr_eastus", false, 300)
+
+	logCh := make(chan CallLog, 2)
+	r, err := New(Config{
+		Group:          groupGrokSales,
+		Redis:          fr,
+		LogSink:        func(c CallLog) { logCh <- c },
+		PromptMetadata: map[string]any{"system_prompt_name": "before"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	nextLog := func() CallLog {
+		t.Helper()
+		select {
+		case lg := <-logCh:
+			return lg
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected a CallLog from the sink")
+			return CallLog{}
+		}
+	}
+
+	if _, err := r.Stream(ctx(), testLLMRequest(), func(string) {}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := nextLog().PromptMetadata["system_prompt_name"]; got != "before" {
+		t.Fatalf("first log metadata = %v, want before", got)
+	}
+
+	r.SetPromptMetadata(map[string]any{"system_prompt_name": "after"})
+	if _, err := r.Stream(ctx(), testLLMRequest(), func(string) {}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := nextLog().PromptMetadata["system_prompt_name"]; got != "after" {
+		t.Fatalf("second log metadata = %v, want after", got)
+	}
+}
+
+func TestSetPromptMetadataConcurrentWithStream(t *testing.T) {
+	server := sseServer(t, []string{"ok"})
+	defer server.Close()
+	t.Setenv("GROK_4_1_FNR_EASTUS_API_KEY", "k")
+	t.Setenv("GROK_4_1_FNR_EASTUS_ENDPOINT", server.URL)
+
+	fr := newFakeRedis()
+	fr.setHealth("grok_4_1_fnr_eastus", false, 300)
+
+	r, err := New(Config{Group: groupGrokSales, Redis: fr, LogSink: func(CallLog) {}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			r.SetPromptMetadata(map[string]any{"i": i})
+		}(i)
+		go func() {
+			defer wg.Done()
+			_, _ = r.Stream(ctx(), testLLMRequest(), func(string) {})
+		}()
+	}
+	wg.Wait()
+}
+
+func TestFixedEndpointGemini25FlashLite(t *testing.T) {
+	fr := newFakeRedis()
+	r, err := New(Config{FixedEndpoint: EndpointOpenRouterGemini25FlashLite, Redis: fr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sel, ok := r.selectEndpoint(ctx())
+	if !ok || sel.ConfigKey != EndpointOpenRouterGemini25FlashLite {
+		t.Fatalf("selection = %+v (%v)", sel, ok)
+	}
+	cfg := endpointConfigs[EndpointOpenRouterGemini25FlashLite]
+	if cfg.Provider != providerOpenRouter || cfg.Model != "google/gemini-2.5-flash-lite" ||
+		cfg.BaseURL != "https://openrouter.ai/api/v1" || cfg.APIKeyEnv != "OPENROUTER_API_KEY" {
+		t.Fatalf("endpoint config = %+v", cfg)
+	}
+	// This config must stay out of every health-selected group: it is
+	// never polled by Python, so group membership would break selection.
+	for group, g := range modelGroups {
+		for _, key := range g.Configs {
+			if key == EndpointOpenRouterGemini25FlashLite {
+				t.Fatalf("classifier endpoint appears in health-selected group %q", group)
+			}
+		}
 	}
 }

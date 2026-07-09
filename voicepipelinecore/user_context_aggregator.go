@@ -281,6 +281,10 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 			if len(strings.Fields(interimTranscript)) >= minBargeInWords {
 				a.taskCtx.Logger.Println("Barge-in detected")
 				a.taskCtx.UIEvents.ServerMessage("Interruption received while bot is speaking", time.Now())
+				// Mirrors Pipecat's MinWordsUserTurnStartStrategy firing
+				// on_user_turn_started as soon as the (bot-speaking) 3-word
+				// threshold is crossed (base_pipeline_manager.py:425-431).
+				a.taskCtx.UIEvents.ServerMessage("User turn started", time.Now())
 				a.PushFrame(NewInterruptFrame(), Downstream)
 				a.interruptSent = true
 				a.botSpeaking = false
@@ -295,6 +299,13 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 					a.taskCtx.Logger.Printf("Discarding below-threshold transcript (bot speaking): %s\n", text)
 					a.resetInterimTranscript()
 				} else {
+					if !a.interruptSent {
+						// Bot was silent for this whole turn (not a barge-in
+						// continuation, which already signaled turn-start
+						// above) — this is Go's equivalent of Pipecat's
+						// min_words=1-when-bot-silent threshold crossing.
+						a.taskCtx.UIEvents.ServerMessage("User turn started", time.Now())
+					}
 					a.submitUserMessage(text)
 				}
 			}

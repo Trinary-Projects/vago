@@ -10,7 +10,10 @@ import (
 // TestBuildResumeSystemMessage pins fetch_conversation.py: a resume nudge
 // is emitted only when resume_gracefully is explicitly true (False/None
 // mean an explicit-chunkId rebuild — continue silently), picking the
-// within-window or after-window text by the resumed chunk's age.
+// within-window or after-window text by the resumed chunk's age. The
+// non-empty results are wrapped in <system_message> — buildResumeSystemMessage
+// is the shared sales/follow-up nudge builder and now returns the
+// fully-composed text ready to append verbatim via buildInitialMessages.
 func TestBuildResumeSystemMessage(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	chunkID := "chunk-1"
@@ -18,6 +21,7 @@ func TestBuildResumeSystemMessage(t *testing.T) {
 	resumedChunk := func(age time.Duration) map[string]any {
 		return map[string]any{"created": now.Add(-age).Format(time.RFC3339Nano)}
 	}
+	wrap := func(text string) string { return "<system_message>" + text + "</system_message>" }
 	cases := []struct {
 		name string
 		data *ConversationData
@@ -38,11 +42,11 @@ func TestBuildResumeSystemMessage(t *testing.T) {
 		{"gracefully true within window", &ConversationData{
 			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
 			ResumedChunk: resumedChunk(time.Minute),
-		}, resumeMessageGracefulWithinWindow},
+		}, wrap(resumeMessageGracefulWithinWindow)},
 		{"gracefully true after window", &ConversationData{
 			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
 			ResumedChunk: resumedChunk(10 * time.Minute),
-		}, resumeMessageAfterWindow},
+		}, wrap(resumeMessageAfterWindow)},
 		{"missing created timestamp emits nothing", &ConversationData{
 			Conversation: ConversationRow{ResumedFromChunkID: &chunkID, ResumeGracefully: boolPtr(true)},
 			ResumedChunk: map[string]any{},

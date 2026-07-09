@@ -64,6 +64,30 @@ func (c *APIClient) RunPostCallOperationsWithFallback(ctx context.Context, req P
 	return c.enqueueAPIFallback("run_post_call_operations", "bots.operations.voice_bot_operations", "run_post_call_operations", req, err)
 }
 
+func (c *APIClient) SetUserCareplan(ctx context.Context, req SetUserCareplanRequest) error {
+	return c.send(ctx, http.MethodPost, "/bot/set_user_careplan", req)
+}
+
+func (c *APIClient) SetUserCareplanWithFallback(ctx context.Context, req SetUserCareplanRequest) error {
+	err := c.SetUserCareplan(ctx, req)
+	if err == nil {
+		return nil
+	}
+	return c.enqueueAPIFallback("set_user_careplan", "bots.operations.voice_bot_operations", "set_user_careplan", req, err)
+}
+
+func (c *APIClient) AddTagToUser(ctx context.Context, req AddTagToUserRequest) error {
+	return c.send(ctx, http.MethodPost, "/bot/add_tag_to_user", req)
+}
+
+func (c *APIClient) AddTagToUserWithFallback(ctx context.Context, req AddTagToUserRequest) error {
+	err := c.AddTagToUser(ctx, req)
+	if err == nil {
+		return nil
+	}
+	return c.enqueueAPIFallback("add_tag_to_user", "bots.operations.voice_bot_operations", "add_tag_to_user", req, err)
+}
+
 func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error {
 	return c.send(ctx, http.MethodPost, "/common/enqueue_job", req)
 }

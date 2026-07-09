@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	vpc "github.com/jaideep329/talk-go/voicepipelinecore"
@@ -52,6 +53,21 @@ type Config struct {
 	// PromptMetadata is static per bot prompt/context and is forwarded
 	// to the log sink without putting prompt concerns into voicepipelinecore.
 	PromptMetadata map[string]any
+
+	// FixedEndpoint pins the router to a single endpoint config key,
+	// bypassing health-ranked selection entirely (Python's failover
+	// service picks configs by fixed list position, not health). In this
+	// mode the router never triggers a poll — there is nothing to
+	// re-rank — but blacklist write-back on completed transient errors
+	// is kept. Group is ignored when set. Used by the hedged one-shot
+	// client.
+	FixedEndpoint string
+
+	// Temperature/MaxTokens override the endpoint config's values for
+	// this client (Python passes them per call; deep thinking uses
+	// 0.7 / 4000 where the registry pins get_guidance's 500).
+	Temperature *float64
+	MaxTokens   *int
 }
 
 // Router implements voicepipelinecore.LLMClient with health-based
@@ -61,6 +77,14 @@ type Router struct {
 	cfg            Config
 	httpClient     *http.Client
 	pollTriggerURL string
+
+	// promptMetadata starts as Config.PromptMetadata and can be replaced
+	// mid-session with SetPromptMetadata (Python updates
+	// context.prompt_metadata on every onboarding prompt recompile, so
+	// logged metadata reflects the prompts actually in use). Reads at log
+	// time go through the same mutex.
+	metaMu         sync.Mutex
+	promptMetadata map[string]any
 }
 
 // New builds a Router for the given model group. The poll-trigger URL is
@@ -69,14 +93,20 @@ type Router struct {
 // is non-fatal (Vertex calls fail and are blacklisted, and selection
 // falls back to other endpoints).
 func New(cfg Config) (*Router, error) {
-	if cfg.Group == "" {
-		return nil, errors.New("llmrouter: Config.Group is required")
-	}
 	if cfg.Redis == nil {
 		return nil, errors.New("llmrouter: Config.Redis is required")
 	}
-	if _, ok := modelGroups[cfg.Group]; !ok {
-		return nil, fmt.Errorf("llmrouter: unknown model group %q", cfg.Group)
+	if cfg.FixedEndpoint != "" {
+		if _, ok := endpointConfigs[cfg.FixedEndpoint]; !ok {
+			return nil, fmt.Errorf("llmrouter: unknown fixed endpoint %q", cfg.FixedEndpoint)
+		}
+	} else {
+		if cfg.Group == "" {
+			return nil, errors.New("llmrouter: Config.Group is required")
+		}
+		if _, ok := modelGroups[cfg.Group]; !ok {
+			return nil, fmt.Errorf("llmrouter: unknown model group %q", cfg.Group)
+		}
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -86,7 +116,34 @@ func New(cfg Config) (*Router, error) {
 		cfg:            cfg,
 		httpClient:     httpClient,
 		pollTriggerURL: strings.TrimSpace(os.Getenv(pollTriggerURLEnv)),
+		promptMetadata: cfg.PromptMetadata,
 	}, nil
+}
+
+// SetPromptMetadata replaces the prompt metadata attached to subsequent
+// call logs. The Disha onboarding stage manager calls this after each
+// stage transition so the conversation router's logged prompt identity
+// tracks the recompiled system prompt; the stage tracker's classifier
+// sets it per one-shot call.
+func (r *Router) SetPromptMetadata(metadata map[string]any) {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	r.promptMetadata = metadata
+}
+
+func (r *Router) currentPromptMetadata() map[string]any {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	return r.promptMetadata
+}
+
+// selectEndpoint resolves the endpoint for one call: the pinned config
+// in fixed-endpoint mode, health-ranked group selection otherwise.
+func (r *Router) selectEndpoint(ctx context.Context) (selection, bool) {
+	if r.cfg.FixedEndpoint != "" {
+		return selection{ConfigKey: r.cfg.FixedEndpoint}, true
+	}
+	return getFastestForGroup(ctx, r.cfg.Redis, r.cfg.Group, r.region())
 }
 
 func (r *Router) region() string {
@@ -108,7 +165,7 @@ func (r *Router) logf(format string, args ...any) {
 // re-poll for fallback recovery. It returns the model that served the
 // turn so the LLMProcessor can report it.
 func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func(string)) (res vpc.LLMResult, err error) {
-	sel, ok := getFastestForGroup(ctx, r.cfg.Redis, r.cfg.Group, r.region())
+	sel, ok := r.selectEndpoint(ctx)
 	if !ok {
 		return vpc.LLMResult{}, errNoEndpoint
 	}
@@ -138,7 +195,7 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 			Request:          llmReq,
 			ResponseContent:  responseContent.String(),
 			ToolCalls:        res.ToolCalls,
-			PromptMetadata:   r.cfg.PromptMetadata,
+			PromptMetadata:   r.currentPromptMetadata(),
 			PromptTokens:     usage.PromptTokens,
 			CompletionTokens: usage.CompletionTokens,
 			TTFBMs:           msFromDuration(res.TTFB),

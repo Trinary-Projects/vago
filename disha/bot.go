@@ -45,6 +45,8 @@ func NewBot(botType string) (Bot, error) {
 		return SalesCallBot{}, nil
 	case FollowUpBotType:
 		return FollowUpBot{}, nil
+	case OnboardingCallBotType:
+		return OnboardingCallBot{}, nil
 	default:
 		return nil, fmt.Errorf("disha: unsupported bot_type %q", botType)
 	}

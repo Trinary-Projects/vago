@@ -63,23 +63,39 @@ type rtviClientMessageData struct {
 // lifecycle while the bridge only joins Daily, relays PCM audio, and sends
 // app messages.
 type DailyRoom struct {
-	roomURL     string
-	roomName    string
-	taskCtx     *TaskContext
-	audioSource *AudioSourceProcessor
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	audioTiming *audioTimingAggregator
-	perfDiag    bool
-	writeMu     sync.Mutex
-	waitDone    chan struct{}
-	closed      atomic.Bool
-	joinOnce    sync.Once
-	joinResult  chan error
-	greetOnce   sync.Once
+	roomURL              string
+	roomName             string
+	taskCtx              *TaskContext
+	audioSource          *AudioSourceProcessor
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	audioTiming          *audioTimingAggregator
+	perfDiag             bool
+	writeMu              sync.Mutex
+	waitDone             chan struct{}
+	closed               atomic.Bool
+	joinOnce             sync.Once
+	joinResult           chan error
+	greetOnce            sync.Once
+	endOnParticipantLeft bool
 }
 
-func JoinDailyRoom(roomURL, token string, taskCtx *TaskContext, audioSource *AudioSourceProcessor) (*DailyRoom, error) {
+// DailyRoomOptions carries per-bot policy for JoinDailyRoom that isn't
+// captured by TaskContext (business/lifecycle decisions, not shared
+// pipeline plumbing).
+type DailyRoomOptions struct {
+	// EndOnParticipantLeft ends the task immediately when the non-bot
+	// participant leaves the Daily room. Sales and follow-up calls set
+	// this true (existing, byte-identical behavior). Onboarding sets it
+	// false: Python parity (bots/onboarding_call/base_pipeline_manager.py
+	// on_participant_left) only records the leave timestamp + RTVI and
+	// lets the user rejoin ("User rejoined (not updating DB)"); an
+	// abandoned call is ended by the idle-nudge loop / 120s watchdog
+	// instead, not by the leave event itself.
+	EndOnParticipantLeft bool
+}
+
+func JoinDailyRoom(roomURL, token string, taskCtx *TaskContext, audioSource *AudioSourceProcessor, opts DailyRoomOptions) (*DailyRoom, error) {
 	roomURL = strings.TrimSpace(roomURL)
 	if roomURL == "" {
 		return nil, errors.New("daily room url is required")
@@ -87,7 +103,7 @@ func JoinDailyRoom(roomURL, token string, taskCtx *TaskContext, audioSource *Aud
 	python, script := dailyBridgeConfig()
 	var lastErr error
 	for attempt := 1; attempt <= dailyJoinRetries; attempt++ {
-		room, err := startDailyRoomAttempt(roomURL, token, python, script, taskCtx, audioSource)
+		room, err := startDailyRoomAttempt(roomURL, token, python, script, taskCtx, audioSource, opts)
 		if err == nil {
 			return room, nil
 		}
@@ -133,7 +149,7 @@ func dailyBridgeConfig() (python, script string) {
 	return python, script
 }
 
-func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskContext, audioSource *AudioSourceProcessor) (*DailyRoom, error) {
+func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskContext, audioSource *AudioSourceProcessor, opts DailyRoomOptions) (*DailyRoom, error) {
 	cmd := exec.Command(python, script, "--room-url", roomURL, "--token", token, "--bot-name", "Chatbot")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -150,15 +166,16 @@ func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskC
 
 	perfDiagEnabled := perf.Enabled()
 	room := &DailyRoom{
-		roomURL:     roomURL,
-		roomName:    dailyRoomNameFromURL(roomURL),
-		taskCtx:     taskCtx,
-		audioSource: audioSource,
-		cmd:         cmd,
-		stdin:       stdin,
-		perfDiag:    perfDiagEnabled,
-		waitDone:    make(chan struct{}),
-		joinResult:  make(chan error, 1),
+		roomURL:              roomURL,
+		roomName:             dailyRoomNameFromURL(roomURL),
+		taskCtx:              taskCtx,
+		audioSource:          audioSource,
+		cmd:                  cmd,
+		stdin:                stdin,
+		perfDiag:             perfDiagEnabled,
+		waitDone:             make(chan struct{}),
+		joinResult:           make(chan error, 1),
+		endOnParticipantLeft: opts.EndOnParticipantLeft,
 	}
 	if perfDiagEnabled {
 		room.audioTiming = newAudioTimingAggregator()
@@ -315,11 +332,21 @@ func (r *DailyRoom) handleEvent(event dailyBridgeEvent) {
 	case "participant_left":
 		at := time.Now()
 		r.markUserLeft(event.ParticipantID)
-		r.log("[%s] Daily participant %q left, requesting EndFrame: %s", r.roomName, event.ParticipantID, event.Reason)
+		if r.endOnParticipantLeft {
+			r.log("[%s] Daily participant %q left, requesting EndFrame: %s", r.roomName, event.ParticipantID, event.Reason)
+		} else {
+			// Onboarding parity (base_pipeline_manager.on_participant_left):
+			// record the leave + RTVI only. The user can rejoin; an
+			// abandoned call is ended by the idle-nudge loop / 120s
+			// watchdog, not by this event.
+			r.log("[%s] Daily participant %q left (not ending call): %s", r.roomName, event.ParticipantID, event.Reason)
+		}
 		if r.taskCtx != nil {
 			r.taskCtx.UIEvents.ServerMessage("Participant left: "+event.Reason, at)
 		}
-		r.endTask(EndReasonClientDisconnect)
+		if r.endOnParticipantLeft {
+			r.endTask(EndReasonClientDisconnect)
+		}
 	case "audio":
 		var raw []byte
 		var err error

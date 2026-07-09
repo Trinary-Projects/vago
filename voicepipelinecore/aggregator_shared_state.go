@@ -42,8 +42,32 @@ func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, m
 	}
 }
 
-func (s *aggregatorSharedState) messagesForTest() []Message {
+// replaceSystemMessage swaps the conversation's system message in place,
+// mirroring Python's ConversationContextManager._set_system_prompt: if
+// the first message is a system message its content is replaced,
+// otherwise a system message is inserted at the front. Used by the
+// onboarding stage machine on every stage transition / deep-thinking
+// recompile.
+func (s *aggregatorSharedState) replaceSystemMessage(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.messages) > 0 && s.messages[0].Role == "system" {
+		s.messages[0].Content = text
+		return
+	}
+	s.messages = append([]Message{{Role: "system", Content: text}}, s.messages...)
+}
+
+// snapshot returns a deep copy of the shared conversation history,
+// mutex-guarded the same as replaceSystemMessage. Callers own the
+// returned slice/messages outright; mutating them (including a
+// message's ToolCalls) cannot affect shared state.
+func (s *aggregatorSharedState) snapshot() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneMessages(s.messages)
+}
+
+func (s *aggregatorSharedState) messagesForTest() []Message {
+	return s.snapshot()
 }

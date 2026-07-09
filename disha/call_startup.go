@@ -151,8 +151,10 @@ func isTruthyJSON(v any) bool {
 //
 //   - If there are prior chunks, prepend the system prompt and replay
 //     each non-debug chunk in role/content form.
-//   - When resuming, append a user message containing a <system_message>
-//     nudge describing how to reconnect with the user.
+//   - When resuming, append resumeMessage verbatim as the last user
+//     message. resumeMessage must already be fully composed (including
+//     any wrapper tag) by the caller — this function has no wrapping or
+//     tag knowledge; it only decides whether prior turns exist.
 //   - On a fresh call, seed with `{user: "hello?"}` so the bot speaks
 //     first.
 func buildInitialMessages(systemPrompt string, chunks [][]any, resumeMessage string) []voicepipelinecore.Message {
@@ -166,7 +168,7 @@ func buildInitialMessages(systemPrompt string, chunks [][]any, resumeMessage str
 	msgs = reorderToolResultMessages(msgs)
 	hasPriorTurns := len(msgs) > 1
 	if hasPriorTurns && resumeMessage != "" {
-		msgs = append(msgs, voicepipelinecore.Message{Role: "user", Content: "<system_message>" + resumeMessage + "</system_message>"})
+		msgs = append(msgs, voicepipelinecore.Message{Role: "user", Content: resumeMessage})
 	}
 	if !hasPriorTurns {
 		msgs = append(msgs, voicepipelinecore.Message{Role: "user", Content: "hello?"})
@@ -221,37 +223,57 @@ func reorderToolResultMessages(msgs []voicepipelinecore.Message) []voicepipeline
 
 // buildResumeSystemMessage reproduces fetch_conversation.py's
 // resume-message logic, but driven by the cached `resumed_chunk`
-// payload that Disha already writes to conversation_data in Redis.
-// Returns "" when no resume nudge is needed (no chunk to resume from,to
-// resume_gracefully=false, etc).
+// payload that Disha already writes to conversation_data in Redis. This
+// is the resume-nudge builder shared by BOTH sales and follow-up calls;
+// onboarding has its own distinct wording and wrapper tag, built by
+// buildOnboardingResumeMessage in onboarding_call.go, over the same
+// resumeMessageGate. Returns "" when no resume nudge is needed (no
+// chunk to resume from, resume_gracefully=false, etc); otherwise the
+// text is wrapped in <system_message>...</system_message> and is ready
+// to append verbatim via buildInitialMessages.
 func buildResumeSystemMessage(data *ConversationData, now time.Time) string {
-	if data == nil {
+	withinWindow, ok := resumeMessageGate(data, now)
+	if !ok {
 		return ""
+	}
+	text := resumeMessageAfterWindow
+	if withinWindow {
+		text = resumeMessageGracefulWithinWindow
+	}
+	return "<system_message>" + text + "</system_message>"
+}
+
+// resumeMessageGate reproduces fetch_conversation.py's resume-message
+// gating, shared by every call flow: ok is false when no resume nudge
+// should be emitted at all (no resumed chunk, resume_gracefully not
+// explicitly true, or an unparseable creation timestamp); when ok is
+// true, withinWindow selects the "just interrupted" vs. "call ended a
+// while ago" branch.
+func resumeMessageGate(data *ConversationData, now time.Time) (withinWindow bool, ok bool) {
+	if data == nil {
+		return false, false
 	}
 	if data.Conversation.ResumedFromChunkID == nil || strings.TrimSpace(*data.Conversation.ResumedFromChunkID) == "" {
-		return ""
+		return false, false
 	}
 	if len(data.ResumedChunk) == 0 {
-		return ""
+		return false, false
 	}
-	chunkCreated, ok := parseResumedChunkCreated(data.ResumedChunk)
-	if !ok {
+	chunkCreated, parsed := parseResumedChunkCreated(data.ResumedChunk)
+	if !parsed {
 		// Without a creation timestamp we can't pick a branch — match
 		// Python's behaviour, which silently skips when the chunk lookup
 		// fails.
-		return ""
+		return false, false
 	}
 	// Python gates on `if conversation.resume_gracefully:` — False and
 	// missing both mean the thread was deliberately rebuilt from an
 	// explicit chunkId (bot_session_manager sets resume_gracefully =
 	// not resumed_from_specific_chunk), so no resume nudge is emitted.
 	if data.Conversation.ResumeGracefully == nil || !*data.Conversation.ResumeGracefully {
-		return ""
+		return false, false
 	}
-	if now.Sub(chunkCreated) < resumeWindowGraceful {
-		return resumeMessageGracefulWithinWindow
-	}
-	return resumeMessageAfterWindow
+	return now.Sub(chunkCreated) < resumeWindowGraceful, true
 }
 
 func parseResumedChunkCreated(payload map[string]any) (time.Time, bool) {

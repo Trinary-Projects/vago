@@ -87,6 +87,19 @@ func (p *callStatsTracker) FirstUserAudioFrameAt() time.Time {
 	return p.firstAudioAt
 }
 
+// Present reports whether a non-bot participant is currently joined.
+// Mirrors Python's `len(transport.participants().keys()) > 1` check
+// (base_pipeline_manager.py's dead-mic idle check): true only while a
+// user is actually in the room, not merely "ever joined".
+func (p *callStatsTracker) Present() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.present
+}
+
 func (p *callStatsTracker) TotalDurationSec(at time.Time) float64 {
 	if p == nil {
 		return 0

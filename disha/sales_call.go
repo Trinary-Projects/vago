@@ -140,7 +140,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {
-		room, err = voicepipelinecore.JoinDailyRoom(req.RoomURL, req.RoomToken, taskCtx, audioSource)
+		room, err = voicepipelinecore.JoinDailyRoom(req.RoomURL, req.RoomToken, taskCtx, audioSource, voicepipelinecore.DailyRoomOptions{EndOnParticipantLeft: true})
 	} else {
 		room, err = voicepipelinecore.JoinLiveKitRoom(req.RoomURL, req.RoomName, req.RoomToken, taskCtx, audioSource)
 	}
