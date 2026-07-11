@@ -18,6 +18,9 @@ const (
 	idleTimeout    = 7 * time.Second
 	maxIdlePrompts = 7
 	idlePromptText = "Hello?"
+	// Fire the diagnostic after a few idle nudges instead of the first one:
+	// first-idle was too noisy for users who responded shortly after the nudge.
+	deadMicSentryIdleRetry = 5
 
 	// cancelOnIdleTimeout ends the call if there is no activity at all
 	// (user speech / interim transcript / bot speaking) for this long.
@@ -113,19 +116,20 @@ func (p *UserIdleProcessor) onIdleTimeout() {
 	}
 
 	// Dead-mic Sentry check: Python's base_pipeline_manager.py fires this
-	// only on the FIRST idle retry, when zero audio frames were ever
-	// received AND more than the bot alone is in the room:
+	// on the FIRST idle retry, when zero audio frames were ever received
+	// AND more than the bot alone is in the room:
 	//   if (self.transport.input().total_audio_frame_count == 0
 	//       and self._idle_retry_count <= 1
 	//       and len(self.transport.participants().keys()) > 1):
 	//       sentry_sdk.capture_exception(Exception(
 	//           "No audio frames received after user idle timeout, try reconnecting"))
-	// Go's proxy for "any audio frame ever received" is the first-AUDIBLE-
-	// frame mark (AudioSourceProcessor only marks it above a magnitude
-	// threshold), and "more than the bot in the room" is callStatsTracker's
-	// current-presence flag. count==1 is naturally once-only since count is
-	// monotonically increasing.
-	if count == 1 && p.taskCtx.callStats.FirstUserAudioFrameAt().IsZero() && p.taskCtx.callStats.Present() {
+	// Go deliberately waits until the fifth retry to avoid alerting on
+	// users who answer right after the first "Hello?". Its proxy for "any
+	// audio frame ever received" is the first-AUDIBLE-frame mark
+	// (AudioSourceProcessor only marks it above a magnitude threshold), and
+	// "more than the bot in the room" is callStatsTracker's current-presence
+	// flag. The exact retry check keeps this naturally once per call.
+	if count == deadMicSentryIdleRetry && p.taskCtx.callStats.FirstUserAudioFrameAt().IsZero() && p.taskCtx.callStats.Present() {
 		p.taskCtx.Logger.Println("User is idle, no audio frames received")
 		captureDeadMicSentry(sentryutil.Event{
 			Hub:     p.taskCtx.SentryHub(),

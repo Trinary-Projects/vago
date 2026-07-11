@@ -151,11 +151,11 @@ func withCapturedDeadMicSentry(t *testing.T) *[]sentryutil.Event {
 	return captured
 }
 
-// TestUserIdle_DeadMicSentryOnFirstFire verifies the Python parity dead-mic
-// alert (base_pipeline_manager.py:153-157): on the FIRST idle fire, if no
-// audible audio frame was ever received AND the user is currently present,
-// Sentry is captured exactly once with Python's exact message.
-func TestUserIdle_DeadMicSentryOnFirstFire(t *testing.T) {
+// TestUserIdle_DeadMicSentryOnFifthFire verifies the dead-mic alert is
+// deferred until the configured retry, if no audible audio frame was ever
+// received AND the user is currently present. This intentionally differs from
+// Python's first-retry capture because first-idle was too noisy in production.
+func TestUserIdle_DeadMicSentryOnFifthFire(t *testing.T) {
 	fix := newTestFixture(t)
 	stats := newCallStatsTracker()
 	stats.MarkUserJoined(time.Now())
@@ -164,9 +164,18 @@ func TestUserIdle_DeadMicSentryOnFirstFire(t *testing.T) {
 	captured := withCapturedDeadMicSentry(t)
 
 	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+
+	if len(*captured) != 0 {
+		t.Fatalf("expected no Sentry capture before fifth fire, got %d", len(*captured))
+	}
+
+	p.onIdleTimeout()
 
 	if len(*captured) != 1 {
-		t.Fatalf("expected 1 Sentry capture on first fire, got %d", len(*captured))
+		t.Fatalf("expected 1 Sentry capture on fifth fire, got %d", len(*captured))
 	}
 	if got := (*captured)[0].Message; got != "No audio frames received after user idle timeout, try reconnecting" {
 		t.Errorf("capture message = %q", got)
@@ -175,12 +184,11 @@ func TestUserIdle_DeadMicSentryOnFirstFire(t *testing.T) {
 		t.Errorf("capture tag operation = %q, want user_idle_no_audio", got)
 	}
 
-	// Second fire must NOT capture again — Python's condition is retry<=1
-	// only, and count is monotonically increasing so this is naturally
-	// once per call.
+	// Later fires must NOT capture again: the exact retry check and monotonic
+	// counter make this naturally once per call.
 	p.onIdleTimeout()
 	if len(*captured) != 1 {
-		t.Errorf("expected still 1 Sentry capture after second fire, got %d", len(*captured))
+		t.Errorf("expected still 1 Sentry capture after later fire, got %d", len(*captured))
 	}
 }
 
@@ -220,6 +228,10 @@ func TestUserIdle_NoDeadMicSentryWhenAudioReceived(t *testing.T) {
 	captured := withCapturedDeadMicSentry(t)
 
 	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
 
 	if len(*captured) != 0 {
 		t.Errorf("expected no Sentry capture when audio was received, got %d", len(*captured))
@@ -235,6 +247,10 @@ func TestUserIdle_NoDeadMicSentryWhenUserNotPresent(t *testing.T) {
 	p := NewUserIdleProcessor(fix.TaskCtx)
 	captured := withCapturedDeadMicSentry(t)
 
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
+	p.onIdleTimeout()
 	p.onIdleTimeout()
 
 	if len(*captured) != 0 {
