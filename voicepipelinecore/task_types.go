@@ -55,7 +55,12 @@ const (
 	EndReasonTalkTimeExhausted EndReason = "talk_time_exhausted"
 	EndReasonClientDisconnect  EndReason = "client_disconnected"
 	EndReasonUserIdle          EndReason = "user_idle"
-	EndReasonError             EndReason = "error"
+	// EndReasonIdleTimeout is the 120s no-activity watchdog end (see
+	// UserIdleProcessor.runCancelWatchdog). Kept distinct from
+	// EndReasonUserIdle so it maps to a null Disha end_reason, matching
+	// Python's unlabeled Pipecat cancel_on_idle_timeout.
+	EndReasonIdleTimeout EndReason = "idle_timeout"
+	EndReasonError       EndReason = "error"
 )
 
 func normalizeEndReason(reason EndReason) EndReason {

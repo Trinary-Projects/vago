@@ -380,10 +380,11 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
 	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
 
-	// Onboarding is Daily-only in practice (LiveKit is not wired for this
-	// bot type), so the LiveKit branch is left unchanged/unused here — the
-	// EndOnParticipantLeft=false rejoin policy only applies to the Daily
-	// path, mirroring Python's Daily-only base_pipeline_manager.
+	// Onboarding ends the call when the participant leaves, like
+	// sales/follow-up — a deliberate delta from Python's rejoin-tolerant
+	// onboarding (see AGENTS.md session-cleanup triggers). Onboarding is
+	// Daily-only in practice, so the LiveKit branch below is left
+	// unchanged/unused.
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {
 		room, err = voicepipelinecore.JoinDailyRoom(req.RoomURL, req.RoomToken, taskCtx, audioSource, voicepipelinecore.DailyRoomOptions{EndOnParticipantLeft: true})
