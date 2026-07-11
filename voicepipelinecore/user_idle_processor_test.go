@@ -206,7 +206,11 @@ func TestUserIdle_DeadMicSentryCarriesTaskHub(t *testing.T) {
 	p := NewUserIdleProcessor(fix.TaskCtx)
 	captured := withCapturedDeadMicSentry(t)
 
-	p.onIdleTimeout()
+	// The alert fires on the deadMicSentryIdleRetry-th idle fire (post
+	// PR-#16 threshold bump), so drive the counter all the way there.
+	for i := 0; i < deadMicSentryIdleRetry; i++ {
+		p.onIdleTimeout()
+	}
 
 	if len(*captured) != 1 {
 		t.Fatalf("expected 1 Sentry capture, got %d", len(*captured))
