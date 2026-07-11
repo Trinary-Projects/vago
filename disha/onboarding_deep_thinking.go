@@ -23,7 +23,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 	"github.com/jaideep329/talk-go/voicepipelinecore/llmrouter"
@@ -60,12 +59,14 @@ type OnboardingDeepThinkingManager struct {
 	patientInfo    string
 	promptKey      string
 
-	// Late-bound UI + Sentry hub (Python's set_infrastructure pattern,
-	// mirroring the stage tracker): nil-safe, RTVI sends/hub-scoped
-	// captures are skipped/fall back to global until wired.
+	// Late-bound UI (Python's set_infrastructure pattern, mirroring the
+	// stage tracker): nil-safe, RTVI sends are skipped until wired. The
+	// task-scoped Sentry hub is wired separately via the embedded
+	// taskSentryHub.
 	infraMu sync.Mutex
 	ui      serverMessageEmitter
-	hub     *sentry.Hub
+
+	taskSentryHub
 }
 
 func NewOnboardingDeepThinkingManager(
@@ -104,25 +105,6 @@ func (m *OnboardingDeepThinkingManager) getUI() serverMessageEmitter {
 	return m.ui
 }
 
-// SetSentryHub injects the task-scoped Sentry hub (sentry-task-hub),
-// called alongside SetUI once NewPipelineTask exists. nil is safe and
-// falls back to global capture, which covers any call in the window
-// before this is wired.
-func (m *OnboardingDeepThinkingManager) SetSentryHub(hub *sentry.Hub) {
-	if m == nil {
-		return
-	}
-	m.infraMu.Lock()
-	defer m.infraMu.Unlock()
-	m.hub = hub
-}
-
-func (m *OnboardingDeepThinkingManager) getHub() *sentry.Hub {
-	m.infraMu.Lock()
-	defer m.infraMu.Unlock()
-	return m.hub
-}
-
 // RunBlocking runs every Blocking==true deep-thinking config for the
 // stage being entered concurrently, waits for all of them, and merges
 // their results in config-list order (later configs win key
@@ -157,7 +139,7 @@ func (m *OnboardingDeepThinkingManager) RunBlocking(ctx context.Context, stage *
 			if err != nil {
 				m.logf("%s BLOCKING error stage=%s prompt=%s: %v", deepThinkingLogPrefix, stageName, dt.Prompt.Name, err)
 				sentryutil.Capture(sentryutil.Event{
-					Hub: m.getHub(),
+					Hub: m.sentryHub(),
 					Err: err,
 					Tags: map[string]string{
 						"component": "disha_onboarding",
@@ -225,7 +207,7 @@ func (m *OnboardingDeepThinkingManager) runNonBlockingOne(ctx context.Context, d
 		m.logf("%s NON-BLOCKING error stage=%s prompt=%s: %v", deepThinkingLogPrefix, stageName, dt.Prompt.Name, err)
 		m.sendRTVI(fmt.Sprintf("Error in non-blocking DT %s: %s", stageName, runePrefix(err.Error(), 50)))
 		sentryutil.Capture(sentryutil.Event{
-			Hub: m.getHub(),
+			Hub: m.sentryHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -334,7 +316,7 @@ func parseDeepThinkingOutput(raw, promptName string, onInvalidObject func(cleane
 func (m *OnboardingDeepThinkingManager) reportInvalidOutput(stageName string) func(cleaned string) {
 	return func(cleaned string) {
 		sentryutil.Capture(sentryutil.Event{
-			Hub:     m.getHub(),
+			Hub:     m.sentryHub(),
 			Message: "deep thinking output is valid JSON but not an object",
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -373,7 +355,7 @@ func (m *OnboardingDeepThinkingManager) recoverToSentry(operation, stageName str
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	m.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
-		Hub: m.getHub(),
+		Hub: m.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",

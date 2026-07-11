@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
@@ -76,15 +75,17 @@ type OnboardingStageTracker struct {
 	patientInfo    string
 
 	// Late-bound infrastructure (Python's set_infrastructure pattern):
-	// the aggregator pair, UI emitter, and task-scoped Sentry hub only
-	// exist after NewPipelineTask, but the tracker must exist before it
-	// (the CallEvents mapping is consumed at NewPipelineTask time).
-	// Methods firing before SetInfrastructure no-op safely.
+	// the aggregator pair and UI emitter only exist after
+	// NewPipelineTask, but the tracker must exist before it (the
+	// CallEvents mapping is consumed at NewPipelineTask time). Methods
+	// firing before SetInfrastructure no-op safely. The task-scoped
+	// Sentry hub is wired separately via the embedded taskSentryHub.
 	infraMu sync.Mutex
 	ctx     context.Context
 	pair    *voicepipelinecore.ContextAggregatorPair
 	ui      serverMessageEmitter
-	hub     *sentry.Hub
+
+	taskSentryHub
 
 	// transitionMu is Python's _transition_lock: serializes the
 	// stale-check + processTransition critical section.
@@ -119,10 +120,9 @@ func NewOnboardingStageTracker(
 
 // SetInfrastructure injects the late-bound pieces before task assembly
 // completes: the task context (goroutine lifetime), the aggregator pair
-// (transcript source), the RTVI emitter, and the task-scoped Sentry hub
-// (sentry-task-hub; nil hub is safe and falls back to global capture,
-// which covers any call in the window before this is wired).
-func (t *OnboardingStageTracker) SetInfrastructure(ctx context.Context, pair *voicepipelinecore.ContextAggregatorPair, ui serverMessageEmitter, hub *sentry.Hub) {
+// (transcript source), and the RTVI emitter. The task-scoped Sentry hub
+// is wired separately via the embedded taskSentryHub.SetSentryHub.
+func (t *OnboardingStageTracker) SetInfrastructure(ctx context.Context, pair *voicepipelinecore.ContextAggregatorPair, ui serverMessageEmitter) {
 	if t == nil {
 		return
 	}
@@ -131,21 +131,12 @@ func (t *OnboardingStageTracker) SetInfrastructure(ctx context.Context, pair *vo
 	t.ctx = ctx
 	t.pair = pair
 	t.ui = ui
-	t.hub = hub
 }
 
 func (t *OnboardingStageTracker) infrastructure() (context.Context, *voicepipelinecore.ContextAggregatorPair, serverMessageEmitter) {
 	t.infraMu.Lock()
 	defer t.infraMu.Unlock()
 	return t.ctx, t.pair, t.ui
-}
-
-// getHub returns the late-bound task-scoped Sentry hub (nil before
-// SetInfrastructure runs).
-func (t *OnboardingStageTracker) getHub() *sentry.Hub {
-	t.infraMu.Lock()
-	defer t.infraMu.Unlock()
-	return t.hub
 }
 
 // OnLLMCallCompleted is the CallEvents.OnLLMCallCompleted hook: the Go
@@ -233,7 +224,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, full
 		var cfgErr *StageTransitionConfigError
 		if errors.As(err, &cfgErr) {
 			sentryutil.Capture(sentryutil.Event{
-				Hub:     t.getHub(),
+				Hub:     t.sentryHub(),
 				Message: cfgErr.Error(),
 				Tags: map[string]string{
 					"conversation_id": t.conversationID,
@@ -358,7 +349,7 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 
 	if !stringSet(allowedNextStages)[output] {
 		sentryutil.Capture(sentryutil.Event{
-			Hub:     t.getHub(),
+			Hub:     t.sentryHub(),
 			Message: "Invalid stage transition tracker output",
 			Tags: map[string]string{
 				"conversation_id": t.conversationID,
@@ -400,7 +391,7 @@ func (t *OnboardingStageTracker) reportRunError(ctx context.Context, currentStag
 	t.sendRTVI(fmt.Sprintf("%s Error for stage=%s: %s",
 		stageTrackerLogPrefix, currentStageName, runePrefix(err.Error(), 80)))
 	sentryutil.Capture(sentryutil.Event{
-		Hub: t.getHub(),
+		Hub: t.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",
@@ -422,7 +413,7 @@ func (t *OnboardingStageTracker) recoverToSentry(operation string) {
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	t.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
-		Hub: t.getHub(),
+		Hub: t.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",

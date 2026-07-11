@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 	"github.com/jaideep329/talk-go/voicepipelinecore/llmrouter"
@@ -32,12 +31,14 @@ type OnboardingCarePlanManager struct {
 	conversationID string
 	patientInfo    string
 
-	// Late-bound UI + Sentry hub (same nil-safe pattern as the
-	// tracker/stage manager/DT manager): RTVI sends/hub-scoped captures
-	// are skipped/fall back to global until wired.
+	// Late-bound UI (same nil-safe pattern as the tracker/stage
+	// manager/DT manager): RTVI sends are skipped until wired. The
+	// task-scoped Sentry hub is wired separately via the embedded
+	// taskSentryHub.
 	infraMu sync.Mutex
 	ui      serverMessageEmitter
-	hub     *sentry.Hub
+
+	taskSentryHub
 }
 
 func NewOnboardingCarePlanManager(
@@ -74,25 +75,6 @@ func (m *OnboardingCarePlanManager) getUI() serverMessageEmitter {
 	m.infraMu.Lock()
 	defer m.infraMu.Unlock()
 	return m.ui
-}
-
-// SetSentryHub injects the task-scoped Sentry hub (sentry-task-hub),
-// called alongside SetUI once NewPipelineTask exists. nil is safe and
-// falls back to global capture, which covers any call in the window
-// before this is wired.
-func (m *OnboardingCarePlanManager) SetSentryHub(hub *sentry.Hub) {
-	if m == nil {
-		return
-	}
-	m.infraMu.Lock()
-	defer m.infraMu.Unlock()
-	m.hub = hub
-}
-
-func (m *OnboardingCarePlanManager) getHub() *sentry.Hub {
-	m.infraMu.Lock()
-	defer m.infraMu.Unlock()
-	return m.hub
 }
 
 // careplanSwitcherUsecaseType matches Python's care-plan-switcher LLM
@@ -155,7 +137,7 @@ func (m *OnboardingCarePlanManager) Detect(ctx context.Context, transcript strin
 	detected, err := parseCareplanOutput(out.String())
 	if err != nil {
 		sentryutil.Capture(sentryutil.Event{
-			Hub: m.getHub(),
+			Hub: m.sentryHub(),
 			Err: fmt.Errorf("disha: care plan detection parse failed: %w", err),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -213,7 +195,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 	}
 	if plan == nil {
 		sentryutil.Capture(sentryutil.Event{
-			Hub:     m.getHub(),
+			Hub:     m.sentryHub(),
 			Message: "care plan not found, proceeding without selection",
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -245,7 +227,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 			// Residual failure (API + enqueue fallback both failed) never
 			// fails activation — Python parity.
 			sentryutil.Capture(sentryutil.Event{
-				Hub: m.getHub(),
+				Hub: m.sentryHub(),
 				Err: fmt.Errorf("disha: set_user_careplan failed: %w", err),
 				Tags: map[string]string{
 					"component": "disha_onboarding",

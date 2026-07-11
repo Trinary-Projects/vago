@@ -84,7 +84,7 @@ func TestStageManagerInvalidStage(t *testing.T) {
 // --- Invalid stage Sentry capture routes through the late-bound hub ---
 
 // TestStageManagerInvalidStageSentryRoutesThroughHub proves the
-// sentry-task-hub wiring: SetInfrastructure's hub argument (harness
+// sentry-task-hub wiring: the hub injected via SetSentryHub (harness
 // stand-in for taskCtx.SentryHub()) is what the manager's
 // sentryutil.Capture calls actually use, not the process-global hub.
 // A tag set on the hub's own scope (mirroring what NewTaskHub would set

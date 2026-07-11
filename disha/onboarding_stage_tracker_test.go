@@ -226,8 +226,10 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 		stageTestUserID, stageTestConversationID, promptKey)
 	tracker := NewOnboardingStageTracker(state, cfg, deps.Documents, manager, classifier, logger,
 		stageTestUserID, stageTestConversationID, stageTestPatientInfo)
-	manager.SetInfrastructure(pair, routerMeta, ui, hub)
-	tracker.SetInfrastructure(context.Background(), pair, ui, hub)
+	manager.SetInfrastructure(pair, routerMeta, ui)
+	tracker.SetInfrastructure(context.Background(), pair, ui)
+	manager.SetSentryHub(hub)
+	tracker.SetSentryHub(hub)
 
 	return &stageMachineHarness{
 		t:            t,
