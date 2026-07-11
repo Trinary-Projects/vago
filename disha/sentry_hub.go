@@ -6,11 +6,11 @@ import (
 	"github.com/getsentry/sentry-go"
 )
 
-// taskSentryHub is the late-bound task-scoped Sentry hub shared by the
-// onboarding managers via embedding (stage manager, stage tracker, deep
-// thinking manager, careplan manager). It is set once at BuildTask wiring
-// time (taskCtx.SentryHub(), sentry-task-hub) and read on every Sentry
-// capture path inside those managers. atomic.Pointer needs no mutex.
+// taskSentryHub is the late-bound task-scoped Sentry hub, embedded by any
+// disha component that captures Sentry events during a live task (today:
+// the onboarding stage manager/tracker, deep-thinking and careplan
+// managers). Set once at BuildTask wiring time (taskCtx.SentryHub()) and
+// read on every capture path. atomic.Pointer needs no mutex.
 // sentryHub() returns nil until wired — sentryutil.Capture treats a nil
 // Event.Hub as "use the global hub", which is safe for any call in the
 // window before this is wired.
