@@ -219,6 +219,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, full
 		PatientInfo:             t.patientInfo,
 		DocumentName:            currentStage.Prompt.Name,
 		DocumentVersion:         documentVersion,
+		Hub:                     t.sentryHub(),
 	})
 	if err != nil {
 		var cfgErr *StageTransitionConfigError

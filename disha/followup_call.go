@@ -327,7 +327,7 @@ func registerFollowUpTools(llm *voicepipelinecore.LLMProcessor, task *voicepipel
 		case "get_guidance":
 			llm.RegisterTool(def, func(ctx context.Context, req voicepipelinecore.ToolCallRequest) (voicepipelinecore.ToolCallResponse, error) {
 				situation, _ := req.Arguments["situation"].(string)
-				text, err := getFollowUpGuidance(ctx, deps, pl, situation)
+				text, err := getFollowUpGuidance(ctx, task.TaskCtx, deps, pl, situation)
 				if err != nil {
 					return voicepipelinecore.ToolCallResponse{}, err
 				}
@@ -339,7 +339,7 @@ func registerFollowUpTools(llm *voicepipelinecore.LLMProcessor, task *voicepipel
 	}
 }
 
-func getFollowUpGuidance(ctx context.Context, deps Deps, pl *followUpPlan, situation string) (string, error) {
+func getFollowUpGuidance(ctx context.Context, taskCtx *voicepipelinecore.TaskContext, deps Deps, pl *followUpPlan, situation string) (string, error) {
 	if strings.TrimSpace(situation) == "" {
 		situation = "No situation provided."
 	}
@@ -372,12 +372,12 @@ func getFollowUpGuidance(ctx context.Context, deps Deps, pl *followUpPlan, situa
 	var b strings.Builder
 	_, err = client.Stream(ctx, req, func(token string) { b.WriteString(token) })
 	if err != nil {
-		reportGuidanceLLMFailure(pl, err)
+		reportGuidanceLLMFailure(taskCtx, pl, err)
 		return "", err
 	}
 	if strings.TrimSpace(b.String()) == "" {
 		err = errors.New("disha: get_guidance returned empty response")
-		reportGuidanceLLMFailure(pl, err)
+		reportGuidanceLLMFailure(taskCtx, pl, err)
 		return "", err
 	}
 	return b.String(), nil
@@ -394,11 +394,12 @@ func followUpGuidancePromptVariables(pl *followUpPlan, situation string) Documen
 // guidance router has no in-call failover (unlike Python's
 // generate_llm_response_with_failover), so a failed call must be visible.
 // Context cancellation just means the call ended mid-tool — not an error.
-func reportGuidanceLLMFailure(pl *followUpPlan, err error) {
+func reportGuidanceLLMFailure(taskCtx *voicepipelinecore.TaskContext, pl *followUpPlan, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
 	sentryutil.Capture(sentryutil.Event{
+		Hub: taskCtx.SentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_followup",
