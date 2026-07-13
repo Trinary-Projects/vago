@@ -159,6 +159,11 @@ type StageTransitionEvalConfig struct {
 	PatientInfo             string
 	DocumentName            string
 	DocumentVersion         any
+	// Hub is the caller's task-scoped Sentry hub (sentry-task-hub), passed
+	// through to the best-effort long-trigger-statement capture below. The
+	// matcher is a pure-function layer with no task context of its own;
+	// nil is safe and falls back to the global hub (sentryutil semantics).
+	Hub *sentry.Hub
 }
 
 // EvaluateStageTransitionFromConfig mirrors Python's
@@ -177,7 +182,7 @@ func EvaluateStageTransitionFromConfig(cfg StageTransitionEvalConfig) (*StageTra
 	}
 	configID := cfg.StagePromptConfig["id"]
 
-	reportLongStageTransitionTriggers(stageTransitions, cfg.DocumentName, documentVersion, configID)
+	reportLongStageTransitionTriggers(cfg.Hub, stageTransitions, cfg.DocumentName, documentVersion, configID)
 
 	if len(stageTransitions) == 0 {
 		return nil, &StageTransitionConfigError{Msg: "next_stages config has no valid trigger statements"}
@@ -367,17 +372,18 @@ var (
 
 // reportLongStageTransitionTriggers mirrors Python's
 // `_report_long_stage_transition_triggers`: best-effort, must never break
-// evaluation.
-func reportLongStageTransitionTriggers(stageTransitions []StageTransition, documentName string, documentVersion any, configID any) {
+// evaluation. hub is the caller's task-scoped Sentry hub (nil falls back to
+// the global hub, per sentryutil.Capture semantics).
+func reportLongStageTransitionTriggers(hub *sentry.Hub, stageTransitions []StageTransition, documentName string, documentVersion any, configID any) {
 	defer func() {
 		// Reporting failures (including a panic from a pathological
 		// documentVersion type) must never break evaluation.
 		_ = recover()
 	}()
-	captureLongStageTransitionTriggers(stageTransitions, documentName, documentVersion, configID)
+	captureLongStageTransitionTriggers(hub, stageTransitions, documentName, documentVersion, configID)
 }
 
-func captureLongStageTransitionTriggers(stageTransitions []StageTransition, documentName string, documentVersion any, configID any) {
+func captureLongStageTransitionTriggers(hub *sentry.Hub, stageTransitions []StageTransition, documentName string, documentVersion any, configID any) {
 	if documentName == "" {
 		return
 	}
@@ -413,6 +419,7 @@ func captureLongStageTransitionTriggers(stageTransitions []StageTransition, docu
 			}
 
 			sentryutil.Capture(sentryutil.Event{
+				Hub:     hub,
 				Message: "Long onboarding stage transition trigger statement",
 				Level:   sentry.LevelInfo,
 				Tags: map[string]string{

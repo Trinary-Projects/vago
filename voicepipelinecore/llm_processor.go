@@ -366,6 +366,7 @@ func (p *LLMProcessor) reportToolResultError(functionName, toolCallID string, er
 	}
 	p.PushError(fmt.Sprintf("tool %q returned empty result", functionName), false)
 	sentryutil.Capture(sentryutil.Event{
+		Hub: p.taskCtx.SentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "llm",

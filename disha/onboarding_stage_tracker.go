@@ -75,14 +75,17 @@ type OnboardingStageTracker struct {
 	patientInfo    string
 
 	// Late-bound infrastructure (Python's set_infrastructure pattern):
-	// the aggregator pair and UI emitter only exist after NewPipelineTask,
-	// but the tracker must exist before it (the CallEvents mapping is
-	// consumed at NewPipelineTask time). Methods firing before
-	// SetInfrastructure no-op safely.
+	// the aggregator pair and UI emitter only exist after
+	// NewPipelineTask, but the tracker must exist before it (the
+	// CallEvents mapping is consumed at NewPipelineTask time). Methods
+	// firing before SetInfrastructure no-op safely. The task-scoped
+	// Sentry hub is wired separately via the embedded taskSentryHub.
 	infraMu sync.Mutex
 	ctx     context.Context
 	pair    *voicepipelinecore.ContextAggregatorPair
 	ui      serverMessageEmitter
+
+	taskSentryHub
 
 	// transitionMu is Python's _transition_lock: serializes the
 	// stale-check + processTransition critical section.
@@ -117,7 +120,8 @@ func NewOnboardingStageTracker(
 
 // SetInfrastructure injects the late-bound pieces before task assembly
 // completes: the task context (goroutine lifetime), the aggregator pair
-// (transcript source), and the RTVI emitter.
+// (transcript source), and the RTVI emitter. The task-scoped Sentry hub
+// is wired separately via the embedded taskSentryHub.SetSentryHub.
 func (t *OnboardingStageTracker) SetInfrastructure(ctx context.Context, pair *voicepipelinecore.ContextAggregatorPair, ui serverMessageEmitter) {
 	if t == nil {
 		return
@@ -215,11 +219,13 @@ func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, full
 		PatientInfo:             t.patientInfo,
 		DocumentName:            currentStage.Prompt.Name,
 		DocumentVersion:         documentVersion,
+		Hub:                     t.sentryHub(),
 	})
 	if err != nil {
 		var cfgErr *StageTransitionConfigError
 		if errors.As(err, &cfgErr) {
 			sentryutil.Capture(sentryutil.Event{
+				Hub:     t.sentryHub(),
 				Message: cfgErr.Error(),
 				Tags: map[string]string{
 					"conversation_id": t.conversationID,
@@ -344,6 +350,7 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 
 	if !stringSet(allowedNextStages)[output] {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     t.sentryHub(),
 			Message: "Invalid stage transition tracker output",
 			Tags: map[string]string{
 				"conversation_id": t.conversationID,
@@ -385,6 +392,7 @@ func (t *OnboardingStageTracker) reportRunError(ctx context.Context, currentStag
 	t.sendRTVI(fmt.Sprintf("%s Error for stage=%s: %s",
 		stageTrackerLogPrefix, currentStageName, runePrefix(err.Error(), 80)))
 	sentryutil.Capture(sentryutil.Event{
+		Hub: t.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",
@@ -406,6 +414,7 @@ func (t *OnboardingStageTracker) recoverToSentry(operation string) {
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	t.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
+		Hub: t.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",

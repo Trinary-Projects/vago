@@ -266,6 +266,7 @@ func (s *STTProcessor) handleConnectExhausted(err error) {
 	}
 	wrapped := fmt.Errorf("Soniox connection failed after %d attempts: %w", len(sttConnectRetryDelays)+1, err)
 	sentryutil.Capture(sentryutil.Event{
+		Hub:  s.taskCtx.SentryHub(),
 		Err:  wrapped,
 		Tags: map[string]string{"component": "stt", "provider": "soniox"},
 	})

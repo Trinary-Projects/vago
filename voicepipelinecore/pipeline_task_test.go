@@ -6,6 +6,8 @@ import (
 	"log"
 	"testing"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
 
 func TestPipelineTaskRunCleanupCallsOnCallEndedWithStats(t *testing.T) {
@@ -97,5 +99,48 @@ func TestPipelineTaskEndCanQueueBeforePipelineAttached(t *testing.T) {
 	task.Cancel()
 	if err := waitForWG(&task.wg, 2*time.Second); err != nil {
 		t.Fatalf("waitForWG: %v", err)
+	}
+}
+
+// TestNewPipelineTaskBuildsSentryHubWithTags proves the sentry-task-hub
+// wiring at the constructor boundary: TaskConfig.SentryTags (pure data,
+// set by the bot — e.g. conversation_id/user_id/bot_type) must land on
+// TaskContext.SentryHub()'s scope, so every core capture site that
+// passes that hub as sentryutil.Event.Hub gets this call's identity
+// tags instead of the process-global hub's.
+func TestNewPipelineTaskBuildsSentryHubWithTags(t *testing.T) {
+	transport := &sentry.MockTransport{}
+	client, err := sentry.NewClient(sentry.ClientOptions{Transport: transport})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	original := sentry.CurrentHub().Client()
+	sentry.CurrentHub().BindClient(client)
+	t.Cleanup(func() { sentry.CurrentHub().BindClient(original) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tags := map[string]string{"conversation_id": "conv-123", "bot_type": "onboarding_call"}
+	task, err := NewPipelineTask(ctx, TaskConfig{
+		Logger:     log.New(io.Discard, "", 0),
+		SentryTags: tags,
+	})
+	if err != nil {
+		t.Fatalf("NewPipelineTask: %v", err)
+	}
+
+	hub := task.TaskCtx.SentryHub()
+	if hub == nil {
+		t.Fatal("expected non-nil SentryHub")
+	}
+
+	hub.CaptureMessage("task hub smoke test")
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Tags["conversation_id"] != "conv-123" || events[0].Tags["bot_type"] != "onboarding_call" {
+		t.Fatalf("expected SentryTags on captured event, got %v", events[0].Tags)
 	}
 }

@@ -124,6 +124,11 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 		Logger:     pl.Startup.Logger,
 		SessionID:  pl.Startup.ConversationID,
 		CallEvents: pl.Callbacks.Events(),
+		SentryTags: map[string]string{
+			"conversation_id": pl.Startup.ConversationID,
+			"user_id":         pl.Startup.UserID,
+			"bot_type":        SalesCallBotType,
+		},
 	})
 	if err != nil {
 		return nil, err

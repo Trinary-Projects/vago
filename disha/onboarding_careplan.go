@@ -31,10 +31,14 @@ type OnboardingCarePlanManager struct {
 	conversationID string
 	patientInfo    string
 
-	// Late-bound UI (same nil-safe pattern as the tracker/stage manager/DT
-	// manager): RTVI sends are skipped until wired.
+	// Late-bound UI (same nil-safe pattern as the tracker/stage
+	// manager/DT manager): RTVI sends are skipped until wired. The
+	// task-scoped Sentry hub is wired separately via the embedded
+	// taskSentryHub.
 	infraMu sync.Mutex
 	ui      serverMessageEmitter
+
+	taskSentryHub
 }
 
 func NewOnboardingCarePlanManager(
@@ -133,6 +137,7 @@ func (m *OnboardingCarePlanManager) Detect(ctx context.Context, transcript strin
 	detected, err := parseCareplanOutput(out.String())
 	if err != nil {
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.sentryHub(),
 			Err: fmt.Errorf("disha: care plan detection parse failed: %w", err),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -190,6 +195,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 	}
 	if plan == nil {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.sentryHub(),
 			Message: "care plan not found, proceeding without selection",
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -221,6 +227,7 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 			// Residual failure (API + enqueue fallback both failed) never
 			// fails activation — Python parity.
 			sentryutil.Capture(sentryutil.Event{
+				Hub: m.sentryHub(),
 				Err: fmt.Errorf("disha: set_user_careplan failed: %w", err),
 				Tags: map[string]string{
 					"component": "disha_onboarding",
@@ -260,6 +267,12 @@ func (m *OnboardingCarePlanManager) sendRTVI(message string) {
 // careplan JSON mid-object in prod (parse failure -> "unknown"
 // fallback). Python sends no cap; 4000 mirrors the deep-thinking
 // ceiling, ~8x the observed ~220-token average completion.
+//
+// Like newDeepThinkingClientFactory, this closure is built in
+// onboarding_call.go BuildTask before NewPipelineTask exists, so its
+// construction-failure capture below has no lexical path to the
+// manager's late-bound Sentry hub (sentry-task-hub) and deliberately
+// stays on the global hub.
 func newCarePlanClientFactory(deps Deps, logger *log.Logger, userID, conversationID string) deepThinkingClientFactory {
 	maxTokens := 4000
 	return func(promptMetadata map[string]any, usecaseType string) voicepipelinecore.LLMClient {

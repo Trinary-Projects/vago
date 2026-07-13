@@ -24,6 +24,7 @@ func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, m
 			taskCtx.Logger.Println(errEmptyInitialMessages)
 		}
 		sentryutil.Capture(sentryutil.Event{
+			Hub: taskCtx.SentryHub(),
 			Err: errEmptyInitialMessages,
 			Tags: map[string]string{
 				"component": "aggregator_pair",

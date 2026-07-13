@@ -138,6 +138,7 @@ func JoinDailyRoom(roomURL, token string, taskCtx *TaskContext, audioSource *Aud
 	}
 	err := fmt.Errorf("failed to join Daily room after %d attempts: %w", dailyJoinRetries, lastErr)
 	sentryutil.Capture(sentryutil.Event{
+		Hub:  taskCtx.SentryHub(),
 		Err:  err,
 		Tags: map[string]string{"component": "daily", "operation": "join"},
 		Details: map[string]any{
@@ -223,6 +224,7 @@ func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskC
 		if !room.closed.Load() && room.joined.Load() && !room.dead.Load() {
 			room.log("[%s] Daily bridge process exited after join; ending call", room.roomName)
 			sentryutil.Capture(sentryutil.Event{
+				Hub:  room.taskCtx.SentryHub(),
 				Err:  errors.New("daily bridge process exited after join"),
 				Tags: map[string]string{"component": "daily", "operation": "bridge_exit"},
 				Details: map[string]any{
@@ -346,6 +348,7 @@ func (r *DailyRoom) writeCommandAllowClosed(cmd dailyBridgeCommand, allowClosed 
 	if err != nil && (errors.Is(err, os.ErrDeadlineExceeded) || os.IsTimeout(err)) && r.dead.CompareAndSwap(false, true) {
 		r.log("[%s] Daily bridge stdin write timed out after %s; declaring bridge dead", r.roomName, dailyBridgeWriteTimeout)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "daily", "operation": "bridge_write_timeout"},
 			Details: map[string]any{
@@ -457,6 +460,7 @@ func (r *DailyRoom) handleEvent(event dailyBridgeEvent) {
 		r.log("[%s] %s", r.roomName, message)
 		err := errors.New(message)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "daily", "operation": "bridge_event"},
 			Details: map[string]any{
@@ -504,6 +508,7 @@ func (r *DailyRoom) sendLegacyPong() {
 	if err := r.SendAppMessage(map[string]any{"type": "pong"}); err != nil {
 		r.log("[%s] Daily pong publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "daily", "operation": "legacy_pong"},
 		})
@@ -524,6 +529,7 @@ func (r *DailyRoom) sendRTVIServerResponse(id, messageType string, data any) {
 	if err := r.SendAppMessage(resp); err != nil {
 		r.log("[%s] RTVI server-response publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "daily", "operation": "rtvi_server_response"},
 			Details: map[string]any{
@@ -550,6 +556,7 @@ func (r *DailyRoom) sendRTVIBotReady(id string) {
 	if err := r.SendAppMessage(msg); err != nil {
 		r.log("[%s] RTVI bot-ready publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "daily", "operation": "rtvi_bot_ready"},
 			Details: map[string]any{

@@ -105,6 +105,7 @@ func JoinLiveKitRoom(roomURL, roomName, token string, taskCtx *TaskContext, audi
 	}
 	err := fmt.Errorf("failed to join LiveKit room after %d attempts: %w", liveKitJoinRetries, lastErr)
 	sentryutil.Capture(sentryutil.Event{
+		Hub:  taskCtx.SentryHub(),
 		Err:  err,
 		Tags: map[string]string{"component": "livekit", "operation": "join"},
 		Details: map[string]any{
@@ -338,6 +339,7 @@ func (r *LiveKitRoom) ClearAudioBuffer() {
 	if err := r.resetOpusEncoderLocked(); err != nil {
 		r.log("[%s] LiveKit opus encoder reset error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "livekit", "operation": "opus_encoder_reset"},
 		})
@@ -392,6 +394,7 @@ func (r *LiveKitRoom) subscribeAudioTrack(track *webrtc.TrackRemote, p *lksdk.Re
 	if err != nil {
 		r.log("[%s] LiveKit audio track subscribe error participant=%q: %v", r.roomName, participantID, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "livekit", "operation": "track_subscribe"},
 			Details: map[string]any{
@@ -476,6 +479,7 @@ func (r *LiveKitRoom) sendLegacyPong() {
 	if err := r.SendAppMessage(map[string]any{"type": "pong"}); err != nil {
 		r.log("[%s] LiveKit pong publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "livekit", "operation": "legacy_pong"},
 		})
@@ -496,6 +500,7 @@ func (r *LiveKitRoom) sendRTVIServerResponse(id, messageType string, data any) {
 	if err := r.SendAppMessage(resp); err != nil {
 		r.log("[%s] RTVI server-response publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "livekit", "operation": "rtvi_server_response"},
 			Details: map[string]any{
@@ -522,6 +527,7 @@ func (r *LiveKitRoom) sendRTVIBotReady(id string) {
 	if err := r.SendAppMessage(msg); err != nil {
 		r.log("[%s] RTVI bot-ready publish error: %v", r.roomName, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub:  r.taskCtx.SentryHub(),
 			Err:  err,
 			Tags: map[string]string{"component": "livekit", "operation": "rtvi_bot_ready"},
 			Details: map[string]any{

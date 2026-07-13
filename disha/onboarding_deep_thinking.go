@@ -60,9 +60,13 @@ type OnboardingDeepThinkingManager struct {
 	promptKey      string
 
 	// Late-bound UI (Python's set_infrastructure pattern, mirroring the
-	// stage tracker): nil-safe, RTVI sends are skipped until wired.
+	// stage tracker): nil-safe, RTVI sends are skipped until wired. The
+	// task-scoped Sentry hub is wired separately via the embedded
+	// taskSentryHub.
 	infraMu sync.Mutex
 	ui      serverMessageEmitter
+
+	taskSentryHub
 }
 
 func NewOnboardingDeepThinkingManager(
@@ -135,6 +139,7 @@ func (m *OnboardingDeepThinkingManager) RunBlocking(ctx context.Context, stage *
 			if err != nil {
 				m.logf("%s BLOCKING error stage=%s prompt=%s: %v", deepThinkingLogPrefix, stageName, dt.Prompt.Name, err)
 				sentryutil.Capture(sentryutil.Event{
+					Hub: m.sentryHub(),
 					Err: err,
 					Tags: map[string]string{
 						"component": "disha_onboarding",
@@ -202,6 +207,7 @@ func (m *OnboardingDeepThinkingManager) runNonBlockingOne(ctx context.Context, d
 		m.logf("%s NON-BLOCKING error stage=%s prompt=%s: %v", deepThinkingLogPrefix, stageName, dt.Prompt.Name, err)
 		m.sendRTVI(fmt.Sprintf("Error in non-blocking DT %s: %s", stageName, runePrefix(err.Error(), 50)))
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.sentryHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -310,6 +316,7 @@ func parseDeepThinkingOutput(raw, promptName string, onInvalidObject func(cleane
 func (m *OnboardingDeepThinkingManager) reportInvalidOutput(stageName string) func(cleaned string) {
 	return func(cleaned string) {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.sentryHub(),
 			Message: "deep thinking output is valid JSON but not an object",
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -348,6 +355,7 @@ func (m *OnboardingDeepThinkingManager) recoverToSentry(operation, stageName str
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	m.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
+		Hub: m.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",
@@ -391,6 +399,12 @@ func isContextCancellation(ctx context.Context, err error) bool {
 // an unregistered pair key, which should not happen in practice) is
 // logged + Sentry-captured and yields a nil client; executeSingle then
 // treats the call as failed.
+//
+// This factory closure is built in onboarding_call.go BuildTask before
+// NewPipelineTask exists, so it has no lexical path to the manager's
+// late-bound Sentry hub (sentry-task-hub) even though it is invoked
+// later, per-call, from executeSingle. Deliberately left on the global
+// hub, the same carve-out as the plan()-time capture sites.
 func newDeepThinkingClientFactory(deps Deps, logger *log.Logger, userID, conversationID string) deepThinkingClientFactory {
 	temperature := 0.7
 	maxTokens := 4000

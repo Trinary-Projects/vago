@@ -48,11 +48,14 @@ type OnboardingStageManager struct {
 	// Late-bound infrastructure (Python's set_infrastructure): the
 	// aggregator pair, conversation router handle, and RTVI emitter only
 	// exist after NewPipelineTask. processTransition before
-	// SetInfrastructure no-ops safely.
+	// SetInfrastructure no-ops safely. The task-scoped Sentry hub is
+	// wired separately via the embedded taskSentryHub (SetSentryHub).
 	infraMu sync.Mutex
 	pair    *voicepipelinecore.ContextAggregatorPair
 	router  promptMetadataSetter
 	ui      serverMessageEmitter
+
+	taskSentryHub
 }
 
 func NewOnboardingStageManager(
@@ -83,7 +86,8 @@ func NewOnboardingStageManager(
 
 // SetInfrastructure injects the aggregator pair (ReplaceSystemMessage),
 // the conversation router handle (SetPromptMetadata refresh after
-// recompiles), and the RTVI emitter.
+// recompiles), and the RTVI emitter. The task-scoped Sentry hub is wired
+// separately via the embedded taskSentryHub.SetSentryHub.
 func (m *OnboardingStageManager) SetInfrastructure(pair *voicepipelinecore.ContextAggregatorPair, router promptMetadataSetter, ui serverMessageEmitter) {
 	if m == nil {
 		return
@@ -115,6 +119,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	currentName := m.state.CurrentStage().Name
 	if currentName != "" && strings.EqualFold(currentName, nextStageName) {
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.sentryHub(),
 			Message: "Redundant stage transition attempted",
 			Tags: map[string]string{
 				"current_agenda": currentName,
@@ -139,6 +144,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 			m.logf("disha: careplan detection failed for stage=%s: %v", nextStageName, err)
 			if !isContextCancellation(ctx, err) {
 				sentryutil.Capture(sentryutil.Event{
+					Hub: m.sentryHub(),
 					Err: fmt.Errorf("disha: careplan detection failed: %w", err),
 					Tags: map[string]string{
 						"component": "disha_onboarding",
@@ -160,6 +166,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	if nextStage == nil {
 		m.sendRTVI(fmt.Sprintf("[ERROR] Invalid stage: %s", nextStageName))
 		sentryutil.Capture(sentryutil.Event{
+			Hub:     m.sentryHub(),
 			Message: fmt.Sprintf("Invalid stage: %s", nextStageName),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -198,6 +205,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		// State has already advanced — Python has the same ordering
 		// (advance_stage before compile_and_apply) and does not roll back.
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.sentryHub(),
 			Err: fmt.Errorf("disha: stage transition prompt compile failed: %w", err),
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -266,6 +274,7 @@ func (m *OnboardingStageManager) onNonBlockingDTComplete(ctx context.Context) fu
 		compiled, err := m.compiler.CompileSystemPrompt(ctx, currentStage, m.state.VariableStoreSnapshot())
 		if err != nil {
 			sentryutil.Capture(sentryutil.Event{
+				Hub: m.sentryHub(),
 				Err: fmt.Errorf("disha: non-blocking DT recompile failed: %w", err),
 				Tags: map[string]string{
 					"component": "disha_onboarding",
@@ -320,6 +329,7 @@ func (m *OnboardingStageManager) persistAndTrack(fromStage, toStage, toolCallID 
 	if err != nil {
 		m.logf("disha: agenda analytics enqueue failed conversation=%s: %v", m.conversationID, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.sentryHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -365,6 +375,7 @@ func (m *OnboardingStageManager) enqueueStageTransitionTimingLog(fromStage, toSt
 	if err != nil {
 		m.logf("[STAGE_TRANSITION_LOG] %s => %s | Failed to persist: %v", fromStage, toStage, err)
 		sentryutil.Capture(sentryutil.Event{
+			Hub: m.sentryHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "disha_onboarding",
@@ -390,6 +401,7 @@ func (m *OnboardingStageManager) recoverToSentry(operation string) {
 	err := fmt.Errorf("disha: panic in %s: %v", operation, p)
 	m.logf("%v", err)
 	sentryutil.Capture(sentryutil.Event{
+		Hub: m.sentryHub(),
 		Err: err,
 		Tags: map[string]string{
 			"component": "disha_onboarding",

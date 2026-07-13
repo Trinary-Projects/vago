@@ -81,6 +81,37 @@ func TestStageManagerInvalidStage(t *testing.T) {
 	}
 }
 
+// --- Invalid stage Sentry capture routes through the late-bound hub ---
+
+// TestStageManagerInvalidStageSentryRoutesThroughHub proves the
+// sentry-task-hub wiring: the hub injected via SetSentryHub (harness
+// stand-in for taskCtx.SentryHub()) is what the manager's
+// sentryutil.Capture calls actually use, not the process-global hub.
+// A tag set on the hub's own scope (mirroring what NewTaskHub would set
+// from TaskConfig.SentryTags) must survive onto the captured event
+// alongside the call's own event-level tags.
+func TestStageManagerInvalidStageSentryRoutesThroughHub(t *testing.T) {
+	h := newStageMachineHarness(t, &stubStageClassifier{})
+	h.hub.Scope().SetTag("conversation_id", stageTestConversationID)
+
+	h.manager.processTransition(context.Background(), "ghost_stage", "stage_transition_tracker_x", "")
+
+	events := h.hubTransport.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event on the late-bound hub's transport, got %d", len(events))
+	}
+	event := events[0]
+	if event.Message != "Invalid stage: ghost_stage" {
+		t.Fatalf("event message = %q", event.Message)
+	}
+	if event.Tags["conversation_id"] != stageTestConversationID {
+		t.Fatalf("expected hub-scope tag to survive onto the captured event, got %v", event.Tags)
+	}
+	if event.Tags["operation"] != "stage_transition" {
+		t.Fatalf("expected event-level tag to also apply, got %v", event.Tags)
+	}
+}
+
 // --- Transition before SetInfrastructure no-ops safely ---
 
 func TestStageManagerNoInfrastructureNoOp(t *testing.T) {

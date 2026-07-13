@@ -137,6 +137,7 @@ func (p *UserIdleProcessor) onIdleTimeout() {
 	if count == deadMicSentryIdleRetry && p.taskCtx.callStats.FirstUserAudioFrameAt().IsZero() && p.taskCtx.callStats.Present() {
 		p.taskCtx.Logger.Println("User is idle, no audio frames received")
 		captureDeadMicSentry(sentryutil.Event{
+			Hub:     p.taskCtx.SentryHub(),
 			Message: "No audio frames received after user idle timeout, try reconnecting",
 			Tags: map[string]string{
 				"component": "voicepipeline",

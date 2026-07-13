@@ -4,6 +4,8 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/getsentry/sentry-go"
 )
 
 // Go port of Disha's Python parity corpus
@@ -557,6 +559,57 @@ func TestLongTriggerReportsInfoSentryMessage(t *testing.T) {
 	}
 	if !reportedLongTriggers[key] {
 		t.Fatalf("reportedLongTriggers missing expected key %+v; got %v", key, reportedLongTriggers)
+	}
+}
+
+// TestLongTriggerSentryRoutesThroughHub proves the sentry-task-hub wiring
+// for the matcher: a caller-supplied hub (the tracker's late-bound
+// taskSentryHub in production) receives the long-trigger info capture
+// instead of the process-global hub, and a tag set on the hub's own scope
+// survives onto the captured event alongside the call's own event-level
+// tag — same shape as TestStageManagerInvalidStageSentryRoutesThroughHub.
+func TestLongTriggerSentryRoutesThroughHub(t *testing.T) {
+	resetReportedLongTriggers(t)
+
+	hubTransport := &sentry.MockTransport{}
+	hubClient, err := sentry.NewClient(sentry.ClientOptions{Transport: hubTransport})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	hub := sentry.NewHub(hubClient, sentry.NewScope())
+	hub.Scope().SetTag("conversation_id", "conv-fuzzy-hub-test")
+
+	longTrigger := make([]rune, stageTransitionTriggerLengthInfoThreshold+1)
+	for i := range longTrigger {
+		longTrigger[i] = 'a'
+	}
+	trigger := string(longTrigger)
+
+	_, err = EvaluateStageTransitionFromConfig(StageTransitionEvalConfig{
+		StagePromptConfig:       stagePromptConfigFixture("problem_rca_discussion", trigger),
+		AllowedNextStages:       []string{"problem_rca_discussion"},
+		LatestAssistantResponse: "short response",
+		DocumentName:            "OB_Call_Configs/test_config",
+		DocumentVersion:         7,
+		Hub:                     hub,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateStageTransitionFromConfig: %v", err)
+	}
+
+	events := hubTransport.Events()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event on the caller-supplied hub's transport, got %d", len(events))
+	}
+	event := events[0]
+	if event.Message != "Long onboarding stage transition trigger statement" {
+		t.Fatalf("event message = %q", event.Message)
+	}
+	if event.Tags["conversation_id"] != "conv-fuzzy-hub-test" {
+		t.Fatalf("expected hub-scope tag to survive onto the captured event, got %v", event.Tags)
+	}
+	if event.Tags["target_stage"] != "problem_rca_discussion" {
+		t.Fatalf("expected event-level tag to also apply, got %v", event.Tags)
 	}
 }
 

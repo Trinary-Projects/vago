@@ -181,6 +181,7 @@ func (a *UserContextAggregator) applyFunctionCallResult(f FunctionCallResultFram
 		err := errors.New("empty tool result")
 		a.PushError("empty tool result", false)
 		sentryutil.Capture(sentryutil.Event{
+			Hub: a.taskCtx.SentryHub(),
 			Err: err,
 			Tags: map[string]string{
 				"component": "user_context_aggregator",

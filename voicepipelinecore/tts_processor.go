@@ -514,6 +514,7 @@ func (t *TTSProcessor) orchestrator() {
 		case <-pendingEndTimeout:
 			t.taskCtx.Logger.Println("TTS pending EndFrame timed out waiting for Cartesia done; forcing shutdown")
 			sentryutil.Capture(sentryutil.Event{
+				Hub:     t.taskCtx.SentryHub(),
 				Message: "TTS pending EndFrame timed out waiting for Cartesia done",
 				Tags:    map[string]string{"component": "tts", "operation": "pending_end_timeout"},
 				Details: map[string]any{
