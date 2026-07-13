@@ -28,6 +28,13 @@ const rtviProtocolVersion = "1.2.0"
 var (
 	dailyJoinRetryDelay = time.Second
 	dailyJoinTimeout    = 20 * time.Second
+	// dailyBridgeWriteTimeout bounds a single stdin write to the Python
+	// Daily bridge. daily-python's audio_source.write_frames can block
+	// forever when Daily's send transport dies mid-call, which backs up
+	// the bridge's stdin pipe and would otherwise wedge every writer in
+	// the pipeline behind writeMu forever. Package var so tests can
+	// shrink it.
+	dailyBridgeWriteTimeout = 5 * time.Second
 )
 
 type dailyBridgeEvent struct {
@@ -78,6 +85,15 @@ type DailyRoom struct {
 	joinResult           chan error
 	greetOnce            sync.Once
 	endOnParticipantLeft bool
+	// joined is true once the bridge has reported the "joined" event.
+	// Used to decide whether a later bridge process exit is a mid-call
+	// failure (end the task) versus a pre-join failure (handled by the
+	// existing join-retry path).
+	joined atomic.Bool
+	// dead is set once a stdin write to the bridge times out. Once dead,
+	// all further writes are no-ops so a wedged bridge can't block
+	// anything else in the pipeline.
+	dead atomic.Bool
 }
 
 // DailyRoomOptions carries per-bot policy for JoinDailyRoom that isn't
@@ -199,6 +215,23 @@ func startDailyRoomAttempt(roomURL, token, python, script string, taskCtx *TaskC
 			room.log("Daily bridge exited: %v", err)
 			room.finishJoin(fmt.Errorf("daily bridge exited before join: %w", err))
 		}
+		// A post-join process exit is a mid-call bridge failure: nothing
+		// else observes daily-python dying (no callback exists for this;
+		// see call-site comment), so without this the call would be
+		// deaf-and-mute until the 120s idle watchdog. Skip it if the
+		// write-timeout path already ended the task (r.dead) or shutdown
+		// is already intentional (r.closed), so we don't double-fire.
+		if !room.closed.Load() && room.joined.Load() && !room.dead.Load() {
+			room.log("[%s] Daily bridge process exited after join; ending call", room.roomName)
+			sentryutil.Capture(sentryutil.Event{
+				Err:  errors.New("daily bridge process exited after join"),
+				Tags: map[string]string{"component": "daily", "operation": "bridge_exit"},
+				Details: map[string]any{
+					"room_name": room.roomName,
+				},
+			})
+			room.endTask(EndReasonError)
+		}
 		close(room.waitDone)
 	})
 
@@ -280,6 +313,16 @@ func (r *DailyRoom) writeCommand(cmd dailyBridgeCommand) error {
 }
 
 func (r *DailyRoom) writeCommandAllowClosed(cmd dailyBridgeCommand, allowClosed bool) error {
+	if r != nil && r.dead.Load() {
+		// Best-effort: a wedged bridge already triggered shutdown, so
+		// every further write (including Disconnect's own leave write)
+		// is a no-op. This check must stay ahead of the writeMu lock
+		// below: the write that discovered the timeout still holds
+		// writeMu (via its deferred Unlock) while it spins up the
+		// shutdown goroutine, and that goroutine's Disconnect() call
+		// re-enters this function to send "leave".
+		return nil
+	}
 	if r == nil || r.stdin == nil || r.closed.Load() {
 		if !allowClosed {
 			return nil
@@ -290,7 +333,37 @@ func (r *DailyRoom) writeCommandAllowClosed(cmd dailyBridgeCommand, allowClosed 
 	}
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
-	return json.NewEncoder(r.stdin).Encode(cmd)
+
+	deadliner, hasDeadline := r.stdin.(interface{ SetWriteDeadline(time.Time) error })
+	if hasDeadline {
+		_ = deadliner.SetWriteDeadline(time.Now().Add(dailyBridgeWriteTimeout))
+	}
+	err := json.NewEncoder(r.stdin).Encode(cmd)
+	if hasDeadline {
+		if err == nil {
+			_ = deadliner.SetWriteDeadline(time.Time{})
+		}
+	}
+	if err != nil && (errors.Is(err, os.ErrDeadlineExceeded) || os.IsTimeout(err)) && r.dead.CompareAndSwap(false, true) {
+		r.log("[%s] Daily bridge stdin write timed out after %s; declaring bridge dead", r.roomName, dailyBridgeWriteTimeout)
+		sentryutil.Capture(sentryutil.Event{
+			Err:  err,
+			Tags: map[string]string{"component": "daily", "operation": "bridge_write_timeout"},
+			Details: map[string]any{
+				"room_name": r.roomName,
+			},
+		})
+		// Must run off this goroutine: it's still holding writeMu (via
+		// the deferred Unlock above) and is likely a pipeline goroutine
+		// (e.g. PlaybackSink's runPlayback) that needs to return this
+		// error rather than block on a graceful shutdown that itself
+		// waits up to 5s before killing the bridge process.
+		r.goTracked(func() {
+			r.endTask(EndReasonError)
+			r.Disconnect()
+		})
+	}
+	return err
 }
 
 func (r *DailyRoom) readStdout(stdout io.Reader) {
@@ -319,6 +392,7 @@ func (r *DailyRoom) readStderr(stderr io.Reader) {
 func (r *DailyRoom) handleEvent(event dailyBridgeEvent) {
 	switch event.Event {
 	case "joined":
+		r.joined.Store(true)
 		at := time.Now()
 		r.log("[%s] Bot joined Daily room meeting_id=%s participant_id=%s", r.roomName, event.MeetingID, event.ParticipantID)
 		if r.taskCtx != nil {

@@ -260,8 +260,13 @@ func (m *OnboardingCarePlanManager) sendRTVI(message string) {
 // superset — a primary error before the hedge threshold still produces
 // Python's immediate sequential retry, and hedging additionally covers
 // the "primary is just slow" case with a parallel hedge after 1s.
-// Temperature/MaxTokens are left nil (endpoint defaults) because Python
-// uses the default temperature=0 and no max_tokens for this call.
+// Temperature stays nil: the gpt-oss endpoint configs set no
+// Temperature, so the router default of 0 applies, matching Python's
+// temperature=0. MaxTokens must be explicit — nil would inherit the
+// endpoint configs' 500-token get_guidance cap, which truncated the
+// careplan JSON mid-object in prod (parse failure -> "unknown"
+// fallback). Python sends no cap; 4000 mirrors the deep-thinking
+// ceiling, ~8x the observed ~220-token average completion.
 //
 // Like newDeepThinkingClientFactory, this closure is built in
 // onboarding_call.go BuildTask before NewPipelineTask exists, so its
@@ -269,6 +274,7 @@ func (m *OnboardingCarePlanManager) sendRTVI(message string) {
 // manager's late-bound Sentry hub (sentry-task-hub) and deliberately
 // stays on the global hub.
 func newCarePlanClientFactory(deps Deps, logger *log.Logger, userID, conversationID string) deepThinkingClientFactory {
+	maxTokens := 4000
 	return func(promptMetadata map[string]any, usecaseType string) voicepipelinecore.LLMClient {
 		client, err := llmrouter.NewHedged(llmrouter.HedgedConfig{
 			Pair:           llmrouter.GroupGPTOSS120FastHedged,
@@ -276,6 +282,7 @@ func newCarePlanClientFactory(deps Deps, logger *log.Logger, userID, conversatio
 			Logger:         logger,
 			LogSink:        newLLMLogSink(deps.API, logger, usecaseType, userID, conversationID),
 			PromptMetadata: promptMetadata,
+			MaxTokens:      &maxTokens,
 		})
 		if err != nil {
 			if logger != nil {

@@ -567,4 +567,7 @@ func TestMapEndReason(t *testing.T) {
 	if got := mapEndReason(voicepipelinecore.EndReasonError); got != nil {
 		t.Fatalf("error reason = %v, want nil", *got)
 	}
+	if got := mapEndReason(voicepipelinecore.EndReasonIdleTimeout); got != nil {
+		t.Fatalf("idle timeout (watchdog) reason = %v, want nil", *got)
+	}
 }

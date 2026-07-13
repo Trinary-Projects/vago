@@ -64,6 +64,11 @@ func (p *UserIdleProcessor) markActivity() {
 // cancelOnIdleTimeout. Reset by any user speech / interim transcript /
 // bot speaking (see markActivity). Exits when the processor's context is
 // cancelled (EndFrame / Stop).
+//
+// Ends with EndReasonIdleTimeout, not EndReasonUserIdle: Python's
+// equivalent (Pipecat's cancel_on_idle_timeout) is an unlabeled
+// task.cancel(), and Disha maps this reason to a null end_reason. Only
+// the 7s nudge-loop exhaustion below is labeled user_idle.
 func (p *UserIdleProcessor) runCancelWatchdog() {
 	timer := time.NewTimer(cancelOnIdleTimeout)
 	defer timer.Stop()
@@ -82,7 +87,7 @@ func (p *UserIdleProcessor) runCancelWatchdog() {
 		case <-timer.C:
 			p.taskCtx.Logger.Printf("No activity for %s; ending call (idle timeout)\n", cancelOnIdleTimeout)
 			if p.taskCtx.EndTask != nil {
-				p.taskCtx.EndTask(EndReasonUserIdle)
+				p.taskCtx.EndTask(EndReasonIdleTimeout)
 			}
 			return
 		}

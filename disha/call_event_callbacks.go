@@ -317,6 +317,10 @@ func optionalTime(t time.Time) *time.Time {
 	return &t
 }
 
+// mapEndReason maps core end reasons to Disha's end_reason enum, which only
+// supports talktime_exhausted and user_idle. Everything else, including the
+// 120s-watchdog EndReasonIdleTimeout, deliberately falls to the nil default
+// (Python's Pipecat cancel_on_idle_timeout parity: an unlabeled task cancel).
 func mapEndReason(reason voicepipelinecore.EndReason) *string {
 	switch reason {
 	case voicepipelinecore.EndReasonTalkTimeExhausted:
