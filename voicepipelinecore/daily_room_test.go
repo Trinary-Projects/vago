@@ -3,9 +3,11 @@ package voicepipelinecore
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -288,5 +290,199 @@ printf '%s\n' '{"event":"left"}'
 	}
 	if got := string(bytes.TrimSpace(raw)); got != "3" {
 		t.Fatalf("join attempts = %s, want 3", got)
+	}
+}
+
+// endTaskRecorder captures EndTask(reason) calls from a background
+// goroutine (the write-timeout/bridge-exit shutdown paths call it off
+// the caller's goroutine) with the same mutex-guarded capture pattern
+// used by the QueueProcessor/callStatsTracker helpers elsewhere in this
+// package.
+type endTaskRecorder struct {
+	mu      sync.Mutex
+	reasons []EndReason
+}
+
+func (e *endTaskRecorder) record(reason EndReason) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reasons = append(e.reasons, reason)
+}
+
+func (e *endTaskRecorder) snapshot() []EndReason {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]EndReason, len(e.reasons))
+	copy(out, e.reasons)
+	return out
+}
+
+// writeJoinedThenBlockScript writes a fake bridge shell script that
+// reports "joined" and then stops reading/writing entirely (simulating
+// daily-python's write_frames wedging forever on a dead send transport).
+func writeJoinedThenBlockScript(t *testing.T, dir string) string {
+	t.Helper()
+	script := filepath.Join(dir, "bridge.sh")
+	body := `#!/bin/sh
+printf '%s\n' '{"event":"joined","participant_id":"bot","meeting_id":"meeting-1"}'
+exec sleep 60
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile script: %v", err)
+	}
+	return script
+}
+
+// TestDailyRoomWriteTimeoutDeclaresBridgeDead covers the prod deadlock
+// fix: a bridge that stops reading stdin mid-call (dead send transport)
+// must not be allowed to hang WriteAudioPCM/SendAppMessage callers
+// forever. The write deadline must fire, the bridge must be declared
+// dead exactly once (EndTask(error) exactly once), further writes must
+// no-op immediately, and the room must still shut down.
+func TestDailyRoomWriteTimeoutDeclaresBridgeDead(t *testing.T) {
+	fix := newTestFixture(t)
+	rec := &endTaskRecorder{}
+	fix.TaskCtx.EndTask = rec.record
+
+	tmp := t.TempDir()
+	script := writeJoinedThenBlockScript(t, tmp)
+	t.Setenv("DAILY_BRIDGE_PYTHON", "/bin/sh")
+	t.Setenv("DAILY_BRIDGE_SCRIPT", script)
+
+	oldWriteTimeout := dailyBridgeWriteTimeout
+	dailyBridgeWriteTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { dailyBridgeWriteTimeout = oldWriteTimeout })
+
+	audioSource := NewAudioSourceProcessor(fix.TaskCtx)
+	room, err := JoinDailyRoom("https://example.daily.co/test-room", "token", fix.TaskCtx, audioSource, DailyRoomOptions{EndOnParticipantLeft: true})
+	if err != nil {
+		t.Fatalf("JoinDailyRoom: %v", err)
+	}
+
+	// The OS pipe buffer is ~64KB; pump a few-KB payload in a bounded
+	// loop until a write times out (pipe fills fast once the bridge
+	// stops reading) or a generous overall deadline expires, so a
+	// regression that removes the deadline fails the test instead of
+	// hanging it.
+	payload := make([]byte, 4*1024)
+	overallDeadline := time.Now().Add(5 * time.Second)
+	var timedOut bool
+	for i := 0; i < 100000 && time.Now().Before(overallDeadline); i++ {
+		writeErr := room.WriteAudioPCM(payload)
+		if writeErr != nil {
+			if errors.Is(writeErr, os.ErrDeadlineExceeded) {
+				timedOut = true
+			} else {
+				t.Fatalf("WriteAudioPCM returned unexpected error: %v", writeErr)
+			}
+			break
+		}
+	}
+	if !timedOut {
+		t.Fatalf("expected a WriteAudioPCM call to time out with os.ErrDeadlineExceeded within the bound")
+	}
+
+	// Once dead, further writes must return immediately without
+	// blocking or erroring.
+	if err := room.WriteAudioPCM(payload); err != nil {
+		t.Fatalf("WriteAudioPCM after bridge declared dead: %v", err)
+	}
+
+	// Disconnect runs on a separate goroutine spawned by the timeout
+	// path and waits up to 5s before killing the wedged bridge process;
+	// budget generously.
+	if err := waitForWG(fix.WG, 10*time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+
+	reasons := rec.snapshot()
+	if len(reasons) != 1 || reasons[0] != EndReasonError {
+		t.Fatalf("expected EndTask(error) exactly once, got %v", reasons)
+	}
+}
+
+// TestDailyRoomPostJoinBridgeExitEndsTask covers the second half of the
+// deadlock fix: a bridge process that exits unexpectedly after join
+// (not via Disconnect) must end the task instead of leaving a
+// deaf-and-mute call alive until the 120s watchdog.
+func TestDailyRoomPostJoinBridgeExitEndsTask(t *testing.T) {
+	fix := newTestFixture(t)
+	rec := &endTaskRecorder{}
+	fix.TaskCtx.EndTask = rec.record
+
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "bridge.sh")
+	body := `#!/bin/sh
+printf '%s\n' '{"event":"joined","participant_id":"bot","meeting_id":"meeting-1"}'
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile script: %v", err)
+	}
+	t.Setenv("DAILY_BRIDGE_PYTHON", "/bin/sh")
+	t.Setenv("DAILY_BRIDGE_SCRIPT", script)
+
+	audioSource := NewAudioSourceProcessor(fix.TaskCtx)
+	room, err := JoinDailyRoom("https://example.daily.co/test-room", "token", fix.TaskCtx, audioSource, DailyRoomOptions{EndOnParticipantLeft: true})
+	if err != nil {
+		t.Fatalf("JoinDailyRoom: %v", err)
+	}
+
+	if err := waitForWG(fix.WG, 2*time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+
+	reasons := rec.snapshot()
+	if len(reasons) != 1 || reasons[0] != EndReasonError {
+		t.Fatalf("expected EndTask(error) exactly once, got %v", reasons)
+	}
+
+	// Disconnect afterwards must be safe/idempotent (closed is already
+	// false since nothing called it, but the process is already gone).
+	room.Disconnect()
+	reasons = rec.snapshot()
+	if len(reasons) != 1 {
+		t.Fatalf("expected Disconnect to not trigger an extra EndTask, got %v", reasons)
+	}
+}
+
+// TestDailyRoomIntentionalDisconnectDoesNotEndTask verifies a normal
+// Disconnect()-driven shutdown (bridge exits only because it was told
+// to leave) never fires EndTask via either new code path.
+func TestDailyRoomIntentionalDisconnectDoesNotEndTask(t *testing.T) {
+	fix := newTestFixture(t)
+	rec := &endTaskRecorder{}
+	fix.TaskCtx.EndTask = rec.record
+
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "bridge.sh")
+	body := `#!/bin/sh
+printf '%s\n' '{"event":"joined","participant_id":"bot","meeting_id":"meeting-1"}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"leave"'*) break ;;
+  esac
+done
+printf '%s\n' '{"event":"left"}'
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile script: %v", err)
+	}
+	t.Setenv("DAILY_BRIDGE_PYTHON", "/bin/sh")
+	t.Setenv("DAILY_BRIDGE_SCRIPT", script)
+
+	audioSource := NewAudioSourceProcessor(fix.TaskCtx)
+	room, err := JoinDailyRoom("https://example.daily.co/test-room", "token", fix.TaskCtx, audioSource, DailyRoomOptions{EndOnParticipantLeft: true})
+	if err != nil {
+		t.Fatalf("JoinDailyRoom: %v", err)
+	}
+
+	room.Disconnect()
+	if err := waitForWG(fix.WG, 2*time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
+	}
+
+	if reasons := rec.snapshot(); len(reasons) != 0 {
+		t.Fatalf("expected no EndTask call on intentional disconnect, got %v", reasons)
 	}
 }

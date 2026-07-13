@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
+	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
 func endsWithPunctuation(s string) bool {
@@ -36,6 +37,12 @@ const (
 	ttsEventAudioChunk ttsEventType = iota
 	ttsEventWordTimestamps
 	ttsEventDone
+	// ttsEventReconnected signals that the reader re-established the
+	// Cartesia websocket after a read error. It carries no contextID —
+	// Cartesia has no idea what context we were in — so the orchestrator
+	// must handle it before the isCurrentContext check in handleTTSEvent
+	// would otherwise eat it.
+	ttsEventReconnected
 )
 
 type ttsEvent struct {
@@ -59,6 +66,12 @@ type ttsCommand struct {
 // appended at dial time. Exposed as a package variable so tests can
 // override it.
 var ttsDialURL = "wss://api.cartesia.ai/tts/websocket?cartesia_version=2025-04-16&api_key="
+
+// ttsPendingEndTimeout bounds how long the orchestrator will hold a
+// deferred EndFrame waiting for Cartesia's "done" event before giving
+// up and forwarding it anyway. Exposed as a package variable so tests
+// can override it.
+var ttsPendingEndTimeout = 10 * time.Second
 
 // TTSProcessor wraps Cartesia. After migration its shape is:
 //
@@ -261,6 +274,14 @@ func (t *TTSProcessor) orchestrator() {
 	var pendingEndDir Direction
 	var pendingEndDone chan struct{}
 
+	// pendingEndTimeout is nil (and therefore inert in the select below)
+	// whenever no EndFrame is deferred. handleEnd arms pendingEndTimer
+	// when it defers; forwardPendingEnd stops and clears it whenever
+	// pendingEnd is cleared, including the normal done-released path, so
+	// a completed turn never leaves a live timer behind.
+	var pendingEndTimer *time.Timer
+	var pendingEndTimeout <-chan time.Time
+
 	// cartesiaTextSent: have we sent text to Cartesia in the current
 	// context that hasn't been resolved by a "done" event yet? When
 	// true, Cartesia owes us a "done" once we send Reset (continue:false).
@@ -296,6 +317,11 @@ func (t *TTSProcessor) orchestrator() {
 			pendingEndDone = nil
 		}
 		pendingEnd = nil
+		if pendingEndTimer != nil {
+			pendingEndTimer.Stop()
+			pendingEndTimer = nil
+		}
+		pendingEndTimeout = nil
 		t.closeTTSConnection()
 		return true
 	}
@@ -328,6 +354,8 @@ func (t *TTSProcessor) orchestrator() {
 			pendingEnd = &pending
 			pendingEndDir = dir
 			pendingEndDone = doneCh
+			pendingEndTimer = time.NewTimer(ttsPendingEndTimeout)
+			pendingEndTimeout = pendingEndTimer.C
 			t.taskCtx.Logger.Printf("EndFrame at TTSProcessor deferred until TTS done: reason=%q\n", frame.Reason)
 			return false
 		}
@@ -461,11 +489,41 @@ func (t *TTSProcessor) orchestrator() {
 				return
 			}
 		case event := <-t.ttsEvents:
+			if event.eventType == ttsEventReconnected {
+				// No contextID to check here: Cartesia forgot the
+				// context, so treat any synthesis we were waiting on as
+				// unrecoverable rather than routing through
+				// handleTTSEvent's isCurrentContext check.
+				if cartesiaTextSent {
+					t.taskCtx.Logger.Println("TTS reconnected while synthesis in flight; Cartesia done is unreachable, emitting TTSDone")
+					t.pushRemainingAudioFrames()
+					t.PushFrame(NewTTSDoneFrame(), Downstream)
+					cartesiaTextSent = false
+					if forwardPendingEnd("after reconnect") {
+						return
+					}
+				}
+				continue
+			}
 			if t.handleTTSEvent(event) {
 				cartesiaTextSent = false
 				if forwardPendingEnd("after TTS done") {
 					return
 				}
+			}
+		case <-pendingEndTimeout:
+			t.taskCtx.Logger.Println("TTS pending EndFrame timed out waiting for Cartesia done; forcing shutdown")
+			sentryutil.Capture(sentryutil.Event{
+				Message: "TTS pending EndFrame timed out waiting for Cartesia done",
+				Tags:    map[string]string{"component": "tts", "operation": "pending_end_timeout"},
+				Details: map[string]any{
+					"context_id": t.currentContextId,
+					"timeout":    ttsPendingEndTimeout.String(),
+				},
+			})
+			cartesiaTextSent = false
+			if forwardPendingEnd("after timeout") {
+				return
 			}
 		}
 	}
@@ -702,6 +760,9 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			}
 			t.taskCtx.Logger.Println("TTS read error, reconnecting:", err)
 			if !t.connect() {
+				return
+			}
+			if !t.pushTTSEvent(ttsEvent{eventType: ttsEventReconnected}) {
 				return
 			}
 			continue
