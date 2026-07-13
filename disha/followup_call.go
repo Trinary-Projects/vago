@@ -238,6 +238,7 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"diet_chart_xml":            user.LastDietChartXML,
 		"patient_executive_profile": patientExecutiveProfile,
 		"active_chat_context":       derefString(user.ActiveChatContext),
+		"recent_1hr_transcript":     derefString(user.Recent1HrTranscript),
 		"patient_name":              name,
 		"patient_schedule":          patientScheduleFromSlots(user.IdealCallTimeSlots),
 		"he_she":                    subjectPronoun(gender),

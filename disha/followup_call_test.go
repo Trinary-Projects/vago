@@ -62,6 +62,7 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	userID := "user-1"
 	patientExecutiveProfile := "Formatted patient executive profile"
 	activeChatContext := "Recent active chat context"
+	recent1HrTranscript := "Patient asked about dinner in chat 20 minutes ago"
 	unprocessed := "Recent chat note"
 	schedule := map[string]any{
 		"checkin_slots": map[string]any{"morning": "8 AM"},
@@ -72,7 +73,7 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 		followUpPromptD1Inactive,
 		"production",
 		9,
-		"FOLLOWUP patient={{ patient_info }} memory={{ patient_memory }} active={{ active_chat_context }} when={{ current_datetime }} name={{ patient_name }} pronoun={{ he_she }} schedule={{ patient_schedule }}",
+		"FOLLOWUP patient={{ patient_info }} memory={{ patient_memory }} active={{ active_chat_context }} recent={{ recent_1hr_transcript }} when={{ current_datetime }} name={{ patient_name }} pronoun={{ he_she }} schedule={{ patient_schedule }}",
 	)
 	seedConversationData(t, redisServer, conversationID, ConversationData{
 		Conversation: ConversationRow{
@@ -89,6 +90,7 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 			UserID:                  userID,
 			PatientExecutiveProfile: &patientExecutiveProfile,
 			ActiveChatContext:       &activeChatContext,
+			Recent1HrTranscript:     &recent1HrTranscript,
 			IdealCallTimeSlots:      schedule,
 			DevanagariName:          "रिया",
 			FirstName:               "Riya",
@@ -115,7 +117,7 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	}
 	if len(pl.InitialMessages) != 2 ||
 		pl.InitialMessages[0].Role != "system" ||
-		!containsAll(pl.InitialMessages[0].Content, "FOLLOWUP", "Riya, age 32", "Formatted patient executive profile", "Recent active chat context", "रिया", "she") ||
+		!containsAll(pl.InitialMessages[0].Content, "FOLLOWUP", "Riya, age 32", "Formatted patient executive profile", "Recent active chat context", "Patient asked about dinner in chat 20 minutes ago", "रिया", "she") ||
 		pl.InitialMessages[1].Role != "user" ||
 		pl.InitialMessages[1].Content != "hello" {
 		t.Fatalf("InitialMessages = %+v", pl.InitialMessages)
@@ -143,6 +145,9 @@ func TestFollowUpBotPlanSelectsAgendaPrompt(t *testing.T) {
 	}
 	if vars["active_chat_context"] != activeChatContext {
 		t.Fatalf("active_chat_context = %#v", vars["active_chat_context"])
+	}
+	if vars["recent_1hr_transcript"] != recent1HrTranscript {
+		t.Fatalf("recent_1hr_transcript = %#v", vars["recent_1hr_transcript"])
 	}
 	currentDatetime, ok := vars["current_datetime"].(string)
 	if !ok {
@@ -347,6 +352,9 @@ func TestFollowUpBotPlanDynamicLoadsCallFlowAndTools(t *testing.T) {
 	}
 	if vars["active_chat_context"] != "" {
 		t.Fatalf("active_chat_context = %#v, want empty fallback", vars["active_chat_context"])
+	}
+	if vars["recent_1hr_transcript"] != "" {
+		t.Fatalf("recent_1hr_transcript = %#v, want empty fallback", vars["recent_1hr_transcript"])
 	}
 }
 
