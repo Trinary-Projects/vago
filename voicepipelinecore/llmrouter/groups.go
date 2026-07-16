@@ -184,17 +184,39 @@ var endpointConfigs = map[string]endpointConfig{
 		Temperature: floatPtr(0.5),
 	},
 
-	// --- follow-up dynamic treatment main model (no health switching in Python) ---
-	"openrouter_gemma_4_31b_it": {
-		Key: "openrouter_gemma_4_31b_it", Provider: providerOpenRouter,
+	// --- follow-up dynamic treatment main model ---
+	// Split into one config per OpenRouter provider (instead of the old
+	// single "openrouter_gemma_4_31b_it" config that pinned both
+	// providers via ExtraBody and let OpenRouter's own internal routing
+	// pick between them). Now talk-go's own health selection — fed by
+	// Disha's Python poller — chooses the provider directly. Each
+	// config's "only"+"allow_fallbacks:false" already excludes every
+	// other provider, so the old "ignore" list is dropped as redundant.
+	// Keys must match the Python OpenAIModels enum values in
+	// disha-backend services/openai_config_manager.py exactly, since
+	// they form the Redis health keys.
+	"openrouter_gemma_4_31b_it_modelrun": {
+		Key: "openrouter_gemma_4_31b_it_modelrun", Provider: providerOpenRouter,
 		Model: "google/gemma-4-31b-it", Region: "us",
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		Temperature: floatPtr(0.5),
 		ExtraBody: map[string]any{
 			"provider": map[string]any{
-				"order":           []string{"modelrun/fp4", "wandb/bf16"},
-				"only":            []string{"modelrun/fp4", "wandb/bf16"},
-				"ignore":          []string{"google-ai-studio", "google-vertex", "novita", "deepinfra/fp8", "parasail/fp8", "together"},
+				"order":           []string{"modelrun/fp4"},
+				"only":            []string{"modelrun/fp4"},
+				"allow_fallbacks": false,
+			},
+		},
+	},
+	"openrouter_gemma_4_31b_it_wandb": {
+		Key: "openrouter_gemma_4_31b_it_wandb", Provider: providerOpenRouter,
+		Model: "google/gemma-4-31b-it", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+		Temperature: floatPtr(0.5),
+		ExtraBody: map[string]any{
+			"provider": map[string]any{
+				"order":           []string{"wandb/bf16"},
+				"only":            []string{"wandb/bf16"},
 				"allow_fallbacks": false,
 			},
 		},
@@ -320,8 +342,16 @@ var modelGroups = map[string]modelGroup{
 		FallbackGroup: groupGPT41,
 	},
 	groupFollowUpDynamic: {
-		Configs:  []string{"openrouter_gemma_4_31b_it"},
-		Fallback: "openrouter_gemma_4_31b_it",
+		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_wandb"},
+		Fallback: "openrouter_gemma_4_31b_it_modelrun",
+		// No healthy gemma endpoint in either provider falls back to the
+		// normal cross-group fallback (gpt-4.1), matching Python's
+		// LLMSwitchingService uniform FALLBACK_MODEL_GROUP behavior.
+		// (When gpt-4.1 has no health data either, selection returns that
+		// group's own hardcoded fallback; the Fallback above is unreachable
+		// while the gpt-4.1 group exists and is kept only for shape parity
+		// with Python's group entry.)
+		FallbackGroup: groupGPT41,
 	},
 	groupGPTOSS120Fast: {
 		Configs: []string{
