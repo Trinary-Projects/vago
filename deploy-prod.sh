@@ -81,13 +81,29 @@ POD_TEMPLATE_VERSION="${POD_TEMPLATE_VERSION:-v${timestamp}}"
 IMAGE_REPOSITORY="us-east1-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY_NAME}/talk-go-worker"
 IMAGE="${IMAGE_REPOSITORY}:latest"
 
-required_commands=(docker kubectl envsubst gcloud)
+required_commands=(docker kubectl envsubst gcloud git)
 for cmd in "${required_commands[@]}"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Missing required command: $cmd" >&2
     exit 1
   fi
 done
+
+# Prod images are built from the working tree (docker build .), so the deploy
+# must run from an up-to-date, clean main checkout or the pushed image can
+# silently miss merged changes.
+current_branch="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "$current_branch" != "main" ]]; then
+  echo "Refusing prod deploy: current branch is '${current_branch}', not main." >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Refusing prod deploy: working tree has uncommitted or untracked changes:" >&2
+  git status --short >&2
+  exit 1
+fi
+echo "Pulling latest main..."
+git pull --ff-only origin main
 
 echo "Fetching credentials for cluster ${GKE_CLUSTER_NAME} (${GKE_CLUSTER_LOCATION})..."
 gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" \

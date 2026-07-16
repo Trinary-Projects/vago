@@ -1,5 +1,6 @@
 .env
 .*.env
+.DS_Store
 *.log
 *.raw
 *.wav
