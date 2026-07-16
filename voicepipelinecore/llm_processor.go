@@ -213,6 +213,24 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// arms its prompt loop. Otherwise the caller sits in silence
 		// until the 120s watchdog.
 		p.taskCtx.Logger.Println("LLM stream failed:", err)
+		// Python parity: pipecat logs the failed call at ERROR level and
+		// the bots' loguru sentry_sink forwards every ERROR to Sentry, so
+		// a live LLM failure always raises a Sentry issue there. Capture
+		// here (never on cancellation — handled above) with the task hub
+		// so the event carries the call identity.
+		sentryutil.Capture(sentryutil.Event{
+			Hub: p.taskCtx.SentryHub(),
+			Err: err,
+			Tags: map[string]string{
+				"component": "llm",
+				"operation": "live_stream",
+			},
+			Details: map[string]any{
+				"model":           result.Model,
+				"partial_chars":   responseText.Len(),
+				"had_first_token": ttfbMs != nil,
+			},
+		})
 		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		p.fireLLMCallCompleted(responseText.String(), true)
