@@ -103,7 +103,7 @@ func vertexCredsEnvForConfig(cfg endpointConfig) string {
 	switch cfg.VertexProject {
 	case "gen-lang-client-0439239631":
 		return "VERTEX_DISHAAI_CREDS_FILE"
-	case "disha-ai2":
+	case "disha-ai3":
 		return "VERTEX_DISHA_AI2_CREDS_FILE"
 	default:
 		return "VERTEX_AI_CREDS_FILE"

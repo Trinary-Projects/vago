@@ -168,7 +168,7 @@ var endpointConfigs = map[string]endpointConfig{
 	"vertex_gemini_flash_3_1_lite": {
 		Key: "vertex_gemini_flash_3_1_lite", Provider: providerVertex,
 		Model: "google/gemini-3.1-flash-lite", Region: "us",
-		VertexProject: "disha-ai2", VertexLocation: "global", VertexCredsEnv: "VERTEX_DISHA_AI2_CREDS_FILE",
+		VertexProject: "disha-ai3", VertexLocation: "global", VertexCredsEnv: "VERTEX_DISHA_AI2_CREDS_FILE",
 		Temperature: floatPtr(0.5),
 	},
 	"google_ai_studio_gemini_flash_3_1_lite": {
