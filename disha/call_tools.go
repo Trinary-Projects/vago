@@ -83,10 +83,12 @@ func propertiesOrEmpty(properties map[string]any) map[string]any {
 	return properties
 }
 
+// stringSliceFromAny always returns a non-nil slice: it feeds the tool
+// schema's "required" field, and a nil slice marshals to JSON null,
+// which OpenAI/Azure reject with "None is not of type 'array'"
+// (OpenRouter tolerates it, so the bug only surfaced on gpt-4.1
+// fallback turns).
 func stringSliceFromAny(values []any) []string {
-	if len(values) == 0 {
-		return nil
-	}
 	out := make([]string, 0, len(values))
 	for _, v := range values {
 		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
