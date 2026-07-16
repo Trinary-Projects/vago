@@ -192,19 +192,67 @@ func TestSelectionGeminiGroupFallsBackToGPT41Group(t *testing.T) {
 	}
 }
 
-func TestSelectionOneEndpointGroupUsesOwnFallback(t *testing.T) {
+func TestSelectionFollowUpDynamicPicksFastestProvider(t *testing.T) {
 	fr := newFakeRedis()
-	fr.setHealth("openai_gpt_4_1", false, 1)
+	fr.setHealth("openrouter_gemma_4_31b_it_modelrun", false, 500)
+	fr.setHealth("openrouter_gemma_4_31b_it_wandb", false, 200)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if sel.ConfigKey != "openrouter_gemma_4_31b_it" {
-		t.Fatalf("selected %q, want dynamic follow-up endpoint", sel.ConfigKey)
+	if sel.ConfigKey != "openrouter_gemma_4_31b_it_wandb" {
+		t.Fatalf("selected %q, want the faster wandb provider", sel.ConfigKey)
 	}
 	if sel.UsingFallback || sel.SelectedGroup != groupFollowUpDynamic {
-		t.Fatalf("selection = %+v, want own-group fallback without cross-group fallback", sel)
+		t.Fatalf("selection = %+v, want own-group selection without cross-group fallback", sel)
+	}
+}
+
+func TestSelectionFollowUpDynamicSkipsBlacklistedProvider(t *testing.T) {
+	fr := newFakeRedis()
+	fr.setHealth("openrouter_gemma_4_31b_it_modelrun", false, 100)
+	fr.setHealth("openrouter_gemma_4_31b_it_wandb", true, 50) // fastest but blacklisted
+
+	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
+	if !ok {
+		t.Fatal("expected a selection")
+	}
+	if sel.ConfigKey != "openrouter_gemma_4_31b_it_modelrun" {
+		t.Fatalf("selected %q, want the healthy modelrun provider (blacklisted wandb skipped)", sel.ConfigKey)
+	}
+	if sel.UsingFallback {
+		t.Error("did not expect fallback")
+	}
+}
+
+func TestSelectionFollowUpDynamicFallsBackToGPT41Group(t *testing.T) {
+	fr := newFakeRedis()
+	// No health data for either gemma provider; gpt-4.1 group has one
+	// healthy endpoint. Mirrors Python's LLMSwitchingService uniform
+	// FALLBACK_MODEL_GROUP behavior.
+	fr.setHealth("azure_gpt_4_1_us_west", false, 250)
+
+	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
+	if !ok {
+		t.Fatal("expected a selection")
+	}
+	if !sel.UsingFallback || sel.SelectedGroup != groupGPT41 || sel.ConfigKey != "azure_gpt_4_1_us_west" {
+		t.Fatalf("selection = %+v, want gpt-4.1 group fallback", sel)
+	}
+}
+
+func TestSelectionFollowUpDynamicFallbackKeyWhenNoHealthAnywhere(t *testing.T) {
+	fr := newFakeRedis() // empty: no health anywhere, incl. gpt-4.1
+	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
+	if !ok {
+		t.Fatal("expected a last-resort selection")
+	}
+	if sel.ConfigKey != modelGroups[groupGPT41].Fallback {
+		t.Errorf("selected %q, want gpt-4.1 hardcoded fallback %q", sel.ConfigKey, modelGroups[groupGPT41].Fallback)
+	}
+	if !sel.UsingFallback || sel.SelectedGroup != groupGPT41 {
+		t.Fatalf("selection = %+v, want UsingFallback with SelectedGroup gpt-4.1", sel)
 	}
 }
 
@@ -453,41 +501,56 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "or-key")
 
 	r := &Router{cfg: Config{}, httpClient: &http.Client{}}
-	req, err := r.buildRequest(ctx(), endpointConfigs["openrouter_gemma_4_31b_it"], testLLMRequest())
-	if err != nil {
-		t.Fatalf("buildRequest: %v", err)
+
+	cases := []struct {
+		configKey string
+		provider  string
+	}{
+		{"openrouter_gemma_4_31b_it_modelrun", "modelrun/fp4"},
+		{"openrouter_gemma_4_31b_it_wandb", "wandb/bf16"},
 	}
-	if req.URL.String() != "https://openrouter.ai/api/v1/chat/completions" {
-		t.Errorf("url = %s", req.URL.String())
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer or-key" {
-		t.Errorf("auth = %q", got)
-	}
-	body := readBody(t, req)
-	if body["model"] != "google/gemma-4-31b-it" {
-		t.Errorf("model = %v", body["model"])
-	}
-	if body["temperature"] != 0.5 {
-		t.Errorf("temperature = %v, want 0.5", body["temperature"])
-	}
-	provider, ok := body["provider"].(map[string]any)
-	if !ok {
-		t.Fatalf("provider = %#v, want object", body["provider"])
-	}
-	order, ok := provider["order"].([]any)
-	if !ok || len(order) != 2 || order[0] != "modelrun/fp4" || order[1] != "wandb/bf16" {
-		t.Fatalf("provider.order = %#v", provider["order"])
-	}
-	only, ok := provider["only"].([]any)
-	if !ok || len(only) != 2 || only[0] != "modelrun/fp4" || only[1] != "wandb/bf16" {
-		t.Fatalf("provider.only = %#v", provider["only"])
-	}
-	ignored, ok := provider["ignore"].([]any)
-	if !ok || len(ignored) != 6 || ignored[0] != "google-ai-studio" || ignored[3] != "deepinfra/fp8" || ignored[4] != "parasail/fp8" || ignored[5] != "together" {
-		t.Fatalf("provider.ignore = %#v", provider["ignore"])
-	}
-	if provider["allow_fallbacks"] != false {
-		t.Fatalf("provider.allow_fallbacks = %#v, want false", provider["allow_fallbacks"])
+
+	for _, tc := range cases {
+		t.Run(tc.configKey, func(t *testing.T) {
+			req, err := r.buildRequest(ctx(), endpointConfigs[tc.configKey], testLLMRequest())
+			if err != nil {
+				t.Fatalf("buildRequest: %v", err)
+			}
+			if req.URL.String() != "https://openrouter.ai/api/v1/chat/completions" {
+				t.Errorf("url = %s", req.URL.String())
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer or-key" {
+				t.Errorf("auth = %q", got)
+			}
+			body := readBody(t, req)
+			if body["model"] != "google/gemma-4-31b-it" {
+				t.Errorf("model = %v", body["model"])
+			}
+			if body["temperature"] != 0.5 {
+				t.Errorf("temperature = %v, want 0.5", body["temperature"])
+			}
+			provider, ok := body["provider"].(map[string]any)
+			if !ok {
+				t.Fatalf("provider = %#v, want object", body["provider"])
+			}
+			// Each config pins only its own provider now — the old
+			// "ignore" list is gone (redundant once "only" is a single
+			// provider with allow_fallbacks:false).
+			order, ok := provider["order"].([]any)
+			if !ok || len(order) != 1 || order[0] != tc.provider {
+				t.Fatalf("provider.order = %#v, want [%q]", provider["order"], tc.provider)
+			}
+			only, ok := provider["only"].([]any)
+			if !ok || len(only) != 1 || only[0] != tc.provider {
+				t.Fatalf("provider.only = %#v, want [%q]", provider["only"], tc.provider)
+			}
+			if _, present := provider["ignore"]; present {
+				t.Fatalf("provider.ignore = %#v, want no ignore key", provider["ignore"])
+			}
+			if provider["allow_fallbacks"] != false {
+				t.Fatalf("provider.allow_fallbacks = %#v, want false", provider["allow_fallbacks"])
+			}
+		})
 	}
 }
 
