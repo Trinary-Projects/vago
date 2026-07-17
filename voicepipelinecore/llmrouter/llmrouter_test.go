@@ -195,14 +195,14 @@ func TestSelectionGeminiGroupFallsBackToGPT41Group(t *testing.T) {
 func TestSelectionFollowUpDynamicPicksFastestProvider(t *testing.T) {
 	fr := newFakeRedis()
 	fr.setHealth("openrouter_gemma_4_31b_it_modelrun", false, 500)
-	fr.setHealth("openrouter_gemma_4_31b_it_wandb", false, 200)
+	fr.setHealth("openrouter_gemma_4_31b_it_cerebras", false, 200)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if sel.ConfigKey != "openrouter_gemma_4_31b_it_wandb" {
-		t.Fatalf("selected %q, want the faster wandb provider", sel.ConfigKey)
+	if sel.ConfigKey != "openrouter_gemma_4_31b_it_cerebras" {
+		t.Fatalf("selected %q, want the faster cerebras provider", sel.ConfigKey)
 	}
 	if sel.UsingFallback || sel.SelectedGroup != groupFollowUpDynamic {
 		t.Fatalf("selection = %+v, want own-group selection without cross-group fallback", sel)
@@ -212,14 +212,14 @@ func TestSelectionFollowUpDynamicPicksFastestProvider(t *testing.T) {
 func TestSelectionFollowUpDynamicSkipsBlacklistedProvider(t *testing.T) {
 	fr := newFakeRedis()
 	fr.setHealth("openrouter_gemma_4_31b_it_modelrun", false, 100)
-	fr.setHealth("openrouter_gemma_4_31b_it_wandb", true, 50) // fastest but blacklisted
+	fr.setHealth("openrouter_gemma_4_31b_it_cerebras", true, 50) // fastest but blacklisted
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
 	if sel.ConfigKey != "openrouter_gemma_4_31b_it_modelrun" {
-		t.Fatalf("selected %q, want the healthy modelrun provider (blacklisted wandb skipped)", sel.ConfigKey)
+		t.Fatalf("selected %q, want the healthy modelrun provider (blacklisted cerebras skipped)", sel.ConfigKey)
 	}
 	if sel.UsingFallback {
 		t.Error("did not expect fallback")
@@ -507,7 +507,7 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 		provider  string
 	}{
 		{"openrouter_gemma_4_31b_it_modelrun", "modelrun/fp4"},
-		{"openrouter_gemma_4_31b_it_wandb", "wandb/bf16"},
+		{"openrouter_gemma_4_31b_it_cerebras", "cerebras/fp16"},
 	}
 
 	for _, tc := range cases {

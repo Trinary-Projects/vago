@@ -195,6 +195,16 @@ var endpointConfigs = map[string]endpointConfig{
 	// Keys must match the Python OpenAIModels enum values in
 	// disha-backend services/openai_config_manager.py exactly, since
 	// they form the Redis health keys.
+	//
+	// Any provider pinned here MUST support tool calling on OpenRouter
+	// (check supported_parameters on the /models/{id}/endpoints API):
+	// the dynamic-checkin call always sends tools, and OpenRouter
+	// returns 404 "No endpoints found" when the pinned provider lacks
+	// tool support. wandb/bf16 was removed for exactly that (2026-07-17:
+	// 152/152 live calls failed while polls — which send no tools —
+	// kept passing). cerebras/fp16 carries an extra_latency_padding_ms
+	// handicap in the Python poller config so selection prefers the
+	// cheaper modelrun unless Cerebras is meaningfully faster.
 	"openrouter_gemma_4_31b_it_modelrun": {
 		Key: "openrouter_gemma_4_31b_it_modelrun", Provider: providerOpenRouter,
 		Model: "google/gemma-4-31b-it", Region: "us",
@@ -208,15 +218,15 @@ var endpointConfigs = map[string]endpointConfig{
 			},
 		},
 	},
-	"openrouter_gemma_4_31b_it_wandb": {
-		Key: "openrouter_gemma_4_31b_it_wandb", Provider: providerOpenRouter,
+	"openrouter_gemma_4_31b_it_cerebras": {
+		Key: "openrouter_gemma_4_31b_it_cerebras", Provider: providerOpenRouter,
 		Model: "google/gemma-4-31b-it", Region: "us",
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
 		Temperature: floatPtr(0.5),
 		ExtraBody: map[string]any{
 			"provider": map[string]any{
-				"order":           []string{"wandb/bf16"},
-				"only":            []string{"wandb/bf16"},
+				"order":           []string{"cerebras/fp16"},
+				"only":            []string{"cerebras/fp16"},
 				"allow_fallbacks": false,
 			},
 		},
@@ -342,7 +352,7 @@ var modelGroups = map[string]modelGroup{
 		FallbackGroup: groupGPT41,
 	},
 	groupFollowUpDynamic: {
-		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_wandb"},
+		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_cerebras"},
 		Fallback: "openrouter_gemma_4_31b_it_modelrun",
 		// No healthy gemma endpoint in either provider falls back to the
 		// normal cross-group fallback (gpt-4.1), matching Python's

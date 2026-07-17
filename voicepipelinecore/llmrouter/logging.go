@@ -37,10 +37,20 @@ type CallLog struct {
 // logged deployment matches what Python records.
 func deploymentName(cfg endpointConfig) string {
 	if cfg.APIKeyEnv != "" {
-		if i := strings.Index(cfg.APIKeyEnv, "_API_KEY"); i >= 0 {
-			return cfg.APIKeyEnv[:i]
+		name := cfg.APIKeyEnv
+		if i := strings.Index(name, "_API_KEY"); i >= 0 {
+			name = name[:i]
 		}
-		return cfg.APIKeyEnv
+		// When we pin the OpenRouter provider ourselves, suffix it so
+		// llm logs distinguish e.g. OPENROUTER_MODELRUN from
+		// OPENROUTER_CEREBRAS. Configs without an explicit pin (no
+		// provider.only, e.g. throughput-sorted) stay plain OPENROUTER.
+		if cfg.Provider == providerOpenRouter {
+			if pinned := pinnedProviderSlug(cfg); pinned != "" {
+				name = name + "_" + strings.ToUpper(pinned)
+			}
+		}
+		return name
 	}
 	if cfg.Provider == providerVertex {
 		project := cfg.VertexProject
@@ -57,6 +67,23 @@ func deploymentName(cfg endpointConfig) string {
 		return strings.Join(parts, "_")
 	}
 	return string(cfg.Provider)
+}
+
+// pinnedProviderSlug returns the base slug (e.g. "modelrun" from
+// "modelrun/fp4") of a config's self-pinned OpenRouter provider — the
+// single entry of ExtraBody provider.only — or "" when the config does
+// not pin one.
+func pinnedProviderSlug(cfg endpointConfig) string {
+	provider, _ := cfg.ExtraBody["provider"].(map[string]any)
+	only, _ := provider["only"].([]string)
+	if len(only) != 1 {
+		return ""
+	}
+	slug := only[0]
+	if i := strings.Index(slug, "/"); i >= 0 {
+		slug = slug[:i]
+	}
+	return slug
 }
 
 func msFromDuration(d time.Duration) float64 {
