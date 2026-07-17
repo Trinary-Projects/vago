@@ -508,6 +508,7 @@ func TestBuildRequestOpenRouterGemmaProviderPreferences(t *testing.T) {
 	}{
 		{"openrouter_gemma_4_31b_it_modelrun", "modelrun/fp4"},
 		{"openrouter_gemma_4_31b_it_cerebras", "cerebras/fp16"},
+		{"openrouter_gemma_4_31b_it_openinference", "open-inference/bf16"},
 	}
 
 	for _, tc := range cases {

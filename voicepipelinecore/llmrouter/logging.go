@@ -47,7 +47,11 @@ func deploymentName(cfg endpointConfig) string {
 		// provider.only, e.g. throughput-sorted) stay plain OPENROUTER.
 		if cfg.Provider == providerOpenRouter {
 			if pinned := pinnedProviderSlug(cfg); pinned != "" {
-				name = name + "_" + strings.ToUpper(pinned)
+				// Hyphens become underscores (open-inference →
+				// OPEN_INFERENCE) so deployment names stay one flat
+				// underscore-delimited token. Must match Python's
+				// get_deployment_name.
+				name = name + "_" + strings.ToUpper(strings.ReplaceAll(pinned, "-", "_"))
 			}
 		}
 		return name

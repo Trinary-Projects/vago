@@ -13,9 +13,10 @@ func TestDeploymentNamePinnedOpenRouterProvider(t *testing.T) {
 	}{
 		{"openrouter_gemma_4_31b_it_modelrun", "OPENROUTER_MODELRUN"},
 		{"openrouter_gemma_4_31b_it_cerebras", "OPENROUTER_CEREBRAS"},
-		{"openrouter_gpt_oss_120b", "OPENROUTER"},            // no ExtraBody at all
-		{"openrouter_gpt_oss_120b_throughput", "OPENROUTER"}, // sort, not a pin
-		{"cerebras_gpt_oss_120b", "CEREBRAS_ENTERPRISE"},     // non-OpenRouter untouched
+		{"openrouter_gemma_4_31b_it_openinference", "OPENROUTER_OPEN_INFERENCE"}, // hyphen normalized
+		{"openrouter_gpt_oss_120b", "OPENROUTER"},                                // no ExtraBody at all
+		{"openrouter_gpt_oss_120b_throughput", "OPENROUTER"},                     // sort, not a pin
+		{"cerebras_gpt_oss_120b", "CEREBRAS_ENTERPRISE"},                         // non-OpenRouter untouched
 	}
 	for _, tc := range cases {
 		cfg, ok := endpointConfigs[tc.configKey]

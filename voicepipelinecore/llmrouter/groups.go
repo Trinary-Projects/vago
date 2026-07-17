@@ -231,6 +231,23 @@ var endpointConfigs = map[string]endpointConfig{
 			},
 		},
 	},
+	// open-inference/bf16 is cheaper than modelrun ($0.10/$0.35 vs
+	// $0.22/$0.55 per M) and supports tools, so it carries no
+	// extra_latency_padding_ms handicap — it competes with modelrun on
+	// latency alone.
+	"openrouter_gemma_4_31b_it_openinference": {
+		Key: "openrouter_gemma_4_31b_it_openinference", Provider: providerOpenRouter,
+		Model: "google/gemma-4-31b-it", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+		Temperature: floatPtr(0.5),
+		ExtraBody: map[string]any{
+			"provider": map[string]any{
+				"order":           []string{"open-inference/bf16"},
+				"only":            []string{"open-inference/bf16"},
+				"allow_fallbacks": false,
+			},
+		},
+	},
 
 	// --- follow-up get_guidance tool failover endpoints ---
 	"cerebras_gpt_oss_120b": {
@@ -352,7 +369,7 @@ var modelGroups = map[string]modelGroup{
 		FallbackGroup: groupGPT41,
 	},
 	groupFollowUpDynamic: {
-		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_cerebras"},
+		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_cerebras", "openrouter_gemma_4_31b_it_openinference"},
 		Fallback: "openrouter_gemma_4_31b_it_modelrun",
 		// No healthy gemma endpoint in either provider falls back to the
 		// normal cross-group fallback (gpt-4.1), matching Python's
