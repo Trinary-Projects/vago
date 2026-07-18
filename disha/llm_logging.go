@@ -96,6 +96,14 @@ func newLLMLogSink(api *APIClient, logger *log.Logger, usecaseType, userID, conv
 			"deployment":         c.Deployment,
 			"llm_call_completed": c.Completed,
 			"status_code":        statusCodeOrNil(c.StatusCode),
+			// The sink runs synchronously at call completion, so Now() is
+			// the real completion time. Without this the Python job stamps
+			// the log when IT runs, skewing Go rows by the SQS queue lag
+			// (4-60s+ under load) and making llm-log timelines unusable.
+			// TOP-LEVEL kwarg: requires disha-backend's log_llm_call to
+			// declare call_completed_at (deployed 2026-07-18) — an unknown
+			// kwarg TypeErrors the SQS job, so backend deploys first.
+			"call_completed_at": time.Now().UTC().Format("2006-01-02T15:04:05.000000"),
 		}
 		if len(c.PromptMetadata) > 0 {
 			kwargs["prompt_metadata"] = c.PromptMetadata

@@ -73,6 +73,13 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 		kwargs["completion_tokens"] != float64(7) {
 		t.Fatalf("kwargs mismatch: %+v", kwargs)
 	}
+	completedAt, ok := kwargs["call_completed_at"].(string)
+	if !ok || completedAt == "" {
+		t.Fatalf("call_completed_at = %#v, want non-empty string", kwargs["call_completed_at"])
+	}
+	if _, err := time.Parse("2006-01-02T15:04:05.000000", completedAt); err != nil {
+		t.Fatalf("call_completed_at %q not in naive-UTC microsecond ISO format: %v", completedAt, err)
+	}
 	promptMetadata, ok := kwargs["prompt_metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("prompt_metadata = %#v, want object", kwargs["prompt_metadata"])
