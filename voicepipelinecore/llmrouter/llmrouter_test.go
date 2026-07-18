@@ -166,14 +166,26 @@ func TestSelectionFallbackKeyWhenNoHealth(t *testing.T) {
 func TestSelectionGeminiGroupPicksHealthyEndpoint(t *testing.T) {
 	fr := newFakeRedis()
 	fr.setHealth("vertex_gemini_flash_3_1_lite", false, 300)
-	fr.setHealth("openrouter_gemini_flash_3_1_lite", false, 200)
+	fr.setHealth("google_ai_studio_gemini_flash_3_1_lite", false, 200)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupGemini31, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if sel.ConfigKey != "openrouter_gemini_flash_3_1_lite" || sel.UsingFallback {
+	if sel.ConfigKey != "google_ai_studio_gemini_flash_3_1_lite" || sel.UsingFallback {
 		t.Fatalf("selection = %+v, want fastest gemini endpoint", sel)
+	}
+}
+
+func TestGeminiGroupKeepsOpenRouterAsFallbackOnly(t *testing.T) {
+	group := modelGroups[groupGemini31]
+	if group.Fallback != "openrouter_gemini_flash_3_1_lite" {
+		t.Fatalf("fallback = %q, want OpenRouter Gemini 3.1 Flash Lite", group.Fallback)
+	}
+	for _, config := range group.Configs {
+		if config == group.Fallback {
+			t.Fatalf("OpenRouter fallback must not be eligible for primary selection")
+		}
 	}
 }
 

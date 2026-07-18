@@ -361,7 +361,6 @@ var modelGroups = map[string]modelGroup{
 		Configs: []string{
 			"vertex_gemini_flash_3_1_lite",
 			"google_ai_studio_gemini_flash_3_1_lite",
-			"openrouter_gemini_flash_3_1_lite",
 		},
 		Fallback: "openrouter_gemini_flash_3_1_lite",
 		// Python's LLMSwitchingService falls back to FALLBACK_MODEL_GROUP
