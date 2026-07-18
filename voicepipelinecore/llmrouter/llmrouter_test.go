@@ -226,33 +226,33 @@ func TestSelectionFollowUpDynamicSkipsBlacklistedProvider(t *testing.T) {
 	}
 }
 
-func TestSelectionFollowUpDynamicFallsBackToGPT41Group(t *testing.T) {
+func TestSelectionFollowUpDynamicFallsBackToGeminiGroup(t *testing.T) {
 	fr := newFakeRedis()
-	// No health data for either gemma provider; gpt-4.1 group has one
-	// healthy endpoint. Mirrors Python's LLMSwitchingService uniform
-	// FALLBACK_MODEL_GROUP behavior.
-	fr.setHealth("azure_gpt_4_1_us_west", false, 250)
+	// No health data for any gemma provider; the gemini-flash-3.1-lite
+	// group has one healthy endpoint. Mirrors Python's per-group
+	// "fallback_group" override in MODEL_GROUPS.
+	fr.setHealth("vertex_gemini_flash_3_1_lite", false, 250)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if !sel.UsingFallback || sel.SelectedGroup != groupGPT41 || sel.ConfigKey != "azure_gpt_4_1_us_west" {
-		t.Fatalf("selection = %+v, want gpt-4.1 group fallback", sel)
+	if !sel.UsingFallback || sel.SelectedGroup != groupGemini31 || sel.ConfigKey != "vertex_gemini_flash_3_1_lite" {
+		t.Fatalf("selection = %+v, want gemini-flash-3.1-lite group fallback", sel)
 	}
 }
 
 func TestSelectionFollowUpDynamicFallbackKeyWhenNoHealthAnywhere(t *testing.T) {
-	fr := newFakeRedis() // empty: no health anywhere, incl. gpt-4.1
+	fr := newFakeRedis() // empty: no health anywhere, incl. the gemini group
 	sel, ok := getFastestForGroup(ctx(), fr, groupFollowUpDynamic, "us")
 	if !ok {
 		t.Fatal("expected a last-resort selection")
 	}
-	if sel.ConfigKey != modelGroups[groupGPT41].Fallback {
-		t.Errorf("selected %q, want gpt-4.1 hardcoded fallback %q", sel.ConfigKey, modelGroups[groupGPT41].Fallback)
+	if sel.ConfigKey != modelGroups[groupGemini31].Fallback {
+		t.Errorf("selected %q, want gemini group hardcoded fallback %q", sel.ConfigKey, modelGroups[groupGemini31].Fallback)
 	}
-	if !sel.UsingFallback || sel.SelectedGroup != groupGPT41 {
-		t.Fatalf("selection = %+v, want UsingFallback with SelectedGroup gpt-4.1", sel)
+	if !sel.UsingFallback || sel.SelectedGroup != groupGemini31 {
+		t.Fatalf("selection = %+v, want UsingFallback with SelectedGroup gemini-flash-3.1-lite", sel)
 	}
 }
 

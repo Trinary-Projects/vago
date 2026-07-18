@@ -371,14 +371,16 @@ var modelGroups = map[string]modelGroup{
 	groupFollowUpDynamic: {
 		Configs:  []string{"openrouter_gemma_4_31b_it_modelrun", "openrouter_gemma_4_31b_it_cerebras", "openrouter_gemma_4_31b_it_openinference"},
 		Fallback: "openrouter_gemma_4_31b_it_modelrun",
-		// No healthy gemma endpoint in either provider falls back to the
-		// normal cross-group fallback (gpt-4.1), matching Python's
-		// LLMSwitchingService uniform FALLBACK_MODEL_GROUP behavior.
-		// (When gpt-4.1 has no health data either, selection returns that
-		// group's own hardcoded fallback; the Fallback above is unreachable
-		// while the gpt-4.1 group exists and is kept only for shape parity
-		// with Python's group entry.)
-		FallbackGroup: groupGPT41,
+		// No healthy gemma endpoint in any pinned provider falls back to
+		// the cheap gemini-flash-3.1-lite group (decided 2026-07-17,
+		// replacing the earlier gpt-4.1 target). Python mirrors this via
+		// the per-group "fallback_group" override in MODEL_GROUPS —
+		// LLMSwitchingService's uniform FALLBACK_MODEL_GROUP applies only
+		// to groups without that key. (When the gemini group has no health
+		// data either, selection returns its hardcoded fallback config;
+		// the Fallback above is unreachable while the gemini group exists
+		// and is kept only for shape parity with Python's group entry.)
+		FallbackGroup: groupGemini31,
 	},
 	groupGPTOSS120Fast: {
 		Configs: []string{
