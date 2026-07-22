@@ -13,6 +13,67 @@ import (
 	vpc "github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
+// geminiThoughtSignatureSkip is Google's documented bypass value for
+// Gemini 3's thought-signature validation. Gemini 3 rejects any request
+// whose history contains assistant functionCall parts without a
+// thought_signature (400 "Function call is missing a thought_signature"),
+// which hits every turn after a tool call (get_guidance/end_call) and
+// resume replays. Mirrors Python's
+// custom_llm_service._inject_gemini_thought_signatures.
+const geminiThoughtSignatureSkip = "skip_thought_signature_validator"
+
+// messagesForModel returns the request messages, injecting the
+// thought-signature bypass into assistant tool_calls for gemini-3
+// models (any provider — vertex, google_ai_studio, and openrouter all
+// route to the same Google backends). Other models get the messages
+// unchanged.
+func messagesForModel(model string, messages []vpc.Message) any {
+	if !strings.Contains(strings.ToLower(model), "gemini-3") {
+		return messages
+	}
+	needsInjection := false
+	for _, m := range messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			needsInjection = true
+			break
+		}
+	}
+	if !needsInjection {
+		return messages
+	}
+	out := make([]any, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			out = append(out, m)
+			continue
+		}
+		msg := map[string]any{"role": m.Role}
+		if m.Content != "" {
+			msg["content"] = m.Content
+		}
+		if m.ToolCallID != "" {
+			msg["tool_call_id"] = m.ToolCallID
+		}
+		calls := make([]map[string]any, 0, len(m.ToolCalls))
+		for _, tc := range m.ToolCalls {
+			calls = append(calls, map[string]any{
+				"id":   tc.ID,
+				"type": tc.Type,
+				"function": map[string]any{
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+				"extra_content": map[string]any{
+					"google": map[string]any{"thought_signature": geminiThoughtSignatureSkip},
+				},
+			})
+		}
+		msg["tool_calls"] = calls
+		out = append(out, msg)
+	}
+	return out
+}
+
 // buildRequest assembles an OpenAI Chat-Completions streaming request
 // for the chosen endpoint. Every provider speaks the same body shape;
 // only the base URL and auth header differ (Azure uses an api-key
@@ -28,7 +89,7 @@ func (r *Router) buildRequest(ctx context.Context, cfg endpointConfig, llmReq vp
 		"model":          cfg.Model,
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
-		"messages":       llmReq.Messages,
+		"messages":       messagesForModel(cfg.Model, llmReq.Messages),
 		"temperature":    r.temperatureFor(cfg),
 	}
 	if len(llmReq.Tools) > 0 {
