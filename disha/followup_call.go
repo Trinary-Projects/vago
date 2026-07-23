@@ -20,7 +20,6 @@ const (
 
 	followUpModelGroup              = "gemini-flash-3.1-lite"
 	followUpPhoneOverrideModelGroup = "gpt-4.1"
-	followUpDynamicModelGroup       = "followup-dynamic-gemma"
 	followUpGuidanceModelGroup      = "gpt-oss120-fast"
 
 	followUpPromptDefault            = "followup_call/system_prompt"
@@ -72,10 +71,12 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 
 	metadata := buildPromptTraceMetadata("system", promptName, promptVersion, variables)
 
+	// Dynamic check-in deliberately shares the regular follow-up group
+	// (decided 2026-07-23): the gemma-on-OpenRouter split was retired
+	// after persistent shared-quota 429 storms — gemini-flash-3.1-lite
+	// spans three separate infrastructures and needs no provider pinning.
 	modelGroup := followUpModelGroup
-	if dynamic {
-		modelGroup = followUpDynamicModelGroup
-	} else if promptName == followUpPromptInvestorDemo {
+	if promptName == followUpPromptInvestorDemo {
 		modelGroup = followUpPhoneOverrideModelGroup
 	}
 

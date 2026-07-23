@@ -311,8 +311,8 @@ func TestFollowUpBotPlanDynamicLoadsCallFlowAndTools(t *testing.T) {
 	if !pl.Dynamic {
 		t.Fatal("Dynamic = false, want true")
 	}
-	if pl.ModelGroup != followUpDynamicModelGroup {
-		t.Fatalf("ModelGroup = %q, want %q", pl.ModelGroup, followUpDynamicModelGroup)
+	if pl.ModelGroup != followUpModelGroup {
+		t.Fatalf("ModelGroup = %q, want %q (dynamic shares the regular follow-up group)", pl.ModelGroup, followUpModelGroup)
 	}
 	if pl.PromptKey != "disha_init_calls/dynamic_checkin_call/main_sys_v12" {
 		t.Fatalf("PromptKey = %q", pl.PromptKey)
