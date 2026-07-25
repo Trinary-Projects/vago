@@ -270,7 +270,7 @@ func newOnboardingChunkDecorator(state *ConversationState, uploader JSONUploader
 		stateDict["user_id"] = userID
 		stateDict["conversation_id"] = conversationID
 		objectKey := fmt.Sprintf("conversation_state/%s/%s.json", conversationID, chunk.ID)
-		ctx, cancel := context.WithTimeout(context.Background(), defaultS3UploadTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultS3OperationTimeout)
 		defer cancel()
 		if err := uploader.UploadJSON(ctx, objectKey, stateDict); err != nil {
 			wrapped := fmt.Errorf("disha: conversation state upload: %w", err)

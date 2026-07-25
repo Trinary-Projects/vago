@@ -80,7 +80,7 @@ func (p *PhoneticDict) ensureLoaded(ctx context.Context) {
 			p.loadErr = errors.New("disha: phonetic dict client is nil")
 			return
 		}
-		fetchCtx, cancel := context.WithTimeout(ctx, defaultS3DownloadTimeout)
+		fetchCtx, cancel := context.WithTimeout(ctx, defaultS3OperationTimeout)
 		defer cancel()
 		raw, err := p.client.GetObject(fetchCtx, "", p.objectKey)
 		if err != nil {
