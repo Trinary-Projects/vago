@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,8 +24,8 @@ import (
 )
 
 const (
-	defaultS3UploadTimeout   = 10 * time.Second
-	defaultS3DownloadTimeout = 15 * time.Second
+	defaultS3RequestTimeout   = 5 * time.Second
+	defaultS3OperationTimeout = 20 * time.Second
 )
 
 type JSONUploader interface {
@@ -41,16 +42,17 @@ type S3GetClient interface {
 type DebugLogUploader func(ctx context.Context, entries []voicepipelinecore.RTVIDebugLogEntry) (string, error)
 
 type S3Uploader struct {
-	accessKey  string
-	secretKey  string
-	region     string
-	bucket     string
-	httpClient *http.Client
-	logger     *log.Logger
+	accessKey   string
+	secretKey   string
+	region      string
+	bucket      string
+	httpClient  *http.Client
+	logger      *log.Logger
+	retryDelays []time.Duration
 }
 
 func NewS3UploaderFromEnv(logger *log.Logger) JSONUploader {
-	uploader := newS3ClientFromEnv(logger, os.Getenv("AWS_BUCKET_NAME"), os.Getenv("AWS_MAIN_REGION"), defaultS3UploadTimeout)
+	uploader := newS3ClientFromEnv(logger, os.Getenv("AWS_BUCKET_NAME"), os.Getenv("AWS_MAIN_REGION"), defaultS3RequestTimeout)
 	if uploader == nil {
 		reportS3EnvIncomplete(logger, "debug_log_upload_client", "AWS_BUCKET_NAME", "AWS_MAIN_REGION")
 		return nil
@@ -65,7 +67,7 @@ func NewS3UploaderFromEnv(logger *log.Logger) JSONUploader {
 // Python's S3Service.upload_file(use_us_bucket=True), including the
 // public-read ACL.
 func NewUSBucketJSONUploaderFromEnv(logger *log.Logger) JSONUploader {
-	uploader := newS3ClientFromEnv(logger, os.Getenv("AWS_US_BUCKET_NAME"), os.Getenv("AWS_US_REGION"), defaultS3UploadTimeout)
+	uploader := newS3ClientFromEnv(logger, os.Getenv("AWS_US_BUCKET_NAME"), os.Getenv("AWS_US_REGION"), defaultS3RequestTimeout)
 	if uploader == nil {
 		reportS3EnvIncomplete(logger, "us_bucket_json_upload_client", "AWS_US_BUCKET_NAME", "AWS_US_REGION")
 		return nil
@@ -79,7 +81,7 @@ func NewUSBucketJSONUploaderFromEnv(logger *log.Logger) JSONUploader {
 // answers 301 PermanentRedirect on a mismatch (e.g. AWS_US_BUCKET_NAME
 // lives in AWS_US_REGION, not AWS_MAIN_REGION).
 func NewS3GetClientFromEnv(logger *log.Logger, bucketEnvKey, regionEnvKey string) S3GetClient {
-	client := newS3ClientFromEnv(logger, os.Getenv(bucketEnvKey), os.Getenv(regionEnvKey), defaultS3DownloadTimeout)
+	client := newS3ClientFromEnv(logger, os.Getenv(bucketEnvKey), os.Getenv(regionEnvKey), defaultS3RequestTimeout)
 	if client == nil {
 		reportS3EnvIncomplete(logger, "get_client", bucketEnvKey, regionEnvKey)
 		return nil
@@ -118,6 +120,10 @@ func newS3ClientFromEnv(logger *log.Logger, bucket, region string, timeout time.
 		bucket:     strings.TrimSpace(bucket),
 		httpClient: &http.Client{Timeout: timeout},
 		logger:     logger,
+		retryDelays: []time.Duration{
+			100 * time.Millisecond,
+			200 * time.Millisecond,
+		},
 	}
 	if client.accessKey == "" || client.secretKey == "" || client.region == "" || client.bucket == "" {
 		return nil
@@ -150,7 +156,7 @@ func uploadDebugLogs(logger interface{ Println(v ...any) }, uploader DebugLogUpl
 	if uploader == nil || len(logs) == 0 {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), postCallRequestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultS3OperationTimeout)
 	defer cancel()
 	key, err := uploader(ctx, logs)
 	if err != nil {
@@ -197,7 +203,32 @@ func (u *S3Uploader) GetObject(ctx context.Context, bucket, objectKey string) ([
 	if strings.TrimSpace(bucket) == "" {
 		bucket = u.bucket
 	}
+	return u.getObjectWithRetry(ctx, bucket, objectKey)
+}
 
+func (u *S3Uploader) getObjectWithRetry(ctx context.Context, bucket, objectKey string) ([]byte, error) {
+	maxAttempts := len(u.retryDelays) + 1
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		body, status, retryable, err := u.getObjectOnce(ctx, bucket, objectKey)
+		if err == nil {
+			return body, nil
+		}
+		if retryable && attempt < maxAttempts {
+			if err := u.waitForS3Retry(ctx, http.MethodGet, bucket, objectKey, attempt, maxAttempts, err); err == nil {
+				continue
+			} else {
+				return nil, u.captureS3Failure(http.MethodGet, bucket, objectKey, status, attempt, err)
+			}
+		}
+		if attempt > 1 {
+			err = fmt.Errorf("%w (after %d attempts)", err, attempt)
+		}
+		return nil, u.captureS3Failure(http.MethodGet, bucket, objectKey, status, attempt, err)
+	}
+	return nil, errors.New("disha: S3 GET retry loop exhausted without an error")
+}
+
+func (u *S3Uploader) getObjectOnce(ctx context.Context, bucket, objectKey string) ([]byte, int, bool, error) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
@@ -240,16 +271,7 @@ func (u *S3Uploader) GetObject(ctx context.Context, bucket, objectKey string) ([
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		wrapped := fmt.Errorf("disha: build S3 GET: %w", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "GET"},
-			Details: map[string]any{
-				"bucket":     bucket,
-				"object_key": objectKey,
-			},
-		})
-		return nil, wrapped
+		return nil, 0, false, fmt.Errorf("disha: build S3 GET: %w", err)
 	}
 	req.Header.Set("Authorization", authorization)
 	for name, value := range headers {
@@ -258,36 +280,46 @@ func (u *S3Uploader) GetObject(ctx context.Context, bucket, objectKey string) ([
 
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
-		wrapped := fmt.Errorf("disha: S3 GET failed: %w", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "GET"},
-			Details: map[string]any{
-				"bucket":     bucket,
-				"object_key": objectKey,
-			},
-		})
-		return nil, wrapped
+		return nil, 0, ctx.Err() == nil, fmt.Errorf("disha: S3 GET failed: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, resp.StatusCode, ctx.Err() == nil, fmt.Errorf("disha: read S3 GET response: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		wrapped := fmt.Errorf("disha: S3 GET returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "GET"},
-			Details: map[string]any{
-				"bucket":     bucket,
-				"object_key": objectKey,
-				"status":     resp.StatusCode,
-			},
-		})
-		return nil, wrapped
+		return nil, resp.StatusCode, isRetryableS3Response(resp.StatusCode, body), fmt.Errorf(
+			"disha: S3 GET returned %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
-	return body, nil
+	return body, resp.StatusCode, false, nil
 }
 
 func (u *S3Uploader) putObject(ctx context.Context, objectKey string, payload []byte, contentType string) error {
+	maxAttempts := len(u.retryDelays) + 1
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		status, retryable, err := u.putObjectOnce(ctx, objectKey, payload, contentType)
+		if err == nil {
+			return nil
+		}
+		if retryable && attempt < maxAttempts {
+			if err := u.waitForS3Retry(ctx, http.MethodPut, u.bucket, objectKey, attempt, maxAttempts, err); err == nil {
+				continue
+			} else {
+				return u.captureS3Failure(http.MethodPut, u.bucket, objectKey, status, attempt, err)
+			}
+		}
+		if attempt > 1 {
+			err = fmt.Errorf("%w (after %d attempts)", err, attempt)
+		}
+		return u.captureS3Failure(http.MethodPut, u.bucket, objectKey, status, attempt, err)
+	}
+	return errors.New("disha: S3 PUT retry loop exhausted without an error")
+}
+
+func (u *S3Uploader) putObjectOnce(ctx context.Context, objectKey string, payload []byte, contentType string) (int, bool, error) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
@@ -332,16 +364,7 @@ func (u *S3Uploader) putObject(ctx context.Context, objectKey string, payload []
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		wrapped := fmt.Errorf("disha: build S3 PUT: %w", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "PUT"},
-			Details: map[string]any{
-				"bucket":     u.bucket,
-				"object_key": objectKey,
-			},
-		})
-		return wrapped
+		return 0, false, fmt.Errorf("disha: build S3 PUT: %w", err)
 	}
 	req.Header.Set("Authorization", authorization)
 	for name, value := range headers {
@@ -351,33 +374,93 @@ func (u *S3Uploader) putObject(ctx context.Context, objectKey string, payload []
 
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
-		wrapped := fmt.Errorf("disha: S3 PUT failed: %w", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "PUT"},
-			Details: map[string]any{
-				"bucket":     u.bucket,
-				"object_key": objectKey,
-			},
-		})
-		return wrapped
+		return 0, ctx.Err() == nil, fmt.Errorf("disha: S3 PUT failed: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		wrapped := fmt.Errorf("disha: S3 PUT returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-		sentryutil.Capture(sentryutil.Event{
-			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_s3", "operation": "PUT"},
-			Details: map[string]any{
-				"bucket":     u.bucket,
-				"object_key": objectKey,
-				"status":     resp.StatusCode,
-			},
-		})
-		return wrapped
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if readErr != nil {
+			return resp.StatusCode, ctx.Err() == nil, fmt.Errorf("disha: read S3 PUT response: %w", readErr)
+		}
+		return resp.StatusCode, isRetryableS3Response(resp.StatusCode, raw), fmt.Errorf(
+			"disha: S3 PUT returned %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(raw)),
+		)
 	}
-	return nil
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, false, nil
+}
+
+func (u *S3Uploader) waitForS3Retry(
+	ctx context.Context,
+	method, bucket, objectKey string,
+	attempt, maxAttempts int,
+	cause error,
+) error {
+	maxDelay := u.retryDelays[attempt-1]
+	delay := time.Duration(0)
+	if maxDelay > 0 {
+		delay = time.Duration(rand.Int64N(int64(maxDelay) + 1))
+	}
+	if u.logger != nil {
+		u.logger.Printf(
+			"disha: transient S3 %s failure attempt=%d/%d bucket=%s object_key=%s retrying_in=%s: %v\n",
+			method,
+			attempt,
+			maxAttempts,
+			bucket,
+			objectKey,
+			delay,
+			cause,
+		)
+	}
+	if delay == 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("disha: S3 %s retry stopped after %d attempts: %w", method, attempt, ctx.Err())
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("disha: S3 %s retry stopped after %d attempts: %w", method, attempt, ctx.Err())
+	}
+}
+
+func (u *S3Uploader) captureS3Failure(method, bucket, objectKey string, status, attempts int, err error) error {
+	details := map[string]any{
+		"bucket":     bucket,
+		"object_key": objectKey,
+		"attempts":   attempts,
+	}
+	if status != 0 {
+		details["status"] = status
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Err:     err,
+		Tags:    map[string]string{"component": "disha_s3", "operation": method},
+		Details: details,
+	})
+	return err
+}
+
+func isRetryableS3Response(status int, body []byte) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 {
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+	responseBody := string(body)
+	return strings.Contains(responseBody, "<Code>RequestTimeout</Code>") ||
+		strings.Contains(responseBody, "<Code>RequestTimeoutException</Code>")
 }
 
 func sortedHeaderNames(headers map[string]string) []string {
