@@ -15,6 +15,14 @@ import (
 // StageThresholdMonitor._tag_user writes when a stage stalls.
 const stageTransitionFailureTag = "Stage Transition Failure"
 
+// stageThresholdGraceTurns is how many turns past a stage's configured
+// turn_threshold are tolerated before alerting, so a stage that merely runs
+// long doesn't page anyone. Prod data from 2026-07-28 showed calls crossing
+// the bare threshold and then progressing normally, so the alert fires at
+// threshold + this + 1. Keep in sync with Python's
+// STAGE_THRESHOLD_GRACE_TURNS.
+const stageThresholdGraceTurns = 3
+
 // OnboardingStageThresholdMonitor is the Go port of Disha's
 // bots/onboarding_call/stage_threshold_monitor.py: it counts assistant
 // turns spent on the current stage and raises one alert per stage when the
@@ -104,12 +112,13 @@ func (m *OnboardingStageThresholdMonitor) OnAssistantTurnCommitted() {
 		return
 	}
 
-	if turnCount <= threshold {
+	if turnCount <= threshold+stageThresholdGraceTurns {
 		m.logger.Printf("Stage threshold check for stage %q: turn %d, threshold %d, no action needed", stageName, turnCount, threshold)
 		return
 	}
 
-	m.logger.Printf("Stage turn threshold exceeded for stage %q (turn %d, threshold %d), handling alert", stageName, turnCount, threshold)
+	m.logger.Printf("Stage turn threshold exceeded by %d for stage %q (turn %d, threshold %d), handling alert",
+		stageThresholdGraceTurns, stageName, turnCount, threshold)
 	m.state.MarkStageThresholdAlerted()
 	m.handleAlert(stageName, turnCount, threshold)
 }

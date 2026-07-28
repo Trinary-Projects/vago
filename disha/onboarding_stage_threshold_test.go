@@ -11,9 +11,13 @@ import (
 )
 
 // The student_test fixture's start stage (introduction) has
-// turn_threshold: 10, so 10 committed assistant turns are silent and the
-// 11th trips the alert.
+// turn_threshold: 10, and the monitor allows stageThresholdGraceTurns past
+// it, so turns up to 13 are silent and the 14th trips the alert.
 const thresholdFixtureIntroThreshold = 10
+
+// thresholdFixtureIntroAlertTurn is the first turn count that alerts on the
+// introduction stage: threshold + grace + 1.
+const thresholdFixtureIntroAlertTurn = thresholdFixtureIntroThreshold + stageThresholdGraceTurns + 1
 
 func (h *stageMachineHarness) commitAssistantTurns(n int) {
 	h.t.Helper()
@@ -42,16 +46,21 @@ func (h *stageMachineHarness) thresholdSentryMessages() []string {
 	return out
 }
 
-func TestStageThresholdNoActionBelowThreshold(t *testing.T) {
+func TestStageThresholdNoActionWithinGrace(t *testing.T) {
 	h := newStageMachineHarness(t, &stubStageClassifier{})
 
-	h.commitAssistantTurns(thresholdFixtureIntroThreshold)
+	// Crossing the bare threshold is not enough: the grace turns must be
+	// used up too. Prod calls were seen passing the raw threshold and then
+	// progressing normally, which is why the grace exists.
+	h.commitAssistantTurns(thresholdFixtureIntroAlertTurn - 1)
 
-	if got := h.state.StageTurnCount(); got != thresholdFixtureIntroThreshold {
-		t.Fatalf("stage turn count = %d, want %d", got, thresholdFixtureIntroThreshold)
+	if got := h.state.StageTurnCount(); got != thresholdFixtureIntroAlertTurn-1 {
+		t.Fatalf("stage turn count = %d, want %d", got, thresholdFixtureIntroAlertTurn-1)
 	}
 	if h.state.StageThresholdAlerted() {
-		t.Fatal("alerted at exactly the threshold; want alert only once it is exceeded")
+		t.Fatalf("alerted at turn %d; want no alert until turn %d (threshold %d + grace %d)",
+			thresholdFixtureIntroAlertTurn-1, thresholdFixtureIntroAlertTurn,
+			thresholdFixtureIntroThreshold, stageThresholdGraceTurns)
 	}
 	if msgs := h.thresholdSentryMessages(); len(msgs) != 0 {
 		t.Fatalf("Sentry messages = %v, want none", msgs)
@@ -67,22 +76,22 @@ func TestStageThresholdNoActionBelowThreshold(t *testing.T) {
 func TestStageThresholdAlertsOnceWhenExceeded(t *testing.T) {
 	h := newStageMachineHarness(t, &stubStageClassifier{})
 
-	// One past the threshold trips it; the decision is alert at
-	// turn_count > threshold (the old threshold+3 grace existed only to
-	// give the removed context reminder a chance to work).
-	h.commitAssistantTurns(thresholdFixtureIntroThreshold + 1)
+	// Alert fires at threshold + grace + 1, i.e. turn 14 for a threshold of
+	// 10. The Sentry message reports the raw threshold, not the effective
+	// one, so the message text matches Python's historical issue grouping.
+	h.commitAssistantTurns(thresholdFixtureIntroAlertTurn)
 
 	if !h.state.StageThresholdAlerted() {
 		t.Fatal("expected stage_threshold_alerted to be set")
 	}
 
-	want := "Stage turn threshold exceeded: introduction had 11 turns (threshold: 10)"
+	want := "Stage turn threshold exceeded: introduction had 14 turns (threshold: 10)"
 	msgs := h.thresholdSentryMessages()
 	if len(msgs) != 1 || msgs[0] != want {
 		t.Fatalf("Sentry messages = %v, want exactly [%q]", msgs, want)
 	}
 
-	h.waitForRTVI("[STAGE] Threshold exceeded: introduction had 11 turns (threshold: 10)")
+	h.waitForRTVI("[STAGE] Threshold exceeded: introduction had 14 turns (threshold: 10)")
 
 	waitForCondition(t, 5*time.Second, "add_tag_to_user request", func() bool {
 		return len(h.tagRequests()) == 1
@@ -98,8 +107,8 @@ func TestStageThresholdAlertsOnceWhenExceeded(t *testing.T) {
 	// Further turns on the same stage must stay silent: one alert per
 	// stage, matching Python's stage_threshold_alerted guard.
 	h.commitAssistantTurns(5)
-	if got := h.state.StageTurnCount(); got != thresholdFixtureIntroThreshold+6 {
-		t.Fatalf("stage turn count = %d, want %d", got, thresholdFixtureIntroThreshold+6)
+	if got := h.state.StageTurnCount(); got != thresholdFixtureIntroAlertTurn+5 {
+		t.Fatalf("stage turn count = %d, want %d", got, thresholdFixtureIntroAlertTurn+5)
 	}
 	if msgs := h.thresholdSentryMessages(); len(msgs) != 1 {
 		t.Fatalf("Sentry messages = %v, want the alert to fire exactly once", msgs)
@@ -112,7 +121,7 @@ func TestStageThresholdAlertsOnceWhenExceeded(t *testing.T) {
 func TestStageThresholdResetsOnStageTransition(t *testing.T) {
 	h := newStageMachineHarness(t, &stubStageClassifier{})
 
-	h.commitAssistantTurns(thresholdFixtureIntroThreshold + 1)
+	h.commitAssistantTurns(thresholdFixtureIntroAlertTurn)
 	if !h.state.StageThresholdAlerted() {
 		t.Fatal("expected the introduction alert to fire first")
 	}
@@ -133,9 +142,9 @@ func TestStageThresholdResetsOnStageTransition(t *testing.T) {
 	}
 
 	// The new stage's threshold is 20 in the fixture, so the old count is
-	// genuinely gone rather than merely unread.
-	h.commitAssistantTurns(21)
-	want := "Stage turn threshold exceeded: problem_discovery_and_exploration had 21 turns (threshold: 20)"
+	// genuinely gone rather than merely unread. 20 + grace + 1 = 24.
+	h.commitAssistantTurns(20 + stageThresholdGraceTurns + 1)
+	want := "Stage turn threshold exceeded: problem_discovery_and_exploration had 24 turns (threshold: 20)"
 	msgs := h.thresholdSentryMessages()
 	if len(msgs) != 2 || msgs[1] != want {
 		t.Fatalf("Sentry messages = %v, want second message %q", msgs, want)
@@ -182,7 +191,7 @@ func TestStageThresholdRunsForTrackerVariant(t *testing.T) {
 		t.Fatalf("harness variant = %s, want the tracker variant student_test", got)
 	}
 
-	h.commitAssistantTurns(thresholdFixtureIntroThreshold + 1)
+	h.commitAssistantTurns(thresholdFixtureIntroAlertTurn)
 
 	if len(h.thresholdSentryMessages()) != 1 {
 		t.Fatalf("tracker variant produced no threshold alert; Sentry messages = %v",
