@@ -126,6 +126,7 @@ type stageMachineHarness struct {
 	routerMeta  *stubMetadataRecorder
 	manager     *OnboardingStageManager
 	tracker     *OnboardingStageTracker
+	threshold   *OnboardingStageThresholdMonitor
 	promptKey   string
 
 	// hub is a private, network-free Sentry hub (own client + mock
@@ -226,10 +227,18 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 		stageTestUserID, stageTestConversationID, promptKey)
 	tracker := NewOnboardingStageTracker(state, cfg, deps.Documents, manager, classifier, logger,
 		stageTestUserID, stageTestConversationID, stageTestPatientInfo)
+	threshold := NewOnboardingStageThresholdMonitor(state, api, logger,
+		stageTestUserID, stageTestConversationID)
+	callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time) {
+		threshold.OnAssistantTurnCommitted()
+	})
+
 	manager.SetInfrastructure(pair, routerMeta, ui)
 	tracker.SetInfrastructure(context.Background(), pair, ui)
 	manager.SetSentryHub(hub)
 	tracker.SetSentryHub(hub)
+	threshold.SetUI(ui)
+	threshold.SetSentryHub(hub)
 
 	return &stageMachineHarness{
 		t:            t,
@@ -245,6 +254,7 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 		routerMeta:   routerMeta,
 		manager:      manager,
 		tracker:      tracker,
+		threshold:    threshold,
 		promptKey:    promptKey,
 		hub:          hub,
 		hubTransport: hubTransport,

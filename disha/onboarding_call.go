@@ -319,8 +319,9 @@ func newOnboardingPostCallDecorator(state *ConversationState, userID string) fun
 
 // BuildTask assembles the onboarding pipeline: the follow-up shape
 // (LLM → response timeout → output filter → TTS) with no talk-time
-// monitor — Python's onboarding pipeline has no talk-time limit, and the
-// StageThresholdProcessor is tool-call-architecture-only (not ported).
+// monitor — Python's onboarding pipeline has no talk-time limit. Stuck-stage
+// alerting is not a processor in either runtime: see
+// OnboardingStageThresholdMonitor, driven off committed assistant turns.
 func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Deps) (*voicepipelinecore.PipelineTask, error) {
 	pl, err := b.plan(ctx, req.ConversationID, deps)
 	if err != nil {
@@ -359,11 +360,19 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
 		pl.Startup.Data.Conversation.PatientInfo,
 	)
-	// CallEventCallbacks owns every callback in Events(); the tracker is
-	// wired as its OnLLMCallCompleted handler (Python's pipeline manager
-	// receiving on_llm_call_complete and delegating to the tracker) so the
-	// mapping below stays the plain Events() used by sales/follow-up.
+	thresholdMonitor := NewOnboardingStageThresholdMonitor(
+		pl.State, deps.API,
+		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
+	)
+	// CallEventCallbacks owns every callback in Events(); the tracker and
+	// threshold monitor are wired as its handlers (Python's pipeline manager
+	// receiving on_llm_call_complete / on_assistant_turn_stopped and
+	// delegating) so the mapping below stays the plain Events() used by
+	// sales/follow-up.
 	pl.Callbacks.SetLLMCallCompletedHandler(stageTracker.OnLLMCallCompleted)
+	pl.Callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time) {
+		thresholdMonitor.OnAssistantTurnCommitted()
+	})
 
 	task, err := voicepipelinecore.NewPipelineTask(ctx, voicepipelinecore.TaskConfig{
 		Logger:     pl.Startup.Logger,
@@ -422,10 +431,12 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	stageTracker.SetInfrastructure(taskCtx.Ctx, contextAggregators, taskCtx.UIEvents)
 	dtManager.SetUI(taskCtx.UIEvents)
 	careplanManager.SetUI(taskCtx.UIEvents)
+	thresholdMonitor.SetUI(taskCtx.UIEvents)
 	stageManager.SetSentryHub(taskCtx.SentryHub())
 	stageTracker.SetSentryHub(taskCtx.SentryHub())
 	dtManager.SetSentryHub(taskCtx.SentryHub())
 	careplanManager.SetSentryHub(taskCtx.SentryHub())
+	thresholdMonitor.SetSentryHub(taskCtx.SentryHub())
 
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)

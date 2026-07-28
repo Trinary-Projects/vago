@@ -31,6 +31,12 @@ type CallEventCallbacks struct {
 	// OnLLMCallCompleted then no-ops.
 	llmCallCompleted func(text string, interrupted bool)
 
+	// assistantTurnCommitted receives each committed assistant turn
+	// (Python's OnboardingPipelineManager.on_assistant_turn_stopped
+	// delegating to the stage-threshold monitor). Nil for bots without a
+	// stage machine; OnAssistantTurnCommitted then only persists the chunk.
+	assistantTurnCommitted func(text string, at time.Time)
+
 	// chunkDecorator lets bot-specific code enrich a chunk immediately
 	// before it is written to Redis (e.g. onboarding calls attach the
 	// current stage name and a conversation-state S3 key to every
@@ -102,6 +108,17 @@ func (c *CallEventCallbacks) OnLLMCallCompleted(text string, interrupted bool) {
 	c.llmCallCompleted(text, interrupted)
 }
 
+// SetAssistantTurnCommittedHandler wires bot-specific work that must run
+// after a committed assistant turn is persisted; other bots leave it unset.
+// Example: onboarding calls use this to advance the per-stage turn count
+// for stuck-stage alerting.
+func (c *CallEventCallbacks) SetAssistantTurnCommittedHandler(fn func(text string, at time.Time)) {
+	if c == nil {
+		return
+	}
+	c.assistantTurnCommitted = fn
+}
+
 func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
 	if c == nil {
 		return voicepipelinecore.CallEvents{}
@@ -144,6 +161,9 @@ func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, prom
 
 func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) {
 	c.appendConversationChunk(text, "assistant", at, metrics, promptKey)
+	if c.assistantTurnCommitted != nil {
+		c.assistantTurnCommitted(text, at)
+	}
 }
 
 func (c *CallEventCallbacks) OnToolResultCommitted(assistantToolCall voicepipelinecore.Message, toolResult voicepipelinecore.Message, at time.Time) {

@@ -13,9 +13,10 @@ import (
 // Go tracker goroutine, deep-thinking callbacks, and turn persistence
 // touch it concurrently, so every accessor holds the mutex.
 //
-// stage_threshold_reminded/alerted stay in the persisted JSON (always
-// false) for shape compatibility even though the StageThresholdProcessor
-// is not ported (tool-call-variant-only).
+// stage_threshold_reminded stays in the persisted JSON (always false) for
+// shape compatibility with older chunks and with Python, which dropped the
+// stage-transition reminder injection; stage_threshold_alerted is live and
+// owned by OnboardingStageThresholdMonitor.
 type ConversationState struct {
 	mu                     sync.Mutex
 	variant                string
@@ -140,10 +141,26 @@ func (s *ConversationState) StageTurnCount() int {
 	return s.stageTurnCount
 }
 
-func (s *ConversationState) IncrementStageTurnCount() {
+// IncrementStageTurnCount counts one more assistant turn on the current
+// stage and returns the new count, so the threshold monitor can check it
+// without a second lock round trip.
+func (s *ConversationState) IncrementStageTurnCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stageTurnCount++
+	return s.stageTurnCount
+}
+
+func (s *ConversationState) StageThresholdAlerted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stageThresholdAlerted
+}
+
+func (s *ConversationState) MarkStageThresholdAlerted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stageThresholdAlerted = true
 }
 
 // AdvanceStage mirrors conversation_state.advance_stage: enter the new
