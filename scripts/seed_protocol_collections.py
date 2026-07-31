@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """Inspect / fix / seed / probe the ProtocolAnchor + ProtocolInstruction
-collections on the US Weaviate instance, for dynamic-check-in protocol
-retrieval testing.
+collections on the US Weaviate instance.
+
+Targets the PRODUCTION instance by default (2026-07-31): both staging and prod
+vago now read the same prod Weaviate, so there is one corpus rather than two
+that drift. `weaviate-us.curelinktech.in` resolves to prod (us-east4, namespace
+hosted-models); staging's own instance is `weaviate-us-staging.curelinktech.in`
+and is no longer what vago reads.
+
+SCHEMA OWNERSHIP: disha-backend `weaviate/migrations/00NN_*.json` is the source
+of truth for these classes, applied by its migration manager. The class files
+next to this script are a convenience copy for --recreate-* and can drift —
+prefer recreating from the backend's migrations, and note that those currently
+hardcode the STAGING TEI endpointURL, which does not resolve inside the prod
+cluster.
 
 Stdlib only, same style as disha-hosted-models validation/weaviate_smoke.py.
 
@@ -78,10 +90,10 @@ def load_class_def(name: str, tei_url: str) -> dict:
         module["endpointURL"] = tei_url
     return definition
 
-DEFAULT_WEAVIATE_URL = "https://weaviate-us-staging.curelinktech.in"
+DEFAULT_WEAVIATE_URL = "https://weaviate-us.curelinktech.in"
 DEFAULT_TEI_URL = "http://jina-embeddings-v5-text-small.{namespace}.svc.cluster.local"
-DEFAULT_KUBE_CONTEXT = "gke_curelinkai_us-east1_disha-voice-worker-staging"
-DEFAULT_NAMESPACE = "staging"
+DEFAULT_KUBE_CONTEXT = "gke_curelinkai_us-east4_disha-voice-worker-prod"
+DEFAULT_NAMESPACE = "hosted-models"
 DEFAULT_SECRET = "weaviate-api-key"
 
 REQUEST_TIMEOUT = 60
@@ -389,8 +401,13 @@ def do_seed(url: str, headers: dict) -> None:
             "instructionText": fixture["instructionText"],
             "title": fixture["title"],
             "documentVersionPath": fixture["documentVersionPath"],
+            # BOTH flags on purpose. There is now a single Weaviate instance
+            # (prod), and vago picks its filter field from ENVIRONMENT: a
+            # staging worker filters isStaging, a prod worker filters
+            # isProduction. Seeding only one flag would make the other
+            # environment retrieve nothing, with no error to notice.
             "isStaging": True,
-            "isProduction": False,
+            "isProduction": True,
         }
         # Omitted on purpose for one fixture, to exercise the default-3 fallback.
         if "turnsThresholdCount" in fixture:
