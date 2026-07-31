@@ -15,7 +15,7 @@ import (
 // untouched.
 //
 // The core knows nothing about what enrichment means. Business packages supply
-// the implementation (Disha's dynamic check-in uses it for blocking protocol
+// the implementation (Disha's follow-up calls use it for blocking protocol
 // retrieval), keeping vector databases and prompts out of the pipeline package.
 type MessagesEnricher func(ctx context.Context, messages []Message) []Message
 

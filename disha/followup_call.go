@@ -53,9 +53,10 @@ type followUpPlan struct {
 	Dynamic         bool
 	Tools           []voicepipelinecore.ToolDefinition
 
-	// Enricher performs blocking protocol retrieval before every LLM call.
-	// Non-nil only on the dynamic check-in path with the feature enabled; nil
-	// leaves the pipeline byte-identical to before.
+	// ProtocolEnricher performs blocking protocol retrieval before every LLM
+	// call, on both follow-up paths. Non-nil only when the feature is enabled
+	// and Weaviate is configured; nil leaves the pipeline byte-identical to
+	// before.
 	ProtocolEnricher *protocolEnricher
 }
 
@@ -115,14 +116,15 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	return pl, nil
 }
 
-// setupProtocolRetrieval wires blocking protocol retrieval for dynamic
-// check-in calls. Every other follow-up call, and every other bot, is left
-// exactly as before: no enricher, no chunk decorator.
+// setupProtocolRetrieval wires blocking protocol retrieval for follow-up
+// calls — both the dynamic check-in path and the agenda-based path. Sales and
+// onboarding are untouched: they never call this, so their pipelines are
+// unchanged.
 //
 // A missing/incomplete Weaviate env is treated as "feature off" rather than a
 // call failure — the same posture as the other optional S3-backed features.
 func setupProtocolRetrieval(pl *followUpPlan) {
-	if !pl.Dynamic || !protocolRetrievalEnabled() {
+	if !protocolRetrievalEnabled() {
 		return
 	}
 	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
@@ -153,7 +155,7 @@ func setupProtocolRetrieval(pl *followUpPlan) {
 		pl.Startup.UserID,
 		pl.Startup.ConversationID,
 	)
-	pl.Callbacks.SetChunkDecorator(newDynamicCheckinChunkDecorator(
+	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
 		box,
 		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
 		pl.Startup.Logger,
@@ -161,7 +163,7 @@ func setupProtocolRetrieval(pl *followUpPlan) {
 		pl.Startup.ConversationID,
 		FollowUpBotType,
 	))
-	pl.Startup.Logger.Println("disha: protocol retrieval enabled for dynamic check-in call")
+	pl.Startup.Logger.Printf("disha: protocol retrieval enabled (dynamic=%v)\n", pl.Dynamic)
 }
 
 func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Deps) (*voicepipelinecore.PipelineTask, error) {

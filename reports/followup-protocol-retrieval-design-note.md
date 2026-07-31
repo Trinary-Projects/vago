@@ -1,4 +1,4 @@
-# Dynamic check-in call: blocking protocol retrieval before every LLM call
+# Follow-up calls: blocking protocol retrieval before every LLM call
 
 Design note — 2026-07-29. Status: **implemented, not committed.** All design
 decisions settled; the Go side is written, `go test -race ./...` is green, and the
@@ -12,20 +12,21 @@ outside vago (§13).
 
 ## 1. What we're adding
 
-Before every LLM generation on a **dynamic check-in follow-up call**, send the
-trailing `Disha: … / User: …` exchange to `weaviate-us` as raw text, get back
-matching protocols, and keep a small rolling set of them in the LLM's message
-array. Per-turn retrieval telemetry rides along with the assistant conversation
-chunk, and the injected protocol text is echoed into the LLM log's variable
-section.
+Before every LLM generation on a **follow-up call**, send the trailing
+`Disha: … / User: …` exchange to `weaviate-us` as raw text, get back matching
+protocols, and keep a small rolling set of them in the LLM's message array.
+Per-turn retrieval telemetry rides along with the assistant conversation chunk,
+and the injected protocol text is echoed into the LLM log's variable section.
 
-**Scope: the dynamic check-in path only** — `FollowUpBot` where
-`conversation.call_flow_key` is set (`followUpPlan.Dynamic == true`). The
-agenda-based follow-up path, sales, and onboarding are untouched.
+**Scope: `FollowUpBot`, both paths** — the dynamic check-in path
+(`conversation.call_flow_key` set) and the agenda-based path. Widened from
+dynamic-only on 2026-07-29 at Jaideep's request; the env flag is now the only
+gate. Sales and onboarding never call `setupProtocolRetrieval`, so their
+pipelines are unchanged.
 
-Note this is the path that carries the `get_guidance` tool, so tool-result LLM
-re-runs are common on it. §5.2's retrieve-vs-inject gate is load-bearing here, not
-an optimisation.
+The dynamic path carries the `get_guidance` tool, so tool-result LLM re-runs are
+common there. §5.2's retrieve-vs-inject gate is load-bearing for it, not an
+optimisation — the agenda path has fewer tool re-runs but uses the same gate.
 
 ---
 
@@ -555,7 +556,7 @@ derived from the call ctx.
 ## 6. Chunk telemetry → future `ChunkRetrievalMetrics`
 
 Wired through the existing generic seam:
-`pl.Callbacks.SetChunkDecorator(newDynamicCheckinChunkDecorator(...))`, registered
+`pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(...))`, registered
 only when retrieval is active.
 
 **Which chunk.** Attach only to the spoken Disha turn:
@@ -679,7 +680,7 @@ Per the one-var-no-fallback-chain rule, new keys in `.staging.env` / `.prod.env`
 
 | Var | Purpose |
 |---|---|
-| `DYNAMIC_CHECKIN_PROTOCOL_RETRIEVAL_ENABLED` | `1` turns the step on. Absent/`0` → no enricher processor is constructed and the pipeline is byte-for-byte today's. |
+| `FOLLOWUP_PROTOCOL_RETRIEVAL_ENABLED` | `1` turns the step on for both follow-up paths. Absent/`0` → no enricher processor is constructed and the pipeline is byte-for-byte today's. Renamed from `DYNAMIC_CHECKIN_…` when the scope widened; it had never been added to an env file, so no deploy coordination was needed. |
 | `WEAVIATE_URL` | `http://weaviate.staging.svc.cluster.local:8080` — the in-cluster Service (§5.3). No default baked into code. The public Ingress `https://weaviate-us.curelinktech.in` is for out-of-cluster tooling like `scripts/seed_protocol_collections.py`. |
 | `WEAVIATE_API_KEY` | the `weaviate-api-key` secret's value in the worker's own namespace (**not** the `weaviate-v2` key from `.lambda.env` — it 401s against this instance). Mount it into the worker env from the existing Secret rather than pasting it into the env file. |
 
@@ -712,7 +713,9 @@ New — `disha/`:
   computation, the protocol-specific Weaviate selection set / filter / decode, the
   `MessagesEnricher` implementation, the retrieval-record handoff, and the
   `SetPromptMetadata` update.
-- `dynamic_checkin_chunk_decorator.go` — S3 upload + `chunk_retrieval_metrics`.
+- `retrieval_chunk_decorator.go` — S3 upload + `chunk_retrieval_metrics`. Named
+  for the step, not the call type: any bot running a retrieval step can wire it
+  through `SetChunkDecorator`.
 
 Modified:
 
@@ -742,13 +745,13 @@ Remaining:
 2. **Add `WEAVIATE_URL` + `WEAVIATE_API_KEY` to `.staging.env`** (§9) so the deploy
    script picks them into `talk-go-worker-env`. Needed before staging QA, not
    before coding.
-3. Ship with `DYNAMIC_CHECKIN_PROTOCOL_RETRIEVAL_ENABLED` **off** — a no-op deploy
+3. Ship with `FOLLOWUP_PROTOCOL_RETRIEVAL_ENABLED` **off** — a no-op deploy
    that proves nothing regressed.
 4. Load the real protocol corpus (ownership open — §13). The 20 fixture anchors are
    enough to exercise every code path, not to judge retrieval quality.
-5. Staging: flag on, QA dynamic check-in calls, re-read the `top_similarity_score`
+5. Staging: flag on, QA follow-up calls on both paths, re-read the `top_similarity_score`
    distribution from the S3 blobs against the real corpus and re-confirm 0.70.
-6. Measure the v2v delta against the current dynamic check-in baseline. §8 predicts
+6. Measure the v2v delta against the current follow-up baseline (both paths). §8 predicts
    ~20–35 ms, so this is a confirmation, not a gate.
 7. disha-backend: `ChunkRetrievalMetrics(chunk_id)` table + sync-job read of the new
    chunk key.
@@ -832,9 +835,9 @@ Neither affects staging work; both must be resolved before prod exposure.
   injections, TTLs decremented once.
 - `SetPromptMetadata` carries the injected protocols and does not mutate the base
   metadata map.
-- Wiring: `pl.Dynamic == false` ⇒ no enricher processor in the pipeline and no chunk
-  decorator registered, even with the env flag on; the processor slice is identical
-  to today's.
+- Wiring: the env flag off ⇒ no enricher processor in the pipeline and no chunk
+  decorator registered on either follow-up path; the processor slice is identical
+  to today's. Flag on ⇒ both paths get it, dynamic or not.
 
 `voicepipelinecore/context_enricher_processor_test.go` (uses the standard
 `runProcessorTest` harness)
@@ -864,7 +867,7 @@ Neither affects staging work; both must be resolved before prod exposure.
 - `NewClientFromEnv` with `WEAVIATE_URL`/`WEAVIATE_API_KEY` missing ⇒ error, not a
   half-built client.
 
-`disha/dynamic_checkin_chunk_decorator_test.go`
+`disha/retrieval_chunk_decorator_test.go`
 
 - Assistant spoken chunk gets metrics + S3 key; user chunk, debug-log chunk, and
   tool-pair assistant chunk (non-nil `AdditionalData`) get none.
@@ -934,7 +937,7 @@ shipped here should need renaming when it lands.
 | `voicepipelinecore.ContextEnricherProcessor` / `MessagesEnricher` / `MetricContextEnrich` | core stays business-free. Note the guardrail step is **not** this processor: it runs after generation and must interrupt, so it needs its own core hook |
 | `disha.weaviateEnvFlagField` | the isProduction/isStaging convention is per-instance, not per-collection |
 | `disha.conversationTurnStarts` | plain conversation shape |
-| `newDynamicCheckinChunkDecorator` | the call-type decorator; it will populate both steps' metrics |
+| `newRetrievalChunkDecorator` | the call-type decorator; it will populate both steps' metrics |
 | `ChunkRetrievalMetrics` (chunk key `chunk_retrieval_metrics`) | the per-chunk umbrella, one row per chunk in the backend table |
 
 **Protocol-scoped, so a guardrail sibling can sit beside each.** Everything else
@@ -961,7 +964,7 @@ type ChunkRetrievalMetrics struct {
 }
 ```
 
-`newDynamicCheckinChunkDecorator` **merges** into the umbrella rather than
+`newRetrievalChunkDecorator` **merges** into the umbrella rather than
 assigning it, so the two steps — which run at different points in the turn and
 may reach the chunk in either order — can each fill their own field. Chosen now
 because nothing consumes the key yet: the backend `ChunkRetrievalMetrics(chunk_id)`

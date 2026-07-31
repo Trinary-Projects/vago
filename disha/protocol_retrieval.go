@@ -18,7 +18,8 @@ import (
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
-// Blocking protocol retrieval for dynamic check-in calls.
+// Blocking protocol retrieval for follow-up calls (both the dynamic check-in
+// path and the agenda-based path).
 //
 // Before every LLM generation the trailing "Disha: … / User: …" exchange is
 // sent to the US Weaviate instance as RAW text (the ProtocolAnchor collection
@@ -72,7 +73,7 @@ const (
 	// when looking for the Disha block rather than becoming it.
 	protocolShortAssistantWords = 6
 
-	protocolRetrievalEnabledEnv = "DYNAMIC_CHECKIN_PROTOCOL_RETRIEVAL_ENABLED"
+	protocolRetrievalEnabledEnv = "FOLLOWUP_PROTOCOL_RETRIEVAL_ENABLED"
 
 	protocolS3KeyPrefix = "protocol_retrieval"
 )

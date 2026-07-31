@@ -69,8 +69,8 @@ type ConversationChunk struct {
 	SystemMessageParamsS3Key         *string  `json:"system_message_params_s3_key"`
 	ConversationStateS3Key           *string  `json:"conversation_state_s3_key"`
 
-	// ChunkRetrievalMetrics carries per-turn retrieval telemetry on dynamic
-	// check-in calls, destined for disha-backend's
+	// ChunkRetrievalMetrics carries per-turn retrieval telemetry on follow-up
+	// calls, destined for disha-backend's
 	// ChunkRetrievalMetrics(chunk_id) table. omitempty so every other bot's
 	// chunk JSON is byte-identical to before. Safe to write ahead of the
 	// backend change: redis_dict_to_model reads named keys only, so this is

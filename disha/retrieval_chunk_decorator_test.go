@@ -54,7 +54,7 @@ func testProtocolRetrievalRecord() protocolRetrievalRecord {
 func newTestDecorator(t *testing.T, uploader JSONUploader) (func(*ConversationChunk), *protocolRecordBox) {
 	t.Helper()
 	box := &protocolRecordBox{}
-	decorator := newDynamicCheckinChunkDecorator(
+	decorator := newRetrievalChunkDecorator(
 		box, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
 	)
 	return decorator, box

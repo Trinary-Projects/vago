@@ -9,7 +9,10 @@ import (
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
-// Per-turn protocol-retrieval telemetry, attached to the spoken Disha chunk.
+// Per-turn retrieval telemetry, attached to the spoken Disha chunk.
+//
+// Not bot- or call-type-specific: any bot that runs a retrieval step can wire
+// this decorator through CallEventCallbacks.SetChunkDecorator.
 //
 // The chunk carries a compact chunk_retrieval_metrics object plus an S3 key;
 // the full candidate list (every score, qualifying or not) goes to S3, which is
@@ -21,14 +24,14 @@ import (
 
 const protocolRetrievalUploadTimeout = 5 * time.Second
 
-// newDynamicCheckinChunkDecorator returns a chunk decorator that attaches the
+// newRetrievalChunkDecorator returns a chunk decorator that attaches the
 // pending retrieval record to the assistant turn it produced.
 //
 // Only the spoken Disha turn qualifies: role assistant, not a debug-log chunk,
 // and no additional_data. That last condition is load-bearing —
 // OnToolResultCommitted also writes an assistant-role chunk (the tool_calls
 // half of the pair), and it must not consume the record.
-func newDynamicCheckinChunkDecorator(
+func newRetrievalChunkDecorator(
 	box *protocolRecordBox,
 	uploader JSONUploader,
 	logger *log.Logger,

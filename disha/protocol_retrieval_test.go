@@ -858,8 +858,8 @@ func TestEnricherInjectsExactlyOneBlockAcrossTurns(t *testing.T) {
 
 // ---------------------------------------------------------------- the wiring
 
-// The feature must be unreachable unless BOTH the dynamic path and the env flag
-// say so, and it must leave no trace on any other call.
+// The env flag is the only gate: both follow-up paths get retrieval when it is
+// on, and neither gets it when it is off.
 func TestSetupProtocolRetrievalGating(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -868,10 +868,11 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 		want    bool
 	}{
 		{"dynamic and enabled", true, "1", true},
+		{"agenda follow-up and enabled", false, "1", true},
 		{"dynamic but flag off", true, "0", false},
 		{"dynamic but flag unset", true, "", false},
-		{"agenda follow-up with flag on", false, "1", false},
 		{"agenda follow-up with flag off", false, "0", false},
+		{"agenda follow-up with flag unset", false, "", false},
 	}
 
 	for _, tc := range tests {
