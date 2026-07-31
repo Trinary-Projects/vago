@@ -42,7 +42,7 @@ func testProtocolRetrievalRecord() protocolRetrievalRecord {
 		Candidates:     []protocolCandidate{{InstructionID: "instr-A", Similarity: 0.88, Qualified: true, TurnThreshold: 3}},
 		Injected:       []residentProtocol{{InstructionID: "instr-A", Title: "t", ScoreAtAdd: 0.88, RemainingTurns: 3, Threshold: 3}},
 		ResidentAfter:  []residentProtocol{{InstructionID: "instr-A", Title: "t", ScoreAtAdd: 0.88, RemainingTurns: 3, Threshold: 3}},
-		Events:         []protocolEvent{{Action: "add", InstructionID: "instr-A"}},
+		Qualified:      1,
 		LatencyMs:      31.5,
 		QueryLatencyMs: 24.25,
 		TopSimilarity:  &top,
@@ -100,7 +100,7 @@ func TestChunkDecoratorAttachesToSpokenAssistantChunk(t *testing.T) {
 	for _, key := range []string{
 		"chunk_id", "conversation_id", "user_id", "bot_type", "retrieved_at",
 		"query_text", "threshold", "latency_ms", "candidates",
-		"injected_protocol_ids", "resident_after", "events", "insert_index", "status",
+		"injected_protocol_ids", "resident_after", "qualified_count", "insert_index", "status",
 		"top_similarity",
 	} {
 		if _, present := body[key]; !present {
@@ -270,4 +270,35 @@ func (m *ChunkRetrievalMetrics) protocolOrNil() *ProtocolRetrievalMetrics {
 		return nil
 	}
 	return m.Protocol
+}
+
+// Resident-set lifecycle events are logged, not persisted (decided 2026-07-31):
+// the per-turn resident_after snapshot already records where the set landed.
+func TestChunkDecoratorDoesNotPersistStoreEvents(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, box := newTestDecorator(t, uploader)
+	box.put(testProtocolRetrievalRecord())
+
+	decorate(&ConversationChunk{ID: "chunk-1", Role: "assistant"})
+
+	_, payload := uploader.uploaded()
+	body, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T", payload)
+	}
+	if _, present := body["events"]; present {
+		t.Error("S3 payload must not carry the store event list")
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, action := range []string{`"add"`, `"evict"`, `"expire"`, `"refresh"`} {
+		if strings.Contains(string(encoded), action) {
+			t.Errorf("payload still contains a store event action %s", action)
+		}
+	}
+	if body["qualified_count"] != 1 {
+		t.Errorf("qualified_count = %v, want the aggregate 1", body["qualified_count"])
+	}
 }

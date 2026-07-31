@@ -604,11 +604,9 @@ durable copy — and it is the calibration dataset of §3:
                   "turn_threshold_count":3,
                   "distance":0.62,"similarity":0.38,"certainty":0.69,
                   "qualified":false}],
+  "qualified_count": 1,
   "injected_protocol_ids": ["..."],
   "resident_after": [{"instruction_id":"...","remaining_turns":2,"score_at_add":0.83}],
-  "events": [{"action":"add","instruction_id":"..."},
-             {"action":"evict","instruction_id":"...","reason":"capacity"},
-             {"action":"expire","instruction_id":"..."}],
   "insert_index": 12, "status": "ok" }
 ```
 
@@ -620,9 +618,23 @@ Upload failure → Sentry + chunk still written with an empty `protocols_s3_key`
 ## 7. Traces / observability
 
 - One RTVI `server-message` per round (`type: "protocol_retrieval"`: latency, top
-  score, add/evict/expire events). Reaches the frontend and the S3 debug log
-  through the existing single stream — no new event channel.
+  score, candidate/qualified/injected counts). Reaches the frontend and the S3
+  debug log through the existing single stream — no new event channel.
 - One `app.log` line per round with the same fields.
+- **Resident-set lifecycle events are logged, never persisted** (decided
+  2026-07-31). `ProtocolStore.apply` still returns add/refresh/evict/expire so the
+  enricher can render them into one `app.log` line:
+
+  ```
+  disha: protocol store events: refresh:c9f55b82 (Acidity or reflux reported during a check-in); \
+    add:0138afba (User has not followed the diet plan); \
+    evict:b9658e62 (User asks to stop or reduce prescribed medication) reason=capacity
+  ```
+
+  They are absent from the S3 record and from the RTVI payload, which carry the
+  aggregate `qualified_count` plus the `resident_after` snapshot instead — that
+  snapshot already says where the set landed, so the per-action list was
+  duplicating it at every turn.
 - Sentry only on failure, per §5.8.
 
 Manual-inspection grade by design; no dedicated lifecycle debugging surface.

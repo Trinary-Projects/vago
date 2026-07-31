@@ -104,6 +104,38 @@ func TestBuildProtocolQueryText(t *testing.T) {
 			want:     "",
 		},
 		{
+			// Regression, staging conv f234dafb (2026-07-31): on a resumed call
+			// buildInitialMessages appends the resume nudge as a USER message, so
+			// the trailing user block merged bot-directed instructions into the
+			// retrieval query instead of user speech.
+			name: "resume nudge is skipped, not merged into the user turn",
+			messages: []voicepipelinecore.Message{
+				msg("system", "sys"), msg("assistant", longDisha),
+				msg("user", "हाँ, हाँ, हाँ, समझ गया मैं।"),
+				msg("user", "<system_message>This conversation was interrupted because the call ended. "+
+					"Now you have to resume this conversation by saying hi and acknowledge the things "+
+					"that have been discussed very briefly and inform the next agenda.</system_message>"),
+			},
+			want: "Disha: " + longDisha + "\nUser: हाँ, हाँ, हाँ, समझ गया मैं।",
+		},
+		{
+			name: "onboarding-style wrapper is skipped too",
+			messages: []voicepipelinecore.Message{
+				msg("system", "sys"), msg("assistant", longDisha),
+				msg("user", "real speech"),
+				msg("user", "<system_instruction>do something</system_instruction>"),
+			},
+			want: "Disha: " + longDisha + "\nUser: real speech",
+		},
+		{
+			name: "a resume nudge with no real user turn behind it skips the round",
+			messages: []voicepipelinecore.Message{
+				msg("system", "sys"), msg("assistant", longDisha),
+				msg("user", "<system_message>resume please</system_message>"),
+			},
+			want: "",
+		},
+		{
 			name: "a previously injected block never becomes the Disha block",
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
@@ -811,8 +843,11 @@ func TestEnricherFailsOpen(t *testing.T) {
 }
 
 func TestEnricherNoQualifyingHitsInjectsNothing(t *testing.T) {
-	// Comfortably below the gate.
-	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A", 0.55, 3))
+	// Derived from the constant, not hardcoded, so re-tuning the threshold
+	// doesn't turn this into a false failure: similarity lands one hundredth
+	// under whatever the gate currently is.
+	belowGate := 1 - protocolSimilarityThreshold + 0.01
+	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A", belowGate, 3))
 	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
 
 	messages := conversation("theek tha didi")

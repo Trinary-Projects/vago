@@ -35,11 +35,26 @@ const (
 	protocolInstructionClass = "ProtocolInstruction"
 
 	// protocolSimilarityThreshold gates admission, as cosine similarity
-	// (1 - distance) on the collection's cosine index. Calibrated 2026-07-29
-	// against jina-embeddings-v5-text-small: true positives measured
-	// 0.7143-0.8808 while the highest false positive was 0.6648, so the
-	// originally proposed 0.80 dropped three of five correct retrievals.
-	protocolSimilarityThreshold = 0.70
+	// (1 - distance) on the collection's cosine index.
+	//
+	// CURRENTLY 0.01 = effectively no gate: every candidate the query returns
+	// is admitted. This is a deliberate QA setting so staging calls exercise the
+	// injection/eviction machinery on a corpus that is still only fixtures — it
+	// is NOT a calibrated value, and it means injected protocols are frequently
+	// irrelevant to the turn. Raise it before drawing any conclusion about
+	// retrieval quality, and before prod.
+	//
+	// Calibration data so far, against jina-embeddings-v5-text-small:
+	//   - fixture probe (2026-07-29): true positives 0.7143-0.8808, highest
+	//     false positive 0.6648 — so 0.80 dropped three of five correct hits
+	//     and 0.70 kept all five.
+	//   - live staging call f234dafb (2026-07-31): real top hits 0.7067 /
+	//     0.7013 / 0.7276 against a best-irrelevant of 0.6472 — a tighter
+	//     margin than the fixtures suggested, sitting right on top of 0.70.
+	// The model has a high similarity floor (irrelevant protocols still score
+	// 0.54-0.67), so the usable band is narrow; a relative gate (top hit must
+	// beat the second by a margin) is the known next lever.
+	protocolSimilarityThreshold = 0.01
 
 	// protocolCapacity is how many protocols stay resident at once.
 	protocolCapacity = 3
@@ -60,7 +75,7 @@ const (
 	// purpose: the measured path is p50 ~17ms / p95 ~21ms, but max latency is
 	// 100-190ms at every concurrency level, so a tight budget would clip tail
 	// requests for no gain.
-	protocolRetrievalBudget = 700 * time.Millisecond
+	protocolRetrievalBudget = 100 * time.Millisecond
 
 	// protocolQueryLimit is how many anchors to fetch. Deliberately larger
 	// than the capacity: many anchors map to one instruction (measured 10
@@ -157,10 +172,10 @@ type protocolRetrievalRecord struct {
 	Candidates     []protocolCandidate
 	Injected       []residentProtocol
 	ResidentAfter  []residentProtocol
-	Events         []protocolEvent
 	LatencyMs      float64
 	QueryLatencyMs float64
 	TopSimilarity  *float64
+	Qualified      int
 	InsertIndex    int
 	Status         string // ok | skipped | error | timeout
 	Err            string
@@ -317,10 +332,17 @@ func buildProtocolQueryText(messages []voicepipelinecore.Message) string {
 	index := len(messages) - 1
 
 	// Trailing user block: consecutive user messages merged into one turn.
+	// Out-of-band injections (the resume nudge, our own protocol block) also
+	// travel as user-role messages, and merging their text into the query would
+	// embed bot-directed instructions instead of user speech — so they are
+	// skipped and the walk continues past them to the real turn.
 	var userParts []string
 	for ; index >= 0; index-- {
 		if messages[index].Role != "user" {
 			break
+		}
+		if isOutOfBandUserMessage(messages[index]) {
+			continue
 		}
 		if text := strings.TrimSpace(messages[index].Content); text != "" {
 			userParts = append([]string{text}, userParts...)
@@ -457,6 +479,33 @@ func renderProtocolBlock(protocols []residentProtocol) string {
 	}
 	b.WriteString("</system_message>")
 	return b.String()
+}
+
+// outOfBandUserWrappers are the tags this codebase uses to smuggle
+// bot-directed instructions into the conversation as user-role messages:
+// <system_message> for the sales/follow-up resume nudge and for the protocol
+// block, <system_instruction> for onboarding's resume text.
+var outOfBandUserWrappers = []string{"<system_message>", "<system_instruction>"}
+
+// isOutOfBandUserMessage reports whether a user-role message is really an
+// injected instruction rather than something the user said.
+//
+// Found live on staging conversation f234dafb (2026-07-31): on a resumed call
+// buildInitialMessages appends the resume nudge as a user message, so the
+// trailing user block merged 285 characters of "resume this conversation by
+// saying hi…" onto 28 characters of actual speech and embedded that as the
+// retrieval query.
+func isOutOfBandUserMessage(message voicepipelinecore.Message) bool {
+	if message.Role != "user" {
+		return false
+	}
+	content := strings.TrimSpace(message.Content)
+	for _, wrapper := range outOfBandUserWrappers {
+		if strings.HasPrefix(content, wrapper) {
+			return true
+		}
+	}
+	return false
 }
 
 // isProtocolBlockMessage reports whether a message is a previously injected
@@ -734,8 +783,40 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 			qualified = append(qualified, candidate)
 		}
 	}
-	record.Events = e.store.apply(qualified)
+	record.Qualified = len(qualified)
+
+	// Resident-set lifecycle is logged, not persisted: the events are for
+	// eyeballing a call in app.log, and the per-turn resident_after snapshot in
+	// the S3 record already says what the set ended up as.
+	e.logEvents(e.store.apply(qualified))
 	return record
+}
+
+// logEvents writes one line per round describing what the round did to the
+// resident set. Nothing here is stored.
+func (e *protocolEnricher) logEvents(events []protocolEvent) {
+	if e.logger == nil || len(events) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(events))
+	for _, event := range events {
+		part := event.Action + ":" + shortID(event.InstructionID)
+		if event.Title != "" {
+			part += " (" + event.Title + ")"
+		}
+		if event.Reason != "" {
+			part += " reason=" + event.Reason
+		}
+		parts = append(parts, part)
+	}
+	e.logger.Printf("disha: protocol store events: %s\n", strings.Join(parts, "; "))
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // reportFailure sends retrieval failures to Sentry. Cancellation just means the
@@ -771,8 +852,8 @@ func (e *protocolEnricher) publish(record protocolRetrievalRecord) {
 	}
 	if e.logger != nil {
 		e.logger.Printf(
-			"disha: protocol retrieval status=%s candidates=%d qualified_events=%d injected=%d top_sim=%s query_ms=%.1f total_ms=%.1f insert_index=%d\n",
-			record.Status, len(record.Candidates), len(record.Events), len(record.Injected),
+			"disha: protocol retrieval status=%s candidates=%d qualified=%d injected=%d top_sim=%s query_ms=%.1f total_ms=%.1f insert_index=%d\n",
+			record.Status, len(record.Candidates), record.Qualified, len(record.Injected),
 			top, record.QueryLatencyMs, record.LatencyMs, record.InsertIndex,
 		)
 	}
@@ -785,11 +866,11 @@ func (e *protocolEnricher) publish(record protocolRetrievalRecord) {
 		"type":               "protocol_retrieval",
 		"status":             record.Status,
 		"candidate_count":    len(record.Candidates),
+		"qualified_count":    record.Qualified,
 		"injected_count":     len(record.Injected),
 		"total_ms":           record.LatencyMs,
 		"vector_query_ms":    record.QueryLatencyMs,
 		"insert_index":       record.InsertIndex,
-		"events":             record.Events,
 		"top_similarity":     nil,
 		"injected_protocols": protocolTitles(record.Injected),
 	}

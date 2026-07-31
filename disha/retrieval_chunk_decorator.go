@@ -170,9 +170,9 @@ func protocolRetrievalRecordPayload(
 			"total":        record.LatencyMs,
 		},
 		"candidates":            candidates,
+		"qualified_count":       record.Qualified,
 		"injected_protocol_ids": injectedIDs,
 		"resident_after":        resident,
-		"events":                record.Events,
 		"insert_index":          record.InsertIndex,
 		"status":                record.Status,
 	}
