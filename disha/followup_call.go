@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jaideep329/talk-go/internal/sentryutil"
+	"github.com/jaideep329/talk-go/internal/weaviate"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 	"github.com/jaideep329/talk-go/voicepipelinecore/llmrouter"
 )
@@ -47,9 +48,15 @@ type followUpPlan struct {
 	Callbacks       *CallEventCallbacks
 	PromptKey       string
 	PromptMetadata  map[string]any
+	PromptVariables DocumentVariables
 	ModelGroup      string
 	Dynamic         bool
 	Tools           []voicepipelinecore.ToolDefinition
+
+	// Enricher performs blocking protocol retrieval before every LLM call.
+	// Non-nil only on the dynamic check-in path with the feature enabled; nil
+	// leaves the pipeline byte-identical to before.
+	ProtocolEnricher *protocolEnricher
 }
 
 func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps) (*followUpPlan, error) {
@@ -90,6 +97,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 		InitialMessages: buildInitialMessages(prompt, startup.Data.Chunks, resumeMsg),
 		PromptKey:       PromptKey(promptName, promptVersion),
 		PromptMetadata:  metadata,
+		PromptVariables: variables,
 		ModelGroup:      modelGroup,
 		Dynamic:         dynamic,
 		Tools:           tools,
@@ -103,7 +111,57 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
+	setupProtocolRetrieval(pl)
 	return pl, nil
+}
+
+// setupProtocolRetrieval wires blocking protocol retrieval for dynamic
+// check-in calls. Every other follow-up call, and every other bot, is left
+// exactly as before: no enricher, no chunk decorator.
+//
+// A missing/incomplete Weaviate env is treated as "feature off" rather than a
+// call failure — the same posture as the other optional S3-backed features.
+func setupProtocolRetrieval(pl *followUpPlan) {
+	if !pl.Dynamic || !protocolRetrievalEnabled() {
+		return
+	}
+	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
+	if err != nil {
+		pl.Startup.Logger.Printf("disha: protocol retrieval disabled: %v\n", err)
+		sentryutil.Capture(sentryutil.Event{
+			Err: err,
+			Tags: map[string]string{
+				"component": "disha_followup",
+				"operation": "protocol_retrieval_config",
+			},
+			Details: map[string]any{
+				"conversation_id": pl.Startup.ConversationID,
+				"user_id":         pl.Startup.UserID,
+			},
+		})
+		return
+	}
+
+	box := &protocolRecordBox{}
+	pl.ProtocolEnricher = newProtocolEnricher(
+		client,
+		NewProtocolStore(),
+		box,
+		pl.Startup.Logger,
+		pl.PromptMetadata,
+		pl.PromptVariables,
+		pl.Startup.UserID,
+		pl.Startup.ConversationID,
+	)
+	pl.Callbacks.SetChunkDecorator(newDynamicCheckinChunkDecorator(
+		box,
+		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
+		pl.Startup.Logger,
+		pl.Startup.UserID,
+		pl.Startup.ConversationID,
+		FollowUpBotType,
+	))
+	pl.Startup.Logger.Println("disha: protocol retrieval enabled for dynamic check-in call")
 }
 
 func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Deps) (*voicepipelinecore.PipelineTask, error) {
@@ -160,12 +218,25 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 
-	pipeline := voicepipelinecore.NewPipeline([]voicepipelinecore.Processor{
+	processors := []voicepipelinecore.Processor{
 		source,
 		audioSource,
 		stt,
 		userIdle,
 		contextAggregators.User(),
+	}
+	// Protocol retrieval sits upstream of the LLM so its latency lands in its
+	// own MetricContextEnrich rather than inside llm_ttfb_ms. Absent on every
+	// non-dynamic call, leaving the processor list identical to before.
+	if pl.ProtocolEnricher != nil {
+		pl.ProtocolEnricher.SetInfrastructure(routerPromptMetadataSetter(llmClient), taskCtx.UIEvents)
+		pl.ProtocolEnricher.SetSentryHub(taskCtx.SentryHub())
+		processors = append(processors,
+			voicepipelinecore.NewContextEnricherProcessor(taskCtx, pl.ProtocolEnricher.Enrich))
+		enricher := pl.ProtocolEnricher
+		go enricher.warmUp(taskCtx.Ctx)
+	}
+	processors = append(processors,
 		llm,
 		llmResponseTimeout,
 		llmOutputFilter,
@@ -173,9 +244,23 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		playback,
 		contextAggregators.Assistant(),
 		sink,
-	})
+	)
+
+	pipeline := voicepipelinecore.NewPipeline(processors)
 	task.SetPipeline(source, pipeline)
 	return task, nil
+}
+
+// routerPromptMetadataSetter exposes the conversation router's per-call
+// prompt-metadata hook when the injected client is one (it always is in
+// production; tests may inject a stub that isn't). Returns nil otherwise, which
+// the enricher treats as "skip the metadata refresh".
+func routerPromptMetadataSetter(client voicepipelinecore.LLMClient) promptMetadataSetter {
+	setter, ok := client.(promptMetadataSetter)
+	if !ok {
+		return nil
+	}
+	return setter
 }
 
 func loadFollowUpPrompt(ctx context.Context, deps Deps, startup CallStartup) (text, name string, version int, config map[string]any, vars DocumentVariables, dynamic bool, err error) {

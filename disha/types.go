@@ -68,6 +68,39 @@ type ConversationChunk struct {
 	MainAgentSystemPromptLangfuseKey *string  `json:"main_agent_system_prompt_langfuse_key"`
 	SystemMessageParamsS3Key         *string  `json:"system_message_params_s3_key"`
 	ConversationStateS3Key           *string  `json:"conversation_state_s3_key"`
+
+	// ChunkRetrievalMetrics carries per-turn retrieval telemetry on dynamic
+	// check-in calls, destined for disha-backend's
+	// ChunkRetrievalMetrics(chunk_id) table. omitempty so every other bot's
+	// chunk JSON is byte-identical to before. Safe to write ahead of the
+	// backend change: redis_dict_to_model reads named keys only, so this is
+	// ignored until the sync job asks for it.
+	ChunkRetrievalMetrics *ChunkRetrievalMetrics `json:"chunk_retrieval_metrics,omitempty"`
+}
+
+// ChunkRetrievalMetrics is the per-chunk umbrella for every retrieval-shaped
+// step on a turn, matching the one-row-per-chunk backend table.
+//
+// Each step gets its own namespaced sub-object rather than flat fields, so the
+// planned post-LLM guardrail step (vector lookup, sometimes an LLM call, then
+// interrupt-and-regenerate) can be added as a sibling `Guardrail
+// *GuardrailCheckMetrics `json:"guardrail,omitempty"“ without renaming or
+// re-keying anything that already ships.
+type ChunkRetrievalMetrics struct {
+	Protocol *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+}
+
+// ProtocolRetrievalMetrics summarizes one protocol-retrieval round. The full
+// candidate list (including sub-threshold scores) lives in the S3 object at
+// ProtocolsS3Key; this is the compact form for the backend table.
+type ProtocolRetrievalMetrics struct {
+	RetrievalLatencyMs   float64  `json:"retrieval_latency_ms"`
+	VectorQueryLatencyMs float64  `json:"vector_query_latency_ms"`
+	TopSimilarityScore   *float64 `json:"top_similarity_score"`
+	InjectedCount        int      `json:"injected_count"`
+	ProtocolsS3Key       string   `json:"protocols_s3_key"`
+	Status               string   `json:"status"` // ok | skipped | error | timeout
+	Error                string   `json:"error,omitempty"`
 }
 
 type UpdateConversationRequest struct {
