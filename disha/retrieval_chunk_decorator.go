@@ -14,13 +14,19 @@ import (
 // Not bot- or call-type-specific: any bot that runs a retrieval step can wire
 // this decorator through CallEventCallbacks.SetChunkDecorator.
 //
-// The chunk carries a compact chunk_retrieval_metrics object plus an S3 key;
-// the full candidate list (every score, qualifying or not) goes to S3, which is
-// both the durable record and the threshold-calibration dataset until
-// disha-backend grows its ChunkRetrievalMetrics(chunk_id) table. Extra
-// top-level chunk keys are safe today: Python's
+// The chunk carries a compact chunk_retrieval_metrics object: the latencies,
+// the top score, the query text, and an S3 key. Everything disha-backend needs
+// to fill its conversationchunkretrievallog row and to seed
+// ProtocolLiveQueryAnchor is inline, so the chunk-sync job needs no S3 read.
+//
+// The full candidate list (every score, qualifying or not) is the one thing
+// that stays S3-only, reachable through protocols_s3_key: it is the
+// threshold-calibration dataset, it is large, and nothing on the write path
+// needs it. Inline it too if Postgres should become self-sufficient.
+//
+// Extra top-level chunk keys are safe: Python's
 // ConversationChunkManager.redis_dict_to_model reads named keys via explicit
-// data.get(...), so unknown ones are ignored rather than raising.
+// data.get(...), so keys it does not know are ignored rather than raising.
 
 const protocolRetrievalUploadTimeout = 5 * time.Second
 
@@ -53,6 +59,7 @@ func newRetrievalChunkDecorator(
 			VectorQueryLatencyMs: record.QueryLatencyMs,
 			TopSimilarityScore:   record.TopSimilarity,
 			InjectedCount:        len(record.Injected),
+			QueryText:            record.QueryText,
 			Status:               record.Status,
 			Error:                record.Err,
 		}

@@ -81,6 +81,12 @@ func TestChunkDecoratorAttachesToSpokenAssistantChunk(t *testing.T) {
 	if metrics.TopSimilarityScore == nil || *metrics.TopSimilarityScore != 0.88 {
 		t.Fatalf("top similarity = %+v", metrics.TopSimilarityScore)
 	}
+	// disha-backend reads query_text off the chunk to fill
+	// conversationchunkretrievallog and to seed ProtocolLiveQueryAnchor, so it
+	// must survive onto the chunk without an S3 read.
+	if metrics.QueryText != "Disha: a\nUser: b" {
+		t.Fatalf("query text = %q, want it carried inline", metrics.QueryText)
+	}
 
 	keys, payload := uploader.uploaded()
 	wantKey := "protocol_retrieval/conv-1/chunk-1.json"
@@ -300,5 +306,51 @@ func TestChunkDecoratorDoesNotPersistStoreEvents(t *testing.T) {
 	}
 	if body["qualified_count"] != 1 {
 		t.Errorf("qualified_count = %v, want the aggregate 1", body["qualified_count"])
+	}
+}
+
+// The chunk must be self-sufficient for the backend's sync job: everything it
+// needs to write a retrieval-log row and seed a live-query anchor is inline, so
+// it never has to fetch S3 per Disha turn.
+func TestChunkMetricsAreSelfSufficientForBackendSync(t *testing.T) {
+	decorate, box := newTestDecorator(t, &stubJSONUploader{})
+	box.put(testProtocolRetrievalRecord())
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	encoded, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{
+		`"query_text":"Disha: a\nUser: b"`, // seeds ProtocolLiveQueryAnchor
+		`"retrieval_latency_ms":31.5`,      // becomes protocol_retrieval_e2e_ms
+		`"protocols_s3_key":`,              // drill-down to the candidate list
+		`"status":"ok"`,
+	} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("chunk JSON missing %s\n%s", want, encoded)
+		}
+	}
+}
+
+// An empty query (a skipped round) must not emit the key at all, so the backend
+// can treat "no query_text" as "nothing to seed" without a sentinel.
+func TestChunkMetricsOmitEmptyQueryText(t *testing.T) {
+	decorate, box := newTestDecorator(t, &stubJSONUploader{})
+	record := testProtocolRetrievalRecord()
+	record.QueryText = ""
+	box.put(record)
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	encoded, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), "query_text") {
+		t.Errorf("empty query text should be omitted: %s", encoded)
 	}
 }

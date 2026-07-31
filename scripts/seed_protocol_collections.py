@@ -78,7 +78,7 @@ def load_class_def(name: str, tei_url: str) -> dict:
         module["endpointURL"] = tei_url
     return definition
 
-DEFAULT_WEAVIATE_URL = "https://weaviate-us.curelinktech.in"
+DEFAULT_WEAVIATE_URL = "https://weaviate-us-staging.curelinktech.in"
 DEFAULT_TEI_URL = "http://jina-embeddings-v5-text-small.{namespace}.svc.cluster.local"
 DEFAULT_KUBE_CONTEXT = "gke_curelinkai_us-east1_disha-voice-worker-staging"
 DEFAULT_NAMESPACE = "staging"

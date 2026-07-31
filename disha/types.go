@@ -98,9 +98,16 @@ type ProtocolRetrievalMetrics struct {
 	VectorQueryLatencyMs float64  `json:"vector_query_latency_ms"`
 	TopSimilarityScore   *float64 `json:"top_similarity_score"`
 	InjectedCount        int      `json:"injected_count"`
-	ProtocolsS3Key       string   `json:"protocols_s3_key"`
-	Status               string   `json:"status"` // ok | skipped | error | timeout
-	Error                string   `json:"error,omitempty"`
+	// QueryText is the exact text embedded for this round. Carried inline
+	// rather than left in the S3 record so disha-backend can persist it and
+	// seed ProtocolLiveQueryAnchor from the chunk alone — reading it from S3
+	// would mean one GET per Disha turn inside the chunk-sync job. It is a few
+	// hundred bytes, and it is user speech that already lives on the chunk's
+	// own text field, so it adds no new exposure.
+	QueryText      string `json:"query_text,omitempty"`
+	ProtocolsS3Key string `json:"protocols_s3_key"`
+	Status         string `json:"status"` // ok | skipped | error | timeout
+	Error          string `json:"error,omitempty"`
 }
 
 type UpdateConversationRequest struct {

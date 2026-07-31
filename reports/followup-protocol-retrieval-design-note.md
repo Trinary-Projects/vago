@@ -400,7 +400,7 @@ which admits every pod in that namespace. There are no egress policies in the
 namespace. **So no NetworkPolicy change is needed.**
 
 Use `http://weaviate.staging.svc.cluster.local:8080` rather than
-`https://weaviate-us.curelinktech.in`: no TLS handshake, no GCLB, no internet hop.
+`https://weaviate-us-staging.curelinktech.in`: no TLS handshake, no GCLB, no internet hop.
 API-key auth still applies (anonymous access is disabled). The public Ingress stays
 the path for out-of-cluster tooling and local development, where the in-cluster DNS
 name doesn't resolve — which the `WEAVIATE_URL` env var handles with no code
@@ -693,7 +693,7 @@ Per the one-var-no-fallback-chain rule, new keys in `.staging.env` / `.prod.env`
 | Var | Purpose |
 |---|---|
 | `FOLLOWUP_PROTOCOL_RETRIEVAL_ENABLED` | `1` turns the step on for both follow-up paths. Absent/`0` → no enricher processor is constructed and the pipeline is byte-for-byte today's. Renamed from `DYNAMIC_CHECKIN_…` when the scope widened; it had never been added to an env file, so no deploy coordination was needed. |
-| `WEAVIATE_URL` | `http://weaviate.staging.svc.cluster.local:8080` — the in-cluster Service (§5.3). No default baked into code. The public Ingress `https://weaviate-us.curelinktech.in` is for out-of-cluster tooling like `scripts/seed_protocol_collections.py`. |
+| `WEAVIATE_URL` | `http://weaviate.staging.svc.cluster.local:8080` — the in-cluster Service (§5.3). No default baked into code. The public Ingress `https://weaviate-us-staging.curelinktech.in` is for out-of-cluster tooling like `scripts/seed_protocol_collections.py`. |
 | `WEAVIATE_API_KEY` | the `weaviate-api-key` secret's value in the worker's own namespace (**not** the `weaviate-v2` key from `.lambda.env` — it 401s against this instance). Mount it into the worker env from the existing Secret rather than pasting it into the env file. |
 
 No `OPENROUTER_API_KEY` involvement: there is no embedding call from Go.
