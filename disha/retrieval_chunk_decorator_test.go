@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -38,10 +39,11 @@ func (u *stubJSONUploader) uploaded() ([]string, any) {
 func testProtocolRetrievalRecord() protocolRetrievalRecord {
 	top := 0.88
 	return protocolRetrievalRecord{
-		QueryText:      "Disha: a\nUser: b",
-		Candidates:     []protocolCandidate{{InstructionID: "instr-A", Similarity: 0.88, Qualified: true, TurnThreshold: 3}},
-		Injected:       []residentProtocol{{InstructionID: "instr-A", Title: "t", ScoreAtAdd: 0.88, RemainingTurns: 3, Threshold: 3}},
-		ResidentAfter:  []residentProtocol{{InstructionID: "instr-A", Title: "t", ScoreAtAdd: 0.88, RemainingTurns: 3, Threshold: 3}},
+		QueryText: "Disha: a\nUser: b",
+		Candidates: []protocolCandidate{{InstructionID: "instr-A", Similarity: 0.88, Qualified: true,
+			TurnThreshold: 3, DocumentPath: "p/v/1"}},
+		Injected: []residentProtocol{{InstructionID: "instr-A", Title: "t", DocumentPath: "p/v/1",
+			ScoreAtAdd: 0.88, RemainingTurns: 3, Threshold: 3}},
 		Qualified:      1,
 		LatencyMs:      31.5,
 		QueryLatencyMs: 24.25,
@@ -105,8 +107,8 @@ func TestChunkDecoratorAttachesToSpokenAssistantChunk(t *testing.T) {
 	}
 	for _, key := range []string{
 		"chunk_id", "conversation_id", "user_id", "bot_type", "retrieved_at",
-		"query_text", "threshold", "latency_ms", "candidates",
-		"injected_protocol_ids", "resident_after", "qualified_count", "insert_index", "status",
+		"query_text", "threshold", "latency_ms", "candidate_protocols",
+		"injected_protocols", "qualified_count", "insert_index", "status",
 		"top_similarity",
 	} {
 		if _, present := body[key]; !present {
@@ -353,4 +355,69 @@ func TestChunkMetricsOmitEmptyQueryText(t *testing.T) {
 	if strings.Contains(string(encoded), "query_text") {
 		t.Errorf("empty query text should be omitted: %s", encoded)
 	}
+}
+
+// The S3 payload shape is a consumer contract (the retrieval-log API and the
+// calibration queries read it), so the exact keys are asserted rather than
+// left to drift.
+func TestRetrievalPayloadShape(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, box := newTestDecorator(t, uploader)
+	box.put(testProtocolRetrievalRecord())
+	decorate(&ConversationChunk{ID: "chunk-1", Role: "assistant"})
+
+	_, payload := uploader.uploaded()
+	body := payload.(map[string]any)
+
+	if _, present := body["injected_protocol_ids"]; present {
+		t.Error("injected_protocol_ids was dropped; injected_protocols carries the same set with detail")
+	}
+	for _, gone := range []string{"candidates", "resident_after"} {
+		if _, present := body[gone]; present {
+			t.Errorf("%q should have been renamed", gone)
+		}
+	}
+
+	cands := body["candidate_protocols"].([]map[string]any)
+	if len(cands) != 1 {
+		t.Fatalf("candidate_protocols = %d", len(cands))
+	}
+	for _, gone := range []string{"distance", "certainty"} {
+		if _, present := cands[0][gone]; present {
+			t.Errorf("candidate still carries %q; similarity is the only score kept", gone)
+		}
+	}
+	wantCand := "anchor_id,anchor_text,document_version_path,instruction_id,qualified,similarity,title,turn_threshold_count"
+	if got := payloadKeys(cands[0]); got != wantCand {
+		t.Errorf("candidate keys = %s, want %s", got, wantCand)
+	}
+
+	inj := body["injected_protocols"].([]map[string]any)
+	if len(inj) != 1 {
+		t.Fatalf("injected_protocols = %d", len(inj))
+	}
+	if _, present := inj[0]["score_at_add"]; present {
+		t.Error("score_at_add should be named similarity")
+	}
+	wantInj := "document_version_path,instruction_id,remaining_turns,similarity,title,turn_threshold"
+	if got := payloadKeys(inj[0]); got != wantInj {
+		t.Errorf("injected keys = %s, want %s", got, wantInj)
+	}
+	if inj[0]["similarity"] != 0.88 {
+		t.Errorf("similarity = %v, want the score recorded at admission (0.88)", inj[0]["similarity"])
+	}
+	if inj[0]["document_version_path"] != "p/v/1" {
+		t.Errorf("document_version_path = %v", inj[0]["document_version_path"])
+	}
+}
+
+// payloadKeys renders a payload object's keys as a sorted, comma-joined string
+// so an exact-shape assertion reads as one comparison.
+func payloadKeys(m map[string]any) string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }

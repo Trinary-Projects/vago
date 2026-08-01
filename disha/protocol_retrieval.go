@@ -137,9 +137,7 @@ type protocolCandidate struct {
 	DocumentPath  string
 	AnchorID      string
 	AnchorText    string
-	Distance      float64
 	Similarity    float64
-	Certainty     float64
 	TurnThreshold int
 	Qualified     bool
 }
@@ -171,7 +169,6 @@ type protocolRetrievalRecord struct {
 	QueryText      string
 	Candidates     []protocolCandidate
 	Injected       []residentProtocol
-	ResidentAfter  []residentProtocol
 	LatencyMs      float64
 	QueryLatencyMs float64
 	TopSimilarity  *float64
@@ -429,9 +426,7 @@ func queryProtocols(ctx context.Context, client *weaviate.Client, query string) 
 			DocumentPath:  instruction.String("documentVersionPath"),
 			AnchorID:      hit.ID,
 			AnchorText:    hit.String("anchorText"),
-			Distance:      hit.Distance,
 			Similarity:    hit.Similarity(),
-			Certainty:     hit.Certainty(),
 			// Unset arrives as JSON null rather than absent; Ref.Int maps
 			// null / non-numeric / non-positive to the fallback.
 			TurnThreshold: instruction.Int("turnsThresholdCount", protocolDefaultTurnThreshold),
@@ -719,7 +714,6 @@ func (e *protocolEnricher) Enrich(ctx context.Context, messages []voicepipelinec
 
 	record.QueryText = query
 	record.Injected = injected
-	record.ResidentAfter = injected
 	record.InsertIndex = index
 	record.LatencyMs = float64(time.Since(startedAt).Microseconds()) / 1000.0
 

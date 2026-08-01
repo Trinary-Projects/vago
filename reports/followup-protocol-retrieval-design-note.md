@@ -599,15 +599,22 @@ durable copy — and it is the calibration dataset of §3:
   "query_text": "Disha: ...\nUser: ...",
   "threshold": {"metric": "cosine_similarity", "value": 0.8},
   "latency_ms": {"vector_query": 0, "total": 0},
-  "candidates": [{"instruction_id":"...","anchor_id":"...","anchor_text":"...",
-                  "title":"...","document_version_path":"...",
-                  "turn_threshold_count":3,
-                  "distance":0.62,"similarity":0.38,"certainty":0.69,
-                  "qualified":false}],
+  "candidate_protocols": [{"instruction_id":"...","anchor_id":"...","anchor_text":"...",
+                           "title":"...","document_version_path":"...",
+                           "turn_threshold_count":3,
+                           "similarity":0.38,"qualified":false}],
   "qualified_count": 1,
-  "injected_protocol_ids": ["..."],
-  "resident_after": [{"instruction_id":"...","remaining_turns":2,"score_at_add":0.83}],
+  "injected_protocols": [{"instruction_id":"...","title":"...",
+                          "document_version_path":"...","remaining_turns":2,
+                          "turn_threshold":3,"similarity":0.83}],
   "insert_index": 12, "status": "ok" }
+
+`similarity` on an injected protocol is the score it had **when admitted**, not
+this round's — that is what the eviction tie-break compares, so a protocol can
+persist through a round in which it scored poorly. `candidate_protocols` keeps
+only `similarity`; `distance` and `certainty` were dropped as derivable and
+unused. There is no separate id list: `injected_protocols` is the same set with
+the detail attached.
 ```
 
 Upload failure → Sentry + chunk still written with an empty `protocols_s3_key`

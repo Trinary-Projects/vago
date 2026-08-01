@@ -129,36 +129,33 @@ func protocolRetrievalRecordPayload(
 	chunkID, userID, conversationID, botType string,
 	record protocolRetrievalRecord,
 ) map[string]any {
-	candidates := make([]map[string]any, 0, len(record.Candidates))
+	candidateProtocols := make([]map[string]any, 0, len(record.Candidates))
 	for _, candidate := range record.Candidates {
-		candidates = append(candidates, map[string]any{
+		candidateProtocols = append(candidateProtocols, map[string]any{
 			"instruction_id":        candidate.InstructionID,
 			"anchor_id":             candidate.AnchorID,
 			"anchor_text":           candidate.AnchorText,
 			"title":                 candidate.Title,
 			"document_version_path": candidate.DocumentPath,
 			"turn_threshold_count":  candidate.TurnThreshold,
-			"distance":              candidate.Distance,
 			"similarity":            candidate.Similarity,
-			"certainty":             candidate.Certainty,
 			"qualified":             candidate.Qualified,
 		})
 	}
 
-	resident := make([]map[string]any, 0, len(record.ResidentAfter))
-	for _, protocol := range record.ResidentAfter {
-		resident = append(resident, map[string]any{
-			"instruction_id":  protocol.InstructionID,
-			"title":           protocol.Title,
-			"remaining_turns": protocol.RemainingTurns,
-			"turn_threshold":  protocol.Threshold,
-			"score_at_add":    protocol.ScoreAtAdd,
-		})
-	}
-
-	injectedIDs := make([]string, 0, len(record.Injected))
+	// similarity here is the score the protocol had when it was ADMITTED, not
+	// this round's score — it is what the eviction tie-break compares, so a
+	// protocol can persist through a round in which it scored poorly.
+	injectedProtocols := make([]map[string]any, 0, len(record.Injected))
 	for _, protocol := range record.Injected {
-		injectedIDs = append(injectedIDs, protocol.InstructionID)
+		injectedProtocols = append(injectedProtocols, map[string]any{
+			"instruction_id":        protocol.InstructionID,
+			"title":                 protocol.Title,
+			"document_version_path": protocol.DocumentPath,
+			"remaining_turns":       protocol.RemainingTurns,
+			"turn_threshold":        protocol.Threshold,
+			"similarity":            protocol.ScoreAtAdd,
+		})
 	}
 
 	payload := map[string]any{
@@ -176,12 +173,11 @@ func protocolRetrievalRecordPayload(
 			"vector_query": record.QueryLatencyMs,
 			"total":        record.LatencyMs,
 		},
-		"candidates":            candidates,
-		"qualified_count":       record.Qualified,
-		"injected_protocol_ids": injectedIDs,
-		"resident_after":        resident,
-		"insert_index":          record.InsertIndex,
-		"status":                record.Status,
+		"candidate_protocols": candidateProtocols,
+		"qualified_count":     record.Qualified,
+		"injected_protocols":  injectedProtocols,
+		"insert_index":        record.InsertIndex,
+		"status":              record.Status,
 	}
 	if record.TopSimilarity != nil {
 		payload["top_similarity"] = *record.TopSimilarity
