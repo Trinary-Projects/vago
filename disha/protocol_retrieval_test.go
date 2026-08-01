@@ -339,7 +339,7 @@ func hasEvent(events []protocolEvent, action, id string) bool {
 func TestProtocolInsertIndexAndBlockPlacement(t *testing.T) {
 	long := "this is a full length assistant turn with plenty of words"
 
-	t.Run("three turns follow the block", func(t *testing.T) {
+	t.Run("three assistant turns follow the block", func(t *testing.T) {
 		messages := []voicepipelinecore.Message{
 			msg("system", "sys"),
 			msg("user", "u1"), msg("assistant", long),
@@ -351,12 +351,10 @@ func TestProtocolInsertIndexAndBlockPlacement(t *testing.T) {
 		if index < 1 {
 			t.Fatalf("index = %d", index)
 		}
-		// Count the conversation turns the block was placed above, in the
-		// original array. (Counting in `out` would undercount: the block is a
-		// user message, so when it lands before a user turn the two merge into
-		// one run and the following turn's start disappears.)
+		// Count ASSISTANT turns after the block, in the original array. The unit
+		// is bot generations, the same unit turnsThresholdCount uses.
 		var turnsAfter int
-		for _, start := range conversationTurnStarts(messages) {
+		for _, start := range assistantTurnStarts(messages) {
 			if start >= index {
 				turnsAfter++
 			}

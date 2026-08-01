@@ -37,20 +37,21 @@ const (
 	// protocolSimilarityThreshold gates admission, as cosine similarity
 	// (1 - distance) on the collection's cosine index.
 	//
-	// CURRENTLY 0.01 = effectively no gate: every candidate the query returns
-	// is admitted. This is a deliberate QA setting so staging calls exercise the
-	// injection/eviction machinery on a corpus that is still only fixtures — it
-	// is NOT a calibrated value, and it means injected protocols are frequently
-	// irrelevant to the turn. Raise it before drawing any conclusion about
-	// retrieval quality, and before prod.
-	//
-	// Calibration data so far, against jina-embeddings-v5-text-small:
+	// Calibration data against jina-embeddings-v5-text-small:
 	//   - fixture probe (2026-07-29): true positives 0.7143-0.8808, highest
-	//     false positive 0.6648 — so 0.80 dropped three of five correct hits
-	//     and 0.70 kept all five.
+	//     false positive 0.6648.
 	//   - live staging call f234dafb (2026-07-31): real top hits 0.7067 /
-	//     0.7013 / 0.7276 against a best-irrelevant of 0.6472 — a tighter
-	//     margin than the fixtures suggested, sitting right on top of 0.70.
+	//     0.7013 / 0.7276 against a best-irrelevant of 0.6472.
+	//   - the first real authored protocol (Acidity, 2026-08-01) scored 0.9198
+	//     on an on-topic query.
+	//
+	// At 0.80 the gate is conservative: it clears the authored protocol
+	// comfortably but rejects the 0.71-0.79 band, where several measured TRUE
+	// positives sat. Whether that costs real recall depends on whether the real
+	// corpus scores like the authored document or like the fixtures — every
+	// candidate's score reaches the S3 record whether or not it qualified, so a
+	// few QA calls answer it with data.
+	//
 	// The model has a high similarity floor (irrelevant protocols still score
 	// 0.54-0.67), so the usable band is narrow; a relative gate (top hit must
 	// beat the second by a margin) is the known next lever.
@@ -64,11 +65,16 @@ const (
 	// absent, when unset).
 	protocolDefaultTurnThreshold = 3
 
-	// protocolBlockTurnsFromTail places the injected block this many turns
-	// above the tail, recomputed every turn. Close to the tail so a content
-	// change invalidates only a short prompt-cache suffix; not adjacent to the
-	// newest user message, so the model treats protocols as background
-	// guidance rather than the thing to answer.
+	// protocolBlockTurnsFromTail places the injected block this many ASSISTANT
+	// turns above the tail, recomputed every turn. Assistant turns, not speaker
+	// turns, so it counts the same unit as turnsThresholdCount: one bot
+	// generation. Counting both roles made the same "3" mean 1.5 exchanges here
+	// and 3 exchanges there.
+	//
+	// The block stays off the newest user message so the model treats protocols
+	// as background guidance rather than the thing to answer; the cost is that a
+	// change to the block invalidates the prompt-cache suffix from that point,
+	// which is now ~6 messages rather than ~3.
 	protocolBlockTurnsFromTail = 3
 
 	// protocolRetrievalBudget bounds the whole blocking step. Generous on
@@ -611,11 +617,26 @@ func protocolQueryHash(query string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// assistantTurnStarts narrows conversationTurnStarts to bot turns only. One
+// entry per generation: a tool pair (assistant tool_calls -> tool result ->
+// spoken reply) is a single assistant turn, and inserting immediately before a
+// start is therefore always safe — the message before it is a user message or
+// the system prompt, never the middle of a tool pair.
+func assistantTurnStarts(messages []voicepipelinecore.Message) []int {
+	starts := make([]int, 0, len(messages))
+	for _, index := range conversationTurnStarts(messages) {
+		if messages[index].Role == "assistant" {
+			starts = append(starts, index)
+		}
+	}
+	return starts
+}
+
 // protocolInsertIndex computes where the block goes: immediately before the
-// start of the Nth-from-last turn, recomputed every turn. Clamped so the
-// system message always stays first.
+// start of the Nth-from-last ASSISTANT turn, recomputed every turn. Clamped so
+// the system message always stays first.
 func protocolInsertIndex(messages []voicepipelinecore.Message) int {
-	starts := conversationTurnStarts(messages)
+	starts := assistantTurnStarts(messages)
 	if len(starts) < protocolBlockTurnsFromTail {
 		if len(messages) == 0 {
 			return 0
