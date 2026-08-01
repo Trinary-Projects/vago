@@ -55,7 +55,7 @@ const (
 	// The model has a high similarity floor (irrelevant protocols still score
 	// 0.54-0.67), so the usable band is narrow; a relative gate (top hit must
 	// beat the second by a margin) is the known next lever.
-	protocolSimilarityThreshold = 0.8
+	protocolSimilarityThreshold = 0.75
 
 	// protocolCapacity is how many protocols stay resident at once.
 	protocolCapacity = 3
@@ -81,7 +81,14 @@ const (
 	// purpose: the measured path is p50 ~17ms / p95 ~21ms, but max latency is
 	// 100-190ms at every concurrency level, so a tight budget would clip tail
 	// requests for no gain.
-	protocolRetrievalBudget = 100 * time.Millisecond
+	protocolRetrievalBudget = 700 * time.Millisecond
+
+	// protocolRenderBudget bounds one instruction-text Jinja render. Separate
+	// from the retrieval budget because it is spent after the vector query
+	// returns, and only for the rare protocol that actually carries template
+	// syntax. The renderer is a warm local subprocess, so this is a hang guard,
+	// not a latency target.
+	protocolRenderBudget = 250 * time.Millisecond
 
 	// protocolQueryLimit is how many anchors to fetch. Deliberately larger
 	// than the capacity: many anchors map to one instruction (measured 10
@@ -692,12 +699,19 @@ func (b *protocolRecordBox) take() *protocolRetrievalRecord {
 	return record
 }
 
+// templateRenderer renders a protocol's instruction text against the call's
+// prompt variables. Satisfied by *DocumentStore; narrow so tests can stub it.
+type templateRenderer interface {
+	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (string, error)
+}
+
 // protocolEnricher implements voicepipelinecore.MessagesEnricher.
 type protocolEnricher struct {
-	client *weaviate.Client
-	store  *ProtocolStore
-	box    *protocolRecordBox
-	logger *log.Logger
+	client   *weaviate.Client
+	store    *ProtocolStore
+	box      *protocolRecordBox
+	logger   *log.Logger
+	renderer templateRenderer
 
 	router promptMetadataSetter
 	ui     serverMessageEmitter
@@ -717,6 +731,7 @@ func newProtocolEnricher(
 	store *ProtocolStore,
 	box *protocolRecordBox,
 	logger *log.Logger,
+	renderer templateRenderer,
 	baseMetadata map[string]any,
 	baseVariables DocumentVariables,
 	userID, conversationID string,
@@ -726,6 +741,7 @@ func newProtocolEnricher(
 		store:          store,
 		box:            box,
 		logger:         logger,
+		renderer:       renderer,
 		baseMetadata:   baseMetadata,
 		baseVariables:  baseVariables,
 		userID:         userID,
@@ -846,13 +862,106 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 			qualified = append(qualified, candidate)
 		}
 	}
+	// qualified_count means "crossed the similarity threshold", so it is taken
+	// before rendering: it must stay equal to the number of candidates carrying
+	// qualified:true in the same payload. A protocol dropped by rendering shows
+	// up as qualified-but-not-injected, the same way a capacity eviction does.
 	record.Qualified = len(qualified)
+	qualified = e.renderInstructions(ctx, qualified)
 
 	// Resident-set lifecycle is logged, not persisted: the events are for
 	// eyeballing a call in app.log, and the per-turn resident_after snapshot in
 	// the S3 record already says what the set ended up as.
 	e.logEvents(e.store.apply(qualified))
 	return record
+}
+
+// renderInstructions renders Jinja in the qualified protocols' instruction
+// text against the same variable store the call's prompts were rendered with.
+//
+// It runs here rather than at block-render time so the text is rendered once
+// per admission instead of once per turn, and so every downstream consumer —
+// the injected block, the S3 record, the llmlog `retrieved_protocols` — sees
+// the same final text the model saw.
+//
+// A protocol whose template fails to render is DROPPED, not injected raw:
+// leaking `{% if diet_chart_available %}` into the context shows the model
+// both branches of a conditional as if both were true, which is worse than
+// the protocol being absent. Text with no template syntax (28 of the 30 live
+// protocols) skips the renderer entirely, so the common case costs no IPC on
+// this blocking path.
+func (e *protocolEnricher) renderInstructions(ctx context.Context, qualified []protocolCandidate) []protocolCandidate {
+	out := qualified[:0]
+	for _, candidate := range qualified {
+		if !templateNeedsRender(candidate.Text) {
+			out = append(out, candidate)
+			continue
+		}
+		if e.renderer == nil {
+			e.dropUnrendered(ctx, candidate, errors.New("no template renderer configured"))
+			continue
+		}
+		renderCtx, cancel := context.WithTimeout(ctx, protocolRenderBudget)
+		text, err := e.renderer.RenderTemplate(renderCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
+		cancel()
+		if err != nil {
+			e.dropUnrendered(ctx, candidate, err)
+			continue
+		}
+		if templateNeedsRender(text) {
+			e.dropUnrendered(ctx, candidate, errors.New("template syntax survived rendering"))
+			continue
+		}
+		candidate.Text = strings.TrimSpace(text)
+		if candidate.Text == "" {
+			e.dropUnrendered(ctx, candidate, errors.New("template rendered empty"))
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+// templateNeedsRender reports whether text carries Jinja syntax. Deliberately
+// a plain substring check: a false positive only costs one render call, and a
+// false negative is impossible for real Jinja.
+func templateNeedsRender(text string) bool {
+	return strings.Contains(text, "{{") || strings.Contains(text, "{%")
+}
+
+// protocolRenderLabel names the text in renderer log lines. The document path
+// is the stable human-readable identity; the instruction id is the fallback
+// for protocols seeded without one.
+func protocolRenderLabel(candidate protocolCandidate) string {
+	if candidate.DocumentPath != "" {
+		return candidate.DocumentPath
+	}
+	return "protocol/" + candidate.InstructionID
+}
+
+func (e *protocolEnricher) dropUnrendered(ctx context.Context, candidate protocolCandidate, err error) {
+	if e.logger != nil {
+		e.logger.Printf("disha: dropping protocol %s (%s): instruction text failed to render: %v\n", shortID(candidate.InstructionID), candidate.Title, err)
+	}
+	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		return
+	}
+	event := sentryutil.Event{
+		Err: err,
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": "protocol_instruction_render",
+		},
+		Details: map[string]any{
+			"conversation_id":       e.conversationID,
+			"user_id":               e.userID,
+			"instruction_id":        candidate.InstructionID,
+			"document_version_path": candidate.DocumentPath,
+			"title":                 candidate.Title,
+		},
+	}
+	event.Hub = e.sentryHub()
+	sentryutil.Capture(event)
 }
 
 // logEvents writes one line per round describing what the round did to the

@@ -90,6 +90,37 @@ func (s *DocumentStore) GetDocument(ctx context.Context, name string, version in
 	return text, resolvedVersion, err
 }
 
+// RenderTemplate renders a template string that did NOT come from the document
+// store, through the same Jinja renderer prompts use. Protocol instruction
+// texts fetched from Weaviate carry the same `{{ var }}` / `{% if %}` syntax
+// prompts do and must be rendered against the same variable store.
+//
+// `label` identifies the text in log lines only. Unlike GetDocumentWithConfig
+// this deliberately does not run reportMissingJinjaVariables: that Sentry path
+// is keyed on a document name+version this text has neither of, and a protocol
+// referencing a variable the caller does not supply is handled by the caller
+// dropping it, not by a document-store alert.
+func (s *DocumentStore) RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (string, error) {
+	if s == nil {
+		return "", errors.New("disha: document store is nil")
+	}
+	if s.renderer == nil {
+		return "", errors.New("disha: document renderer is nil")
+	}
+	rendered, err := s.renderer.Render(ctx, TemplateRenderRequest{
+		DocumentName: label,
+		Text:         text,
+		Variables:    variables,
+	})
+	if err != nil {
+		return "", err
+	}
+	if rendered.UndefinedError != "" {
+		return "", fmt.Errorf("disha: undefined jinja variables in %q: %s missing=%v", label, rendered.UndefinedError, rendered.CompileTimeMissingVars)
+	}
+	return rendered.Output, nil
+}
+
 // GetDocumentWithConfig is the Go equivalent of Disha's
 // get_document_with_config/get_document_and_version combination: it renders
 // the prompt and also returns the Langfuse document config JSON. Dynamic

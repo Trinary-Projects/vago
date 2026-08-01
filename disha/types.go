@@ -38,6 +38,8 @@ type UserProfileData struct {
 	ActiveChatContext                 *string        `json:"active_chat_context"`
 	Recent1HrTranscript               *string        `json:"recent_1hr_transcript"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
+	DietChartAvailable                bool           `json:"diet_chart_available"`
+	DietPlanToday                     *string        `json:"diet_plan_today"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
 	DevanagariName                    string         `json:"devanagari_name"`
 	FirstName                         string         `json:"first_name"`

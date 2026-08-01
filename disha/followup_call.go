@@ -112,7 +112,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
-	setupProtocolRetrieval(pl)
+	setupProtocolRetrieval(pl, deps.Documents)
 	return pl, nil
 }
 
@@ -123,7 +123,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 //
 // A missing/incomplete Weaviate env is treated as "feature off" rather than a
 // call failure — the same posture as the other optional S3-backed features.
-func setupProtocolRetrieval(pl *followUpPlan) {
+func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
 	if !protocolRetrievalEnabled() {
 		return
 	}
@@ -150,6 +150,7 @@ func setupProtocolRetrieval(pl *followUpPlan) {
 		NewProtocolStore(),
 		box,
 		pl.Startup.Logger,
+		renderer,
 		pl.PromptMetadata,
 		pl.PromptVariables,
 		pl.Startup.UserID,
@@ -333,6 +334,14 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"him_her":                   objectPronoun(gender),
 		"his_her":                   possessivePronoun(gender),
 		"call_flow":                 callFlowValue,
+
+		// Not referenced by any follow-up prompt today — these two exist for
+		// retrieved protocol instruction texts, which are rendered against
+		// this same store. Python resolves them in
+		// user_prompt_variable_resolver (_diet_chart_available /
+		// _today_diet_plan) and fetch_conversation forwards them here.
+		"diet_chart_available": user.DietChartAvailable,
+		"diet_plan_today":      derefString(user.DietPlanToday),
 	}
 }
 

@@ -3,6 +3,7 @@ package disha
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -616,6 +617,36 @@ func (s *stubMetadataSetter) snapshot() (map[string]any, int) {
 	return s.metadata, s.calls
 }
 
+// stubRenderer stands in for the Jinja subprocess. It does a literal
+// `{{ name }}` substitution and nothing else, which is enough to prove the
+// enricher routes instruction text through a renderer and handles the outcomes.
+type stubRenderer struct {
+	mu   sync.Mutex
+	err  error
+	vars []DocumentVariables
+}
+
+func (r *stubRenderer) RenderTemplate(_ context.Context, _ string, text string, variables DocumentVariables) (string, error) {
+	r.mu.Lock()
+	r.vars = append(r.vars, variables)
+	err := r.err
+	r.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	for name, value := range variables {
+		text = strings.ReplaceAll(text, "{{"+name+"}}", fmt.Sprint(value))
+		text = strings.ReplaceAll(text, "{{ "+name+" }}", fmt.Sprint(value))
+	}
+	return text, nil
+}
+
+func (r *stubRenderer) calls() []DocumentVariables {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]DocumentVariables(nil), r.vars...)
+}
+
 func newTestEnricher(t *testing.T, client *weaviate.Client) (*protocolEnricher, *protocolRecordBox, *stubMetadataSetter) {
 	t.Helper()
 	box := &protocolRecordBox{}
@@ -623,6 +654,7 @@ func newTestEnricher(t *testing.T, client *weaviate.Client) (*protocolEnricher, 
 	enricher := newProtocolEnricher(
 		client, NewProtocolStore(), box,
 		log.New(io.Discard, "", 0),
+		&stubRenderer{},
 		buildPromptTraceMetadata("system", "followup/sys", 3, baseVariables),
 		baseVariables,
 		"user-1", "conv-1",
@@ -692,6 +724,94 @@ func TestEnricherInjectsAndRecords(t *testing.T) {
 	if _, leaked := enricher.baseVariables["retrieved_protocols"]; leaked {
 		t.Error("base variables were mutated")
 	}
+}
+
+// Two of the 30 live protocols carry Jinja. Their instruction text must be
+// rendered against the same variable store the call's prompts were rendered
+// with, so the model never sees `{% if diet_chart_available %}`.
+func TestEnricherRendersInstructionVariables(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate,
+		anchorHit("a1", "instr-A", "Today's plan: {{ diet_plan_today }}", 0.1, 3))
+	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	renderer := enricher.renderer.(*stubRenderer)
+	enricher.baseVariables = DocumentVariables{"diet_plan_today": "dal chawal at 1pm"}
+
+	out := enricher.Enrich(context.Background(), conversation("khaana kab khaun"))
+
+	block := findProtocolBlock(t, out)
+	if !strings.Contains(block, "Today's plan: dal chawal at 1pm") {
+		t.Errorf("instruction text not rendered into block:\n%s", block)
+	}
+	if strings.Contains(block, "{{") {
+		t.Errorf("raw jinja leaked into the block:\n%s", block)
+	}
+	if calls := renderer.calls(); len(calls) != 1 || calls[0]["diet_plan_today"] != "dal chawal at 1pm" {
+		t.Errorf("renderer got the wrong variable store: %#v", calls)
+	}
+	// The rendered text — not the template — is what telemetry reports.
+	record := box.take()
+	if record == nil || len(record.Injected) != 1 {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+	if record.Injected[0].Text != "Today's plan: dal chawal at 1pm" {
+		t.Errorf("resident text = %q, want the rendered text", record.Injected[0].Text)
+	}
+}
+
+// Protocols without template syntax — 28 of the 30 live ones — must not pay
+// for an IPC round trip on this blocking path.
+func TestEnricherSkipsRendererForPlainText(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "plain protocol body", 0.1, 3))
+	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	renderer := enricher.renderer.(*stubRenderer)
+
+	enricher.Enrich(context.Background(), conversation("mera pet kharab hai"))
+
+	if calls := renderer.calls(); len(calls) != 0 {
+		t.Errorf("renderer called %d times for plain text, want 0", len(calls))
+	}
+}
+
+// A protocol whose template will not render is dropped rather than injected
+// raw: showing the model both branches of an `{% if %}` is worse than the
+// protocol being absent.
+func TestEnricherDropsProtocolWhenRenderFails(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate, strings.Join([]string{
+		anchorHit("a1", "instr-A", "{% if diet_chart_available %}has plan{% endif %}", 0.1, 3),
+		anchorHit("a2", "instr-B", "plain protocol body", 0.2, 3),
+	}, ","))
+	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	enricher.renderer.(*stubRenderer).err = errors.New("undefined variable")
+
+	out := enricher.Enrich(context.Background(), conversation("diet chart nahi mila"))
+
+	record := box.take()
+	if record == nil {
+		t.Fatal("no retrieval record published")
+	}
+	if len(record.Injected) != 1 || record.Injected[0].InstructionID != "instr-B" {
+		t.Fatalf("unrenderable protocol was not dropped: %+v", record.Injected)
+	}
+	// qualified_count tracks threshold crossings, not admissions, so it must
+	// stay consistent with the two qualified:true candidates in the payload.
+	if record.Qualified != 2 {
+		t.Errorf("qualified = %d, want 2 (render drops do not change the count)", record.Qualified)
+	}
+	if block := findProtocolBlock(t, out); strings.Contains(block, "{%") {
+		t.Errorf("raw jinja leaked into the block:\n%s", block)
+	}
+}
+
+// findProtocolBlock returns the injected protocol block, failing if absent.
+func findProtocolBlock(t *testing.T, messages []voicepipelinecore.Message) string {
+	t.Helper()
+	for _, message := range messages {
+		if strings.Contains(message.Content, protocolBlockHeader) {
+			return message.Content
+		}
+	}
+	t.Fatal("no protocol block injected")
+	return ""
 }
 
 // The greet-first turn has no real user input ("hello?" is a synthetic seed)
@@ -927,7 +1047,7 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 				PromptVariables: DocumentVariables{},
 				Callbacks:       &CallEventCallbacks{},
 			}
-			setupProtocolRetrieval(pl)
+			setupProtocolRetrieval(pl, nil)
 
 			if got := pl.ProtocolEnricher != nil; got != tc.want {
 				t.Errorf("enricher present = %v, want %v", got, tc.want)
@@ -950,7 +1070,7 @@ func TestSetupProtocolRetrievalMissingWeaviateConfig(t *testing.T) {
 		Dynamic:   true,
 		Callbacks: &CallEventCallbacks{},
 	}
-	setupProtocolRetrieval(pl)
+	setupProtocolRetrieval(pl, nil)
 
 	if pl.ProtocolEnricher != nil {
 		t.Error("enricher should not be built without Weaviate config")
