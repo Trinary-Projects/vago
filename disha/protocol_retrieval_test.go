@@ -973,3 +973,174 @@ func TestRouterPromptMetadataSetter(t *testing.T) {
 	// Must not panic with no router wired.
 	enricher.refreshPromptMetadata(nil)
 }
+
+func residentIDsInOrder(store *ProtocolStore) []string {
+	return residentIDs(store.snapshot())
+}
+
+func eventActions(events []protocolEvent) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		out = append(out, e.Action+":"+e.InstructionID)
+	}
+	return out
+}
+
+// Regression, found by review 2026-08-01: with a single interleaved pass, a
+// higher-scoring newcomer evicted a resident whose own refresh had not been
+// processed yet. That resident was then re-added as brand new — two evictions
+// instead of one, an unrelated protocol lost, and the insertion order corrupted.
+func TestProtocolStoreRefreshBeforeAdmitPreventsChurn(t *testing.T) {
+	store := NewProtocolStore()
+	store.apply([]protocolCandidate{
+		candidate("a", 0.70, 2), candidate("b", 0.80, 5), candidate("c", 0.90, 5),
+	})
+	seqBefore := map[string]int{}
+	for _, p := range store.snapshot() {
+		seqBefore[p.InstructionID] = p.seq
+	}
+
+	// "a" is about to age to 1 remaining, and re-matches strongly this round —
+	// but "d" outranks it, so "d" is processed first.
+	events := store.apply([]protocolCandidate{candidate("d", 0.99, 3), candidate("a", 0.98, 10)})
+
+	actions := eventActions(events)
+	for _, unwanted := range []string{"evict:a", "add:a"} {
+		if contains(actions, unwanted) {
+			t.Errorf("a re-matched and must be refreshed, not %s: %v", unwanted, actions)
+		}
+	}
+	if !contains(actions, "refresh:a") {
+		t.Errorf("expected refresh:a, got %v", actions)
+	}
+	if got := countAction(events, "evict"); got != 1 {
+		t.Errorf("evictions = %d, want exactly 1 (capacity overflow only): %v", got, actions)
+	}
+
+	got := residentIDsInOrder(store)
+	if !contains(got, "a") || !contains(got, "d") {
+		t.Fatalf("resident = %v, want both the refreshed a and the new d", got)
+	}
+	for _, p := range store.snapshot() {
+		if p.InstructionID == "a" {
+			if p.seq != seqBefore["a"] {
+				t.Errorf("a's insertion order changed (%d -> %d); a refresh must keep its slot",
+					seqBefore["a"], p.seq)
+			}
+			if p.RemainingTurns != 10 {
+				t.Errorf("a remaining = %d, want its refreshed threshold 10", p.RemainingTurns)
+			}
+		}
+	}
+}
+
+// Regression: refreshes used to consume the per-round admission budget, so a
+// genuinely new protocol was starved whenever the resident set kept matching —
+// the common case, since the conversation stays on topic. Spec: the newly
+// ranked protocol is added under all circumstances.
+func TestProtocolStoreRefreshesDoNotStarveNewAdmission(t *testing.T) {
+	store := NewProtocolStore()
+	store.apply([]protocolCandidate{
+		candidate("a", 0.90, 9), candidate("b", 0.89, 9), candidate("c", 0.88, 9),
+	})
+
+	events := store.apply([]protocolCandidate{
+		candidate("a", 0.95, 9), candidate("b", 0.94, 9), candidate("c", 0.93, 9),
+		candidate("NEW", 0.92, 9),
+	})
+
+	got := residentIDsInOrder(store)
+	if !contains(got, "NEW") {
+		t.Fatalf("resident = %v, want the newly ranked NEW admitted: %v", got, eventActions(events))
+	}
+	if len(got) != protocolCapacity {
+		t.Errorf("resident = %v, want exactly %d", got, protocolCapacity)
+	}
+	if countAction(events, "refresh") != 3 {
+		t.Errorf("all three residents re-matched and should refresh: %v", eventActions(events))
+	}
+}
+
+// Duplicate ids inside one round must not consume admission budget either.
+func TestProtocolStoreDuplicateCandidatesDoNotConsumeBudget(t *testing.T) {
+	store := NewProtocolStore()
+	events := store.apply([]protocolCandidate{
+		candidate("a", 0.99, 3), candidate("a", 0.98, 3),
+		candidate("b", 0.97, 3), candidate("c", 0.96, 3),
+	})
+	got := residentIDsInOrder(store)
+	for _, want := range []string{"a", "b", "c"} {
+		if !contains(got, want) {
+			t.Errorf("resident = %v, missing %q: %v", got, want, eventActions(events))
+		}
+	}
+	if len(got) != 3 {
+		t.Errorf("resident = %v, want 3 distinct protocols", got)
+	}
+}
+
+func countAction(events []protocolEvent, action string) int {
+	n := 0
+	for _, e := range events {
+		if e.Action == action {
+			n++
+		}
+	}
+	return n
+}
+
+// A failed retrieval must still age the resident set. Fail-open means the
+// protocols are KEPT and still injected, not that the turn stops counting —
+// otherwise a run of failures (e.g. a tight budget timing out) pins protocols
+// in context indefinitely.
+func TestEnricherFailedRetrievalStillAgesTheStore(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"server error", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }},
+		{"timeout", func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(protocolRetrievalBudget + 200*time.Millisecond)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(tc.handler)
+			t.Cleanup(server.Close)
+			client, _ := weaviate.New(weaviate.Config{BaseURL: server.URL, APIKey: "k"})
+			enricher, _, _ := newTestEnricher(t, client)
+
+			enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 3)})
+			before := enricher.store.snapshot()[0].RemainingTurns
+
+			out := enricher.Enrich(context.Background(), conversation("first user turn"))
+			after := enricher.store.snapshot()[0].RemainingTurns
+
+			if after != before-1 {
+				t.Errorf("remaining turns %d -> %d, want the failed turn to still age it", before, after)
+			}
+			// Fail open: the protocol is kept and still injected.
+			if len(out) != len(conversation("first user turn"))+1 {
+				t.Errorf("resident protocol should still be injected on failure")
+			}
+		})
+	}
+}
+
+// ...and enough consecutive failures must still expire it, rather than pinning
+// it in context forever.
+func TestEnricherRepeatedFailuresEventuallyExpire(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
+	t.Cleanup(server.Close)
+	client, _ := weaviate.New(weaviate.Config{BaseURL: server.URL, APIKey: "k"})
+	enricher, _, _ := newTestEnricher(t, client)
+
+	enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 3)})
+	for turn := 1; turn <= 3; turn++ {
+		// Distinct text per turn so the re-run gate treats each as a new turn.
+		enricher.Enrich(context.Background(), conversation(fmt.Sprintf("user turn %d", turn)))
+	}
+	if got := len(enricher.store.snapshot()); got != 0 {
+		t.Errorf("resident = %d after three failed turns, want it expired", got)
+	}
+}

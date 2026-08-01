@@ -194,10 +194,16 @@ func NewProtocolStore() *ProtocolStore { return &ProtocolStore{} }
 // apply runs one retrieval round against the resident set and returns the
 // lifecycle events.
 //
-// Order matters and mirrors the agreed rules: expire first, then admit every
-// qualifying protocol unconditionally, evicting only from the protocols that
-// were already resident BEFORE this round (fewest remaining turns first, ties
-// broken by the lower similarity recorded at the time of addition).
+// Three ordered phases, and the order is the correctness argument:
+//
+//  1. Expire — age every resident, drop those that ran out.
+//  2. Refresh — reset the TTL and score of every resident that re-matched.
+//  3. Admit — add genuinely new protocols unconditionally, evicting only from
+//     the protocols resident BEFORE this round (fewest remaining turns first,
+//     ties broken by the lower similarity recorded at the time of addition).
+//
+// Refreshing before admitting is what makes eviction pick the right victim, and
+// what stops a re-matched protocol from being evicted and re-added as new.
 func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,26 +224,57 @@ func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
 	}
 	s.resident = kept
 
-	// Snapshot of "already resident before this round" — the only eviction
-	// candidates, so a protocol added now is never evicted by a later hit in
-	// the same round.
-	preexisting := make(map[string]bool, len(s.resident))
-	for _, protocol := range s.resident {
-		preexisting[protocol.InstructionID] = true
+	// 2. Refresh pass. Every re-matched resident has its TTL and score reset
+	// BEFORE anything is admitted, for two reasons.
+	//
+	// First, the eviction comparator picks the fewest remaining turns — so a
+	// protocol that just re-matched must already carry its reset count by the
+	// time eviction runs, or it looks like the weakest resident and gets thrown
+	// out at the exact moment it proved most relevant. (Previously the passes
+	// were interleaved in score order: a higher-scoring newcomer could evict a
+	// resident whose own refresh had not been reached yet, and that resident was
+	// then re-added as brand new — two evictions, and a lost insertion order.)
+	//
+	// Second, a refresh consumes no admission slot: the protocol already holds
+	// one. Counting it against the per-round budget starved genuinely new
+	// protocols whenever the resident set kept matching, which is the common
+	// case because the conversation stays on topic.
+	refreshed := make(map[string]bool, len(qualified))
+	for _, candidate := range qualified {
+		if refreshed[candidate.InstructionID] {
+			continue
+		}
+		index := s.indexOf(candidate.InstructionID)
+		if index < 0 {
+			continue
+		}
+		s.resident[index].RemainingTurns = candidate.TurnThreshold
+		s.resident[index].ScoreAtAdd = candidate.Similarity
+		refreshed[candidate.InstructionID] = true
+		events = append(events, protocolEvent{
+			Action: "refresh", InstructionID: candidate.InstructionID,
+			Title: candidate.Title, Score: candidate.Similarity,
+		})
 	}
 
-	// 2. Admit. Never more than capacity in one round.
-	for i, candidate := range qualified {
-		if i >= protocolCapacity {
+	// Eviction may only take protocols that were resident before this round —
+	// including ones just refreshed, which are protected not by exclusion but by
+	// now having the most remaining turns. Anything admitted below is exempt.
+	eligible := make(map[string]bool, len(s.resident))
+	for _, protocol := range s.resident {
+		eligible[protocol.InstructionID] = true
+	}
+
+	// 3. Admission pass. Only genuinely new protocols, and the budget counts
+	// admissions rather than candidates examined.
+	admitted := 0
+	for _, candidate := range qualified {
+		if admitted >= protocolCapacity {
 			break
 		}
-		if index := s.indexOf(candidate.InstructionID); index >= 0 {
-			s.resident[index].RemainingTurns = candidate.TurnThreshold
-			s.resident[index].ScoreAtAdd = candidate.Similarity
-			events = append(events, protocolEvent{
-				Action: "refresh", InstructionID: candidate.InstructionID,
-				Title: candidate.Title, Score: candidate.Similarity,
-			})
+		// Already handled by the refresh pass, or a duplicate id later in the
+		// same round's list — either way it must not consume a slot.
+		if refreshed[candidate.InstructionID] || s.indexOf(candidate.InstructionID) >= 0 {
 			continue
 		}
 
@@ -252,13 +289,14 @@ func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
 			Threshold:      candidate.TurnThreshold,
 			seq:            s.seq,
 		})
+		admitted++
 		events = append(events, protocolEvent{
 			Action: "add", InstructionID: candidate.InstructionID,
 			Title: candidate.Title, Score: candidate.Similarity,
 		})
 
 		for len(s.resident) > protocolCapacity {
-			victim := s.evictionTarget(preexisting)
+			victim := s.evictionTarget(eligible)
 			if victim < 0 {
 				break
 			}
@@ -267,7 +305,7 @@ func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
 				Title: s.resident[victim].Title, Reason: "capacity",
 				Score: s.resident[victim].ScoreAtAdd,
 			})
-			delete(preexisting, s.resident[victim].InstructionID)
+			delete(eligible, s.resident[victim].InstructionID)
 			s.resident = append(s.resident[:victim], s.resident[victim+1:]...)
 		}
 	}
@@ -378,11 +416,6 @@ func buildProtocolQueryText(messages []voicepipelinecore.Message) string {
 		return "User: " + userText
 	}
 	return "Disha: " + dishaText + "\nUser: " + userText
-}
-
-func protocolQueryHash(query string) string {
-	sum := sha256.Sum256([]byte(query))
-	return hex.EncodeToString(sum[:8])
 }
 
 // ------------------------------------------------------- weaviate decoding
@@ -573,6 +606,11 @@ func conversationTurnStarts(messages []voicepipelinecore.Message) []int {
 	return starts
 }
 
+func protocolQueryHash(query string) string {
+	sum := sha256.Sum256([]byte(query))
+	return hex.EncodeToString(sum[:8])
+}
+
 // protocolInsertIndex computes where the block goes: immediately before the
 // start of the Nth-from-last turn, recomputed every turn. Clamped so the
 // system message always stays first.
@@ -731,8 +769,14 @@ func (e *protocolEnricher) Enrich(ctx context.Context, messages []voicepipelinec
 }
 
 // shouldRetrieve gates retrieval on the query text changing, so a tool-result
-// re-run re-injects without re-querying and without ageing the resident set.
-// Returns true (and records the hash) only when this is a new user turn.
+// re-run re-injects without re-querying and without ageing the resident set:
+// residency is measured in user turns, not LLM calls.
+//
+// Known limitation, accepted deliberately: two genuinely different turns can
+// render an identical query once short assistant stubs are skipped ("haan" /
+// bot "hmm" / "haan"), and that collision suppresses the second turn's
+// retrieval and ageing. A monotonic turn id from upstream would be exact, but
+// this is simpler and the collision is rare.
 func (e *protocolEnricher) shouldRetrieve(query string) bool {
 	hash := protocolQueryHash(query)
 	e.mu.Lock()
@@ -762,7 +806,11 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 		}
 		record.Err = err.Error()
 		e.reportFailure(ctx, err, query)
-		// Fail open: the resident set is left exactly as it was.
+		// Fail open on CONTENT — the resident set keeps its protocols and is
+		// still injected — but the turn still happened, so it must still be
+		// counted against every resident's TTL. Skipping the ageing let a run of
+		// failures pin protocols in context indefinitely.
+		e.logEvents(e.store.apply(nil))
 		return record
 	}
 
