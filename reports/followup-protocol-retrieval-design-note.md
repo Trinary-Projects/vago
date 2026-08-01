@@ -606,12 +606,14 @@ durable copy — and it is the calibration dataset of §3:
   "qualified_count": 1,
   "injected_protocols": [{"instruction_id":"...","title":"...",
                           "document_version_path":"...","remaining_turns":2,
-                          "turn_threshold":3,"similarity":0.83}],
+                          "turn_threshold":3,"similarity_at_add":0.83}],
   "insert_index": 12, "status": "ok" }
 
-`similarity` on an injected protocol is the score it had **when admitted**, not
-this round's — that is what the eviction tie-break compares, so a protocol can
-persist through a round in which it scored poorly. `candidate_protocols` keeps
+`similarity_at_add` on an injected protocol is the score it had **when
+admitted**, not this round's — that is what the eviction tie-break compares, so a
+protocol can persist through a round in which it scored poorly. It is named
+distinctly from `candidate_protocols.similarity`, one level away, which *is* the
+current round's score. `candidate_protocols` keeps
 only `similarity`; `distance` and `certainty` were dropped as derivable and
 unused. There is no separate id list: `injected_protocols` is the same set with
 the detail attached.

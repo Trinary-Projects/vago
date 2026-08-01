@@ -143,9 +143,11 @@ func protocolRetrievalRecordPayload(
 		})
 	}
 
-	// similarity here is the score the protocol had when it was ADMITTED, not
-	// this round's score — it is what the eviction tie-break compares, so a
-	// protocol can persist through a round in which it scored poorly.
+	// similarity_at_add, not similarity: this is the score the protocol had when
+	// it was ADMITTED, not this round's. It is what the eviction tie-break
+	// compares, so a protocol can persist through a round in which it scored
+	// poorly — and candidate_protocols.similarity one level away IS the current
+	// round's score, so the two must not share a name.
 	injectedProtocols := make([]map[string]any, 0, len(record.Injected))
 	for _, protocol := range record.Injected {
 		injectedProtocols = append(injectedProtocols, map[string]any{
@@ -154,7 +156,7 @@ func protocolRetrievalRecordPayload(
 			"document_version_path": protocol.DocumentPath,
 			"remaining_turns":       protocol.RemainingTurns,
 			"turn_threshold":        protocol.Threshold,
-			"similarity":            protocol.ScoreAtAdd,
+			"similarity_at_add":     protocol.ScoreAtAdd,
 		})
 	}
 

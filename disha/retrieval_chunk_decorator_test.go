@@ -399,12 +399,17 @@ func TestRetrievalPayloadShape(t *testing.T) {
 	if _, present := inj[0]["score_at_add"]; present {
 		t.Error("score_at_add should be named similarity")
 	}
-	wantInj := "document_version_path,instruction_id,remaining_turns,similarity,title,turn_threshold"
+	wantInj := "document_version_path,instruction_id,remaining_turns,similarity_at_add,title,turn_threshold"
 	if got := payloadKeys(inj[0]); got != wantInj {
 		t.Errorf("injected keys = %s, want %s", got, wantInj)
 	}
-	if inj[0]["similarity"] != 0.88 {
-		t.Errorf("similarity = %v, want the score recorded at admission (0.88)", inj[0]["similarity"])
+	if inj[0]["similarity_at_add"] != 0.88 {
+		t.Errorf("similarity_at_add = %v, want the score recorded at admission (0.88)", inj[0]["similarity_at_add"])
+	}
+	// Must not collide with candidate_protocols.similarity, which is this
+	// round's score rather than the score at admission.
+	if _, present := inj[0]["similarity"]; present {
+		t.Error("injected protocol should not carry a bare similarity key")
 	}
 	if inj[0]["document_version_path"] != "p/v/1" {
 		t.Errorf("document_version_path = %v", inj[0]["document_version_path"])
