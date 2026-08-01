@@ -54,7 +54,7 @@ const (
 	// The model has a high similarity floor (irrelevant protocols still score
 	// 0.54-0.67), so the usable band is narrow; a relative gate (top hit must
 	// beat the second by a margin) is the known next lever.
-	protocolSimilarityThreshold = 0.01
+	protocolSimilarityThreshold = 0.8
 
 	// protocolCapacity is how many protocols stay resident at once.
 	protocolCapacity = 3
