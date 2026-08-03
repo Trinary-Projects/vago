@@ -943,3 +943,179 @@ func TestFixedEndpointGemini25FlashLite(t *testing.T) {
 		}
 	}
 }
+
+// --- guardrail-check judge (llmrouter.GroupGuardrailJudgeHedged) ---
+
+func TestBuildRequestGuardrailJudgeLlama(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "or-key")
+
+	r := &Router{cfg: Config{}, httpClient: &http.Client{}}
+	req, err := r.buildRequest(ctx(), endpointConfigs["openrouter_llama_3_1_8b_instruct_nitro"], testLLMRequest())
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if req.URL.String() != "https://openrouter.ai/api/v1/chat/completions" {
+		t.Errorf("url = %s", req.URL.String())
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer or-key" {
+		t.Errorf("auth = %q", got)
+	}
+	body := readBody(t, req)
+	if body["model"] != "meta-llama/llama-3.1-8b-instruct:nitro" {
+		t.Errorf("model = %v, want the :nitro-suffixed model id", body["model"])
+	}
+	// The primary leg carries no reasoning field — only the hedge
+	// (gpt-oss-20b) does.
+	if _, hasReasoning := body["reasoning"]; hasReasoning {
+		t.Errorf("llama nitro must not carry a reasoning field, got %v", body["reasoning"])
+	}
+	if _, hasMaxTokens := body["max_tokens"]; hasMaxTokens {
+		t.Errorf("llama nitro config must not set a default max_tokens, got %v", body["max_tokens"])
+	}
+}
+
+func TestBuildRequestGuardrailJudgeGPTOSS20B(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "or-key")
+
+	r := &Router{cfg: Config{}, httpClient: &http.Client{}}
+	req, err := r.buildRequest(ctx(), endpointConfigs["openrouter_gpt_oss_20b_nitro"], testLLMRequest())
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if req.URL.String() != "https://openrouter.ai/api/v1/chat/completions" {
+		t.Errorf("url = %s", req.URL.String())
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer or-key" {
+		t.Errorf("auth = %q", got)
+	}
+	body := readBody(t, req)
+	if body["model"] != "openai/gpt-oss-20b:nitro" {
+		t.Errorf("model = %v, want the :nitro-suffixed model id", body["model"])
+	}
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "low" {
+		t.Fatalf("reasoning = %v, want effort=low", body["reasoning"])
+	}
+	if _, hasMaxTokens := body["max_tokens"]; hasMaxTokens {
+		t.Errorf("gpt-oss-20b nitro config must not set a default max_tokens (VAGO-15 regression guard), got %v", body["max_tokens"])
+	}
+}
+
+// TestBuildRequestGuardrailJudgeExplicitMaxTokensStillWins verifies the
+// caller-side override still reaches the body when supplied (the hedged
+// judge client always passes MaxTokens: 512 explicitly per the guardrail
+// design note; VAGO-15 was a nil override silently inheriting a stale
+// config-level cap, which these two configs cannot do since they carry no
+// MaxTokens of their own).
+func TestBuildRequestGuardrailJudgeExplicitMaxTokensStillWins(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "or-key")
+
+	r := &Router{cfg: Config{MaxTokens: intPtr(512)}, httpClient: &http.Client{}}
+	for _, key := range []string{"openrouter_llama_3_1_8b_instruct_nitro", "openrouter_gpt_oss_20b_nitro"} {
+		req, err := r.buildRequest(ctx(), endpointConfigs[key], testLLMRequest())
+		if err != nil {
+			t.Fatalf("buildRequest(%s): %v", key, err)
+		}
+		body := readBody(t, req)
+		if body["max_tokens"] != float64(512) {
+			t.Errorf("%s: max_tokens = %v, want 512", key, body["max_tokens"])
+		}
+	}
+}
+
+func TestExtraBodyForGuardrailJudge(t *testing.T) {
+	// Llama carries no reasoning field.
+	if eb := extraBodyFor(endpointConfigs["openrouter_llama_3_1_8b_instruct_nitro"]); eb != nil {
+		t.Errorf("llama nitro extra body = %v, want nil", eb)
+	}
+	// gpt-oss-20b carries reasoning.effort=low.
+	eb := extraBodyFor(endpointConfigs["openrouter_gpt_oss_20b_nitro"])
+	reasoning, ok := eb["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "low" {
+		t.Fatalf("gpt-oss-20b nitro extra body = %v, want reasoning.effort=low", eb)
+	}
+	// The unrelated gpt-oss-120b hedge config (different model string) must
+	// not pick up the new "gpt-oss-20b" substring check.
+	if eb := extraBodyFor(endpointConfigs["openrouter_gpt_oss_120b_throughput"]); eb != nil {
+		t.Errorf("gpt-oss-120b throughput extra body = %v, want nil (unaffected by the new 20b case)", eb)
+	}
+}
+
+func TestGuardrailJudgeHedgedPair(t *testing.T) {
+	pair, ok := hedgedPairs[GroupGuardrailJudgeHedged]
+	if !ok {
+		t.Fatalf("hedgedPairs[%q] not registered", GroupGuardrailJudgeHedged)
+	}
+	if pair.Primary != "openrouter_llama_3_1_8b_instruct_nitro" {
+		t.Errorf("primary = %q, want openrouter_llama_3_1_8b_instruct_nitro", pair.Primary)
+	}
+	if pair.Hedge != "openrouter_gpt_oss_20b_nitro" {
+		t.Errorf("hedge = %q, want openrouter_gpt_oss_20b_nitro", pair.Hedge)
+	}
+	// Both legs must resolve to a real registered endpoint config.
+	if _, ok := endpointConfigs[pair.Primary]; !ok {
+		t.Fatalf("primary config %q not registered", pair.Primary)
+	}
+	if _, ok := endpointConfigs[pair.Hedge]; !ok {
+		t.Fatalf("hedge config %q not registered", pair.Hedge)
+	}
+}
+
+// TestGuardrailJudgeConfigsNotInAnyHealthSelectedGroup guards the whole
+// point of these being fixed-endpoint-only: neither config may appear in a
+// health-selected group's Configs list, because that would require a
+// matching disha-backend polling change (per the "adding a new endpoint or
+// model group" rule in AGENTS.md) and neither endpoint is polled.
+func TestGuardrailJudgeConfigsNotInAnyHealthSelectedGroup(t *testing.T) {
+	guardrailConfigs := map[string]bool{
+		"openrouter_llama_3_1_8b_instruct_nitro": true,
+		"openrouter_gpt_oss_20b_nitro":           true,
+	}
+	for group, g := range modelGroups {
+		for _, key := range g.Configs {
+			if guardrailConfigs[key] {
+				t.Fatalf("guardrail judge config %q appears in health-selected group %q", key, group)
+			}
+		}
+	}
+}
+
+// TestExtraBodyForUnchangedExistingConfigs is a regression guard: adding
+// the gpt-oss-20b reasoning case to extraBodyFor must not change what any
+// pre-existing config sends. A stray top-level "reasoning" field has caused
+// real production 400s on Azure/Vertex grok before.
+func TestExtraBodyForUnchangedExistingConfigs(t *testing.T) {
+	cases := []struct {
+		key  string
+		want map[string]any
+	}{
+		{"grok_4_1_fnr_eastus", nil},
+		{"vertex_dishaai_grok_4_1_fast_non_reasoning", nil},
+		{"openai_gpt_4_1", nil},
+		{"azure_gpt_4_1_us_east", nil},
+		{"vertex_gemini_flash_3_1_lite", map[string]any{
+			"google": map[string]any{"thinking_config": map[string]any{"thinking_level": "MINIMAL"}},
+		}},
+		{"google_ai_studio_gemini_flash_3_1_lite", map[string]any{"reasoning_effort": "minimal"}},
+		{"openrouter_gemini_flash_3_1_lite", map[string]any{
+			"reasoning": map[string]any{"effort": "minimal"},
+		}},
+		{"cerebras_gpt_oss_120b", nil},
+		{"openrouter_gpt_oss_120b", nil},
+		{"openrouter_gpt_oss_120b_throughput", nil},
+		{EndpointOpenRouterGemini25FlashLite, map[string]any{
+			"reasoning": map[string]any{"effort": "none"},
+		}},
+		{"openrouter_gemma_4_31b_it_modelrun", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			got := extraBodyFor(endpointConfigs[tc.key])
+			gotJSON, _ := json.Marshal(got)
+			wantJSON, _ := json.Marshal(tc.want)
+			if string(gotJSON) != string(wantJSON) {
+				t.Errorf("extraBodyFor(%s) = %s, want %s", tc.key, gotJSON, wantJSON)
+			}
+		})
+	}
+}

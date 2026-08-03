@@ -237,6 +237,13 @@ func extraBodyFor(cfg endpointConfig) map[string]any {
 			}
 			return map[string]any{"reasoning": map[string]any{"effort": "minimal"}}
 		}
+		// The follow-up guardrail-check judge's hedge leg: gpt-oss-20b
+		// spends output tokens on reasoning even at low effort, which is
+		// why its HedgedConfig pairs this with an explicit MaxTokens: 512
+		// (disha/guardrail_check.go) rather than something tiny.
+		if strings.Contains(model, "gpt-oss-20b") {
+			return map[string]any{"reasoning": map[string]any{"effort": "low"}}
+		}
 	case providerVertex:
 		if strings.Contains(model, "gemini") {
 			if strings.Contains(model, "gemini-2.5") {

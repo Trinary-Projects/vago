@@ -290,6 +290,53 @@ var endpointConfigs = map[string]endpointConfig{
 			"provider": map[string]any{"sort": "throughput"},
 		},
 	},
+
+	// --- follow-up guardrail-check judge (hedged one-shot, fixed-endpoint only) ---
+	// Raced by disha's follow-up guardrail checker's hedged one-shot judge
+	// client (voicepipelinecore/response_guard_processor.go's ResponseGuard
+	// implementation). Fixed-endpoint only: neither key appears in any
+	// health-selected group's Configs list below, so — unlike the gemma
+	// work — this needs NO matching disha-backend polling change (same
+	// pattern as EndpointOpenRouterGemini25FlashLite and the hedged
+	// throughput config above).
+	//
+	// ":nitro" is an OpenRouter completion-time routing shorthand
+	// (equivalent to a request-time "provider":{"sort":"throughput"}
+	// preference), not a distinct listed model id: verified 2026-08-03 that
+	// GET /models/{id}/endpoints strips the suffix and returns the base
+	// model's endpoint list (data.id comes back without ":nitro"), but a
+	// live non-streaming chat-completion call with the ":nitro"-suffixed
+	// model in the request body is honored and OpenRouter routes it to the
+	// highest-throughput provider at call time (observed: CoreWeave for the
+	// llama call, Amazon Bedrock for the gpt-oss-20b call). Both base model
+	// ids resolve with HTTP 200 and both live completions returned 200.
+	//
+	// Deliberately no MaxTokens on either config: NewHedged's HedgedConfig
+	// always passes an explicit MaxTokens (512, per VAGO-15 — see
+	// disha/guardrail_check.go), and setting a config-level cap here would
+	// only matter if some future caller invoked these configs directly with
+	// a nil MaxTokens, which is exactly the silent-inheritance failure mode
+	// VAGO-15 taught us to avoid. With no config-level MaxTokens, a nil
+	// caller-side MaxTokens against either config sends no "max_tokens"
+	// field at all (client.go's switch falls through both cases), so the
+	// request relies entirely on the provider's own ceiling
+	// (max_completion_tokens per /endpoints: up to 131072 for the llama
+	// providers actually in rotation, 32768-131072 for gpt-oss-20b) rather
+	// than truncating early — the opposite failure mode from VAGO-15, and
+	// harmless for a judge call that always supplies 512 explicitly.
+	"openrouter_llama_3_1_8b_instruct_nitro": {
+		Key: "openrouter_llama_3_1_8b_instruct_nitro", Provider: providerOpenRouter,
+		Model: "meta-llama/llama-3.1-8b-instruct:nitro", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+	},
+	// reasoning.effort=low is applied via extraBodyFor (providers.go) so it
+	// follows the same provider/model-keyed switch as every other reasoning
+	// toggle, rather than being hardcoded into ExtraBody here.
+	"openrouter_gpt_oss_20b_nitro": {
+		Key: "openrouter_gpt_oss_20b_nitro", Provider: providerOpenRouter,
+		Model: "openai/gpt-oss-20b:nitro", Region: "us",
+		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+	},
 }
 
 // hedgedPair is a fixed ordered primary/hedge endpoint pair for the
@@ -304,10 +351,20 @@ type hedgedPair struct {
 // failover config: Cerebras primary, OpenRouter throughput-sorted hedge.
 const GroupGPTOSS120FastHedged = "gpt-oss120-fast-hedged"
 
+// GroupGuardrailJudgeHedged is the follow-up guardrail-check judge's
+// hedged one-shot pair: llama-3.1-8b-instruct:nitro primary, gpt-oss-20b:nitro
+// hedge — both fixed-endpoint-only OpenRouter configs (see the endpointConfigs
+// entries above for the ":nitro" verification note and the no-poll rationale).
+const GroupGuardrailJudgeHedged = "guardrail-judge-hedged"
+
 var hedgedPairs = map[string]hedgedPair{
 	GroupGPTOSS120FastHedged: {
 		Primary: "cerebras_gpt_oss_120b",
 		Hedge:   "openrouter_gpt_oss_120b_throughput",
+	},
+	GroupGuardrailJudgeHedged: {
+		Primary: "openrouter_llama_3_1_8b_instruct_nitro",
+		Hedge:   "openrouter_gpt_oss_20b_nitro",
 	},
 }
 

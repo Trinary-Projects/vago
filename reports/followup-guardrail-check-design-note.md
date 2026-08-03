@@ -306,12 +306,30 @@ Both configs are **fixed-endpoint only**, so they bypass health-ranked
 selection and **need no disha-backend polling change** — a real deploy-order
 simplification versus the gemma work. Auth is the existing `OPENROUTER_API_KEY`.
 
-⚠️ **Verify before implementing** that the `:nitro` suffix resolves on
-OpenRouter and that both models list `tools` support is *not* required here (the
-judge sends no tools). The lesson from the gemma work is that a pinned
-OpenRouter target can pass polls and fail live calls; here there are no polls at
-all, so a bad model id fails 100% of judge calls and the band silently
-degrades to fail-open. Confirm with `/models/{id}/endpoints` first.
+**`:nitro` verified live 2026-08-03.** It is **not** a catalog id suffix: both
+`GET /models/meta-llama/llama-3.1-8b-instruct:nitro/endpoints` and the gpt-oss-20b
+equivalent return HTTP 200 but with the suffix **silently stripped** (`data.id`
+comes back as the bare model id). It is an OpenRouter completion-time routing
+shorthand, equivalent to a request-time `provider.sort="throughput"` preference.
+It does work where it matters: live non-streaming completions with
+`model: "…:nitro"` returned 200 and routed to CoreWeave (llama) and Amazon
+Bedrock (gpt-oss-20b). So the ids are correct as written and no substitution is
+needed — but note that `/endpoints` is **not** a valid way to validate a
+`:nitro` id, because it answers about the base model.
+
+This mattered because these are fixed-endpoint configs with no health polling:
+unlike the gemma case there is no poll to catch a bad id, so a wrong model would
+fail 100% of judge calls and silently degrade the 0.75–0.90 band to fail-open.
+
+**`MaxTokens` 512 is empirically justified, not a guess.** A live call at
+`max_tokens: 16` with `reasoning: {"effort":"low"}` returned
+`finish_reason: length` with `completion_tokens_details.reasoning_tokens: 7` —
+i.e. 7 of 16 tokens went to reasoning before any verdict text. Note also that
+neither endpoint config carries a `MaxTokens`, so a nil caller-side value sends
+**no `max_tokens` field at all** and falls through to the provider ceiling
+(32k–131k). That is the opposite failure mode from VAGO-15 — no silent
+truncation — but it means the caller must pass 512 explicitly, and a regression
+test asserts the caller override reaches the request body.
 
 ### 5.6 The judge prompt and the audit judge
 
