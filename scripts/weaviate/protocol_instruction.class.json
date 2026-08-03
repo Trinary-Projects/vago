@@ -1,0 +1,40 @@
+{
+  "class": "ProtocolInstruction",
+  "description": "A protocol (instruction text) retrieved during dynamic check-in calls. Never searched directly: retrieval searches ProtocolAnchor and follows answeredBy. Hence vectorizer=none, matching SituationInstruction on weaviate-v2.",
+  "vectorizer": "none",
+  "vectorIndexConfig": {
+    "distance": "cosine"
+  },
+  "properties": [
+    {
+      "name": "instructionText",
+      "dataType": ["text"],
+      "description": "The protocol body injected into the LLM context."
+    },
+    {
+      "name": "title",
+      "dataType": ["text"],
+      "description": "Short human label, used in traces and the retrieval S3 blob."
+    },
+    {
+      "name": "documentVersionPath",
+      "dataType": ["text"],
+      "description": "Source document + version this protocol was authored from."
+    },
+    {
+      "name": "turnsThresholdCount",
+      "dataType": ["int"],
+      "description": "How many turns this protocol stays resident in the LLM context. Absent, null or <= 0 falls back to the default of 3."
+    },
+    {
+      "name": "isProduction",
+      "dataType": ["boolean"],
+      "description": "Live in prod. Filtered on via the answeredBy cross-reference when ENVIRONMENT == \"prod\"."
+    },
+    {
+      "name": "isStaging",
+      "dataType": ["boolean"],
+      "description": "Live in staging. Filtered on via the answeredBy cross-reference for every non-prod ENVIRONMENT."
+    }
+  ]
+}

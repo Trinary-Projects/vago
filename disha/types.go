@@ -38,6 +38,8 @@ type UserProfileData struct {
 	ActiveChatContext                 *string        `json:"active_chat_context"`
 	Recent1HrTranscript               *string        `json:"recent_1hr_transcript"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
+	DietChartAvailable                bool           `json:"diet_chart_available"`
+	DietPlanToday                     *string        `json:"diet_plan_today"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
 	DevanagariName                    string         `json:"devanagari_name"`
 	FirstName                         string         `json:"first_name"`
@@ -68,6 +70,46 @@ type ConversationChunk struct {
 	MainAgentSystemPromptLangfuseKey *string  `json:"main_agent_system_prompt_langfuse_key"`
 	SystemMessageParamsS3Key         *string  `json:"system_message_params_s3_key"`
 	ConversationStateS3Key           *string  `json:"conversation_state_s3_key"`
+
+	// ChunkRetrievalMetrics carries per-turn retrieval telemetry on follow-up
+	// calls, destined for disha-backend's
+	// ChunkRetrievalMetrics(chunk_id) table. omitempty so every other bot's
+	// chunk JSON is byte-identical to before. Safe to write ahead of the
+	// backend change: redis_dict_to_model reads named keys only, so this is
+	// ignored until the sync job asks for it.
+	ChunkRetrievalMetrics *ChunkRetrievalMetrics `json:"chunk_retrieval_metrics,omitempty"`
+}
+
+// ChunkRetrievalMetrics is the per-chunk umbrella for every retrieval-shaped
+// step on a turn, matching the one-row-per-chunk backend table.
+//
+// Each step gets its own namespaced sub-object rather than flat fields, so the
+// planned post-LLM guardrail step (vector lookup, sometimes an LLM call, then
+// interrupt-and-regenerate) can be added as a sibling `Guardrail
+// *GuardrailCheckMetrics `json:"guardrail,omitempty"“ without renaming or
+// re-keying anything that already ships.
+type ChunkRetrievalMetrics struct {
+	Protocol *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+}
+
+// ProtocolRetrievalMetrics summarizes one protocol-retrieval round. The full
+// candidate list (including sub-threshold scores) lives in the S3 object at
+// ProtocolsS3Key; this is the compact form for the backend table.
+type ProtocolRetrievalMetrics struct {
+	RetrievalLatencyMs   float64  `json:"retrieval_latency_ms"`
+	VectorQueryLatencyMs float64  `json:"vector_query_latency_ms"`
+	TopSimilarityScore   *float64 `json:"top_similarity_score"`
+	InjectedCount        int      `json:"injected_count"`
+	// QueryText is the exact text embedded for this round. Carried inline
+	// rather than left in the S3 record so disha-backend can persist it and
+	// seed ProtocolLiveQueryAnchor from the chunk alone — reading it from S3
+	// would mean one GET per Disha turn inside the chunk-sync job. It is a few
+	// hundred bytes, and it is user speech that already lives on the chunk's
+	// own text field, so it adds no new exposure.
+	QueryText      string `json:"query_text,omitempty"`
+	ProtocolsS3Key string `json:"protocols_s3_key"`
+	Status         string `json:"status"` // ok | skipped | error | timeout
+	Error          string `json:"error,omitempty"`
 }
 
 type UpdateConversationRequest struct {
