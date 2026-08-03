@@ -77,18 +77,24 @@ const (
 	// which is now ~6 messages rather than ~3.
 	protocolBlockTurnsFromTail = 3
 
-	// protocolRetrievalBudget bounds the whole blocking step. Generous on
-	// purpose: the measured path is p50 ~17ms / p95 ~21ms, but max latency is
-	// 100-190ms at every concurrency level, so a tight budget would clip tail
-	// requests for no gain.
-	protocolRetrievalBudget = 700 * time.Millisecond
+	// protocolRetrievalBudget is the ONE deadline for the whole blocking step —
+	// the vector query and every instruction-text render share it, so the step
+	// can never cost the turn more than this no matter how many protocols
+	// qualify. This sits in front of every LLM generation, so it is deliberately
+	// tight: the measured query path is p50 ~17ms / p95 ~21ms and rendering only
+	// runs for the rare templated protocol, but max query latency reaches
+	// 100-190ms, so the tail does get clipped. That is the intended trade —
+	// a clipped round fails open (resident set kept and injected) and costs the
+	// call nothing but one round of freshness.
+	protocolRetrievalBudget = 100 * time.Millisecond
 
-	// protocolRenderBudget bounds one instruction-text Jinja render. Separate
-	// from the retrieval budget because it is spent after the vector query
-	// returns, and only for the rare protocol that actually carries template
-	// syntax. The renderer is a warm local subprocess, so this is a hang guard,
-	// not a latency target.
-	protocolRenderBudget = 250 * time.Millisecond
+	// protocolWarmUpBudget bounds the throwaway warm-up query. 10x the live
+	// budget, because the warm-up runs in its own goroutine at call setup,
+	// blocks nothing, and its whole job is to absorb the one-off DNS + TCP +
+	// TLS cost that does not fit in the live budget. Measured cold setup is
+	// 100-160ms, so 1s has ample headroom while still bounding a hung dial.
+	// See warmUp.
+	protocolWarmUpBudget = 1 * time.Second
 
 	// protocolQueryLimit is how many anchors to fetch. Deliberately larger
 	// than the capacity: many anchors map to one instruction (measured 10
@@ -184,11 +190,17 @@ type protocolRetrievalRecord struct {
 	Injected       []residentProtocol
 	LatencyMs      float64
 	QueryLatencyMs float64
-	TopSimilarity  *float64
-	Qualified      int
-	InsertIndex    int
-	Status         string // ok | skipped | error | timeout
-	Err            string
+	// RenderLatencyMs is the Jinja time for this round, across all rendered
+	// protocols. Deliberately NOT in the S3 payload or the chunk metrics — it
+	// travels only to app.log and the RTVI trace, which is enough to size the
+	// renderer's cost on staging.
+	RenderLatencyMs float64
+	RenderCount     int
+	TopSimilarity   *float64
+	Qualified       int
+	InsertIndex     int
+	Status          string // ok | skipped | error | timeout
+	Err             string
 }
 
 // --------------------------------------------------------------- the store
@@ -217,7 +229,24 @@ func NewProtocolStore() *ProtocolStore { return &ProtocolStore{} }
 //
 // Refreshing before admitting is what makes eviction pick the right victim, and
 // what stops a re-matched protocol from being evicted and re-added as new.
+// protocolTextRenderer produces the final instruction text for a protocol the
+// store is about to admit. Returning ok=false drops that protocol: it is not
+// admitted and consumes no capacity slot.
+//
+// The store calls this at the exact moment of admission, which is what keeps
+// "render only what enters the LLM context" a property of the code rather than
+// a rule restated by the caller. A protocol that merely refreshes an existing
+// residency never reaches it, because apply's refresh pass resets TTL and score
+// but never Text.
+type protocolTextRenderer func(protocolCandidate) (string, bool)
+
+// apply is the no-render form: the fail-open ageing path and the store's own
+// tests use it.
 func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
+	return s.applyWithRender(qualified, nil)
+}
+
+func (s *ProtocolStore) applyWithRender(qualified []protocolCandidate, render protocolTextRenderer) []protocolEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -291,11 +320,23 @@ func (s *ProtocolStore) apply(qualified []protocolCandidate) []protocolEvent {
 			continue
 		}
 
+		// This protocol IS entering the context, so this is where its text is
+		// finalised. A protocol whose template will not render is dropped here
+		// and takes no slot with it.
+		text := candidate.Text
+		if render != nil {
+			rendered, ok := render(candidate)
+			if !ok {
+				continue
+			}
+			text = rendered
+		}
+
 		s.seq++
 		s.resident = append(s.resident, residentProtocol{
 			InstructionID:  candidate.InstructionID,
 			Title:          candidate.Title,
-			Text:           candidate.Text,
+			Text:           text,
 			DocumentPath:   candidate.DocumentPath,
 			ScoreAtAdd:     candidate.Similarity,
 			RemainingTurns: candidate.TurnThreshold,
@@ -828,11 +869,14 @@ func (e *protocolEnricher) shouldRetrieve(query string) bool {
 func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolRetrievalRecord {
 	record := protocolRetrievalRecord{Status: "ok"}
 
-	queryCtx, cancel := context.WithTimeout(ctx, protocolRetrievalBudget)
+	// One deadline for the whole step. Rendering runs under the SAME budget as
+	// the query rather than getting its own, so a slow query leaves less time
+	// for rendering instead of adding to it.
+	budgetCtx, cancel := context.WithTimeout(ctx, protocolRetrievalBudget)
 	defer cancel()
 
 	queryStartedAt := time.Now()
-	candidates, err := queryProtocols(queryCtx, e.client, query)
+	candidates, err := queryProtocols(budgetCtx, e.client, query)
 	record.QueryLatencyMs = float64(time.Since(queryStartedAt).Microseconds()) / 1000.0
 	record.Candidates = candidates
 
@@ -867,59 +911,87 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 	// qualified:true in the same payload. A protocol dropped by rendering shows
 	// up as qualified-but-not-injected, the same way a capacity eviction does.
 	record.Qualified = len(qualified)
-	qualified = e.renderInstructions(ctx, qualified)
-
 	// Resident-set lifecycle is logged, not persisted: the events are for
 	// eyeballing a call in app.log, and the per-turn resident_after snapshot in
 	// the S3 record already says what the set ended up as.
-	e.logEvents(e.store.apply(qualified))
+	//
+	// Instruction text is rendered by the store, at the point it admits — so
+	// only protocols actually entering the LLM context are rendered, without the
+	// caller restating the admission rule.
+	renderer := e.newInstructionRenderer(ctx, budgetCtx)
+	e.logEvents(e.store.applyWithRender(qualified, renderer.render))
+	record.RenderLatencyMs, record.RenderCount = renderer.totalMs, renderer.count
 	return record
 }
 
-// renderInstructions renders Jinja in the qualified protocols' instruction
-// text against the same variable store the call's prompts were rendered with.
-//
-// It runs here rather than at block-render time so the text is rendered once
-// per admission instead of once per turn, and so every downstream consumer —
-// the injected block, the S3 record, the llmlog `retrieved_protocols` — sees
-// the same final text the model saw.
+// instructionRenderer renders a protocol's Jinja instruction text against the
+// same variable store the call's prompts were rendered with, at the moment the
+// store admits it. One per retrieval round; it accumulates the round's timing
+// for the app.log line and the RTVI trace.
 //
 // A protocol whose template fails to render is DROPPED, not injected raw:
-// leaking `{% if diet_chart_available %}` into the context shows the model
-// both branches of a conditional as if both were true, which is worse than
-// the protocol being absent. Text with no template syntax (28 of the 30 live
+// leaking `{% if diet_chart_available %}` into the context shows the model both
+// branches of a conditional as if both were true, which is worse than the
+// protocol being absent. Text with no template syntax (28 of the 30 live
 // protocols) skips the renderer entirely, so the common case costs no IPC on
 // this blocking path.
-func (e *protocolEnricher) renderInstructions(ctx context.Context, qualified []protocolCandidate) []protocolCandidate {
-	out := qualified[:0]
-	for _, candidate := range qualified {
-		if !templateNeedsRender(candidate.Text) {
-			out = append(out, candidate)
-			continue
-		}
-		if e.renderer == nil {
-			e.dropUnrendered(ctx, candidate, errors.New("no template renderer configured"))
-			continue
-		}
-		renderCtx, cancel := context.WithTimeout(ctx, protocolRenderBudget)
-		text, err := e.renderer.RenderTemplate(renderCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
-		cancel()
-		if err != nil {
-			e.dropUnrendered(ctx, candidate, err)
-			continue
-		}
-		if templateNeedsRender(text) {
-			e.dropUnrendered(ctx, candidate, errors.New("template syntax survived rendering"))
-			continue
-		}
-		candidate.Text = strings.TrimSpace(text)
-		if candidate.Text == "" {
-			e.dropUnrendered(ctx, candidate, errors.New("template rendered empty"))
-			continue
-		}
-		out = append(out, candidate)
+//
+// budgetCtx carries whatever is left of protocolRetrievalBudget after the
+// vector query, and every render shares it — the step cannot exceed the budget
+// however many protocols are admitted. turnCtx is the un-budgeted parent, used
+// only to tell a budget overrun (worth a Sentry event) from a barge-in (not).
+//
+// Not safe for concurrent use, and does not need to be: apply calls it inline
+// on the pipeline's frame loop.
+type instructionRenderer struct {
+	enricher  *protocolEnricher
+	turnCtx   context.Context
+	budgetCtx context.Context
+	totalMs   float64
+	count     int
+}
+
+func (e *protocolEnricher) newInstructionRenderer(turnCtx, budgetCtx context.Context) *instructionRenderer {
+	return &instructionRenderer{enricher: e, turnCtx: turnCtx, budgetCtx: budgetCtx}
+}
+
+// render satisfies protocolTextRenderer.
+func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool) {
+	e := r.enricher
+	if !templateNeedsRender(candidate.Text) {
+		return candidate.Text, true
 	}
-	return out
+	if e.renderer == nil {
+		e.dropUnrendered(r.turnCtx, candidate, errors.New("no template renderer configured"))
+		return "", false
+	}
+
+	startedAt := time.Now()
+	text, err := e.renderer.RenderTemplate(r.budgetCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
+	elapsedMs := float64(time.Since(startedAt).Microseconds()) / 1000.0
+	r.totalMs += elapsedMs
+	r.count++
+	if e.logger != nil {
+		e.logger.Printf(
+			"disha: protocol instruction render %s (%s) render_ms=%.1f err=%v\n",
+			shortID(candidate.InstructionID), protocolRenderLabel(candidate), elapsedMs, err,
+		)
+	}
+
+	if err != nil {
+		e.dropUnrendered(r.turnCtx, candidate, err)
+		return "", false
+	}
+	if templateNeedsRender(text) {
+		e.dropUnrendered(r.turnCtx, candidate, errors.New("template syntax survived rendering"))
+		return "", false
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		e.dropUnrendered(r.turnCtx, candidate, errors.New("template rendered empty"))
+		return "", false
+	}
+	return trimmed, true
 }
 
 // templateNeedsRender reports whether text carries Jinja syntax. Deliberately
@@ -1024,9 +1096,10 @@ func (e *protocolEnricher) publish(record protocolRetrievalRecord) {
 	}
 	if e.logger != nil {
 		e.logger.Printf(
-			"disha: protocol retrieval status=%s candidates=%d qualified=%d injected=%d top_sim=%s query_ms=%.1f total_ms=%.1f insert_index=%d\n",
+			"disha: protocol retrieval status=%s candidates=%d qualified=%d injected=%d top_sim=%s query_ms=%.1f render_ms=%.1f rendered=%d total_ms=%.1f insert_index=%d\n",
 			record.Status, len(record.Candidates), record.Qualified, len(record.Injected),
-			top, record.QueryLatencyMs, record.LatencyMs, record.InsertIndex,
+			top, record.QueryLatencyMs, record.RenderLatencyMs, record.RenderCount,
+			record.LatencyMs, record.InsertIndex,
 		)
 	}
 
@@ -1042,6 +1115,8 @@ func (e *protocolEnricher) publish(record protocolRetrievalRecord) {
 		"injected_count":     len(record.Injected),
 		"total_ms":           record.LatencyMs,
 		"vector_query_ms":    record.QueryLatencyMs,
+		"render_ms":          record.RenderLatencyMs,
+		"rendered_count":     record.RenderCount,
 		"insert_index":       record.InsertIndex,
 		"top_similarity":     nil,
 		"injected_protocols": protocolTitles(record.Injected),
@@ -1095,13 +1170,32 @@ func protocolLogVariables(protocols []residentProtocol) []any {
 	return out
 }
 
-// warmUp fires one throwaway query so the first real retrieval doesn't pay TLS
-// and connection setup. Best-effort and silent: a failure here is not a call
-// problem, and the real path reports its own errors.
+// warmUp fires one throwaway query so the first real retrieval doesn't pay DNS,
+// TCP and TLS setup. Best-effort: a failure here is not a call problem, and the
+// real path reports its own errors.
+//
+// It gets protocolWarmUpBudget, NOT protocolRetrievalBudget. Sharing the live
+// budget made the warm-up self-defeating: cold DNS + TCP + a cross-region TLS
+// handshake to the US Weaviate exceeds 100 ms, so on a cold pod the warm-up was
+// cancelled mid-handshake every single time (verified in staging 2026-08-03 —
+// every call logged "warm-up failed … context deadline exceeded"), pooled no
+// connection, and left the first real query to pay the setup cost it existed to
+// absorb. This runs in its own goroutine off the critical path, so a generous
+// budget costs the call nothing.
 func (e *protocolEnricher) warmUp(ctx context.Context) {
-	warmCtx, cancel := context.WithTimeout(ctx, protocolRetrievalBudget)
+	warmCtx, cancel := context.WithTimeout(ctx, protocolWarmUpBudget)
 	defer cancel()
-	if _, err := queryProtocols(warmCtx, e.client, "warm up"); err != nil && e.logger != nil {
-		e.logger.Printf("disha: protocol retrieval warm-up failed (ignored): %v\n", err)
+	startedAt := time.Now()
+	_, err := queryProtocols(warmCtx, e.client, "warm up")
+	if e.logger == nil {
+		return
 	}
+	elapsedMs := float64(time.Since(startedAt).Microseconds()) / 1000.0
+	if err != nil {
+		e.logger.Printf("disha: protocol retrieval warm-up failed after %.1fms (ignored): %v\n", elapsedMs, err)
+		return
+	}
+	// Logged on success too: this is the cold-path setup cost the first real
+	// query would otherwise have paid, and it is the number to watch.
+	e.logger.Printf("disha: protocol retrieval warm-up ok warm_ms=%.1f\n", elapsedMs)
 }

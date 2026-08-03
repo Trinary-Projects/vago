@@ -621,16 +621,21 @@ func (s *stubMetadataSetter) snapshot() (map[string]any, int) {
 // `{{ name }}` substitution and nothing else, which is enough to prove the
 // enricher routes instruction text through a renderer and handles the outcomes.
 type stubRenderer struct {
-	mu   sync.Mutex
-	err  error
-	vars []DocumentVariables
+	mu    sync.Mutex
+	err   error
+	block bool // hang until the caller's context expires
+	vars  []DocumentVariables
 }
 
-func (r *stubRenderer) RenderTemplate(_ context.Context, _ string, text string, variables DocumentVariables) (string, error) {
+func (r *stubRenderer) RenderTemplate(ctx context.Context, _ string, text string, variables DocumentVariables) (string, error) {
 	r.mu.Lock()
 	r.vars = append(r.vars, variables)
-	err := r.err
+	err, block := r.err, r.block
 	r.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if err != nil {
 		return "", err
 	}
@@ -799,6 +804,78 @@ func TestEnricherDropsProtocolWhenRenderFails(t *testing.T) {
 	}
 	if block := findProtocolBlock(t, out); strings.Contains(block, "{%") {
 		t.Errorf("raw jinja leaked into the block:\n%s", block)
+	}
+}
+
+// A protocol that stays resident and keeps re-matching must not be re-rendered:
+// apply's refresh pass throws the text away, so it is IPC spent for nothing on
+// a blocking path.
+func TestEnricherDoesNotReRenderResidentProtocol(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate,
+		anchorHit("a1", "instr-A", "Plan: {{ diet_plan_today }}", 0.1, 5))
+	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	renderer := enricher.renderer.(*stubRenderer)
+	enricher.baseVariables = DocumentVariables{"diet_plan_today": "dal chawal"}
+
+	// Three rounds, same protocol qualifying every time. Distinct query text per
+	// round so the hash gate does not suppress the later retrievals.
+	for _, speech := range []string{"khaana kab", "aur uske baad kya", "theek hai samajh gaya"} {
+		out := enricher.Enrich(context.Background(), conversation(speech))
+		if block := findProtocolBlock(t, out); !strings.Contains(block, "Plan: dal chawal") {
+			t.Fatalf("resident text lost after refresh:\n%s", block)
+		}
+	}
+	if calls := renderer.calls(); len(calls) != 1 {
+		t.Errorf("rendered %d times across 3 rounds, want 1 (admission only)", len(calls))
+	}
+}
+
+// Render timing is reported to app.log and RTVI only — never to the chunk or
+// the S3 payload, which is why it lives on the record but not in the payload.
+func TestEnricherReportsRenderLatency(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "plain protocol body", 0.1, 3))
+	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+
+	enricher.Enrich(context.Background(), conversation("mera pet kharab hai"))
+
+	record := box.take()
+	if record == nil {
+		t.Fatal("no record")
+	}
+	if record.RenderCount != 0 || record.RenderLatencyMs != 0 {
+		t.Errorf("plain text must not report render work: count=%d ms=%v", record.RenderCount, record.RenderLatencyMs)
+	}
+	payload := protocolRetrievalRecordPayload("chunk-1", "user-1", "conv-1", FollowUpBotType, *record)
+	latency, _ := payload["latency_ms"].(map[string]any)
+	if _, present := latency["render"]; present {
+		t.Error("render timing must stay out of the S3 payload")
+	}
+}
+
+// Rendering shares protocolRetrievalBudget with the vector query rather than
+// getting a budget of its own, so N templated protocols cannot cost N budgets.
+// This sits in front of every LLM generation: the whole step is capped.
+func TestEnricherRenderSharesRetrievalBudget(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate, strings.Join([]string{
+		anchorHit("a1", "instr-A", "{{ diet_plan_today }}", 0.1, 3),
+		anchorHit("a2", "instr-B", "{{ diet_plan_today }} again", 0.11, 3),
+		anchorHit("a3", "instr-C", "{{ diet_plan_today }} thrice", 0.12, 3),
+	}, ","))
+	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	enricher.renderer.(*stubRenderer).block = true
+
+	startedAt := time.Now()
+	enricher.Enrich(context.Background(), conversation("khaana kab khaun"))
+	elapsed := time.Since(startedAt)
+
+	// Three hanging renders under one shared budget: comfortably under two
+	// budgets even on a loaded CI box, but far above one if they were additive.
+	if elapsed > 2*protocolRetrievalBudget {
+		t.Errorf("step took %v for 3 renders, want one shared %v budget", elapsed, protocolRetrievalBudget)
+	}
+	record := box.take()
+	if record == nil || len(record.Injected) != 0 {
+		t.Fatalf("timed-out renders must not be injected: %+v", record)
 	}
 }
 
