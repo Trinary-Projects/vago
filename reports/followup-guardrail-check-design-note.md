@@ -843,9 +843,29 @@ tool misreports what production does.
 
 - `disha/types.go` — `GuardrailCheckMetrics` + the umbrella sibling field.
 - `disha/retrieval_chunk_decorator.go` — second box, guardrail payload builder.
-- `disha/followup_call.go` — `GuardrailChecker` on `followUpPlan`,
-  `setupGuardrailCheck` in `plan()`, processor insertion and enricher
-  composition in `BuildTask`, shared Weaviate client.
+- `disha/followup_call.go` — **corrected 2026-08-03 (implementation):** the
+  field on `followUpPlan` is `NewGuardrailChecker func(callCtx
+  context.Context) *guardrailChecker`, a constructor closure, not a built
+  `*guardrailChecker` value. `newGuardrailChecker`'s first parameter is the
+  call's own long-lived context (needed by the >0.90 band's fire-and-forget
+  audit judge to outlive the very interrupt its violation triggers — see
+  §5.6/§14.1's `spawnAuditJudge`), and that context does not exist at
+  `plan()` time — only `BuildTask` has `taskCtx.Ctx`. `plan()` still does all
+  the env/config/box wiring (`setupRetrieval`, `setupProtocolRetrieval`,
+  `setupGuardrailCheck`) and registers the chunk decorator exactly once,
+  with whichever box(es) the enabled step(s) produced (`protocolBox` is
+  always a real, possibly-never-written box rather than nil, because
+  `newRetrievalChunkDecorator` has no nil guard on that parameter; only
+  `guardrailBox` is nil-safe there). `BuildTask` calls
+  `pl.NewGuardrailChecker(taskCtx.Ctx)` once infrastructure exists, then
+  wires `checker.Check` into `NewResponseGuardProcessor` and `checker.Enrich`
+  into the shared `composeEnrichers(protocolEnrich, guardrailEnrich)` result
+  (protocol first, guardrail second — see §6.2's ordering rationale).
+  `disha/protocol_retrieval.go` gained the free function
+  `warmUpWeaviateClient(ctx, client, logger)` (the same query
+  `protocolEnricher.warmUp` already ran, extracted so a guardrail-only call
+  has something to hang the single shared warm-up goroutine on);
+  `protocolEnricher.warmUp` now delegates to it.
 - `voicepipelinecore/llmrouter/groups.go` — two endpoint configs + the pair key.
 - `voicepipelinecore/llmrouter/providers.go` — `extraBodyFor` case for
   gpt-oss low reasoning effort.

@@ -47,9 +47,12 @@ const (
 // OnToolResultCommitted also writes an assistant-role chunk (the tool_calls
 // half of the pair), and it must not consume either record.
 //
-// guardrailBox may be nil (protocol-only configurations, and every non-
-// follow-up bot): in that case the guardrail step is a complete no-op, exactly
-// as if it were never wired.
+// Either box may be nil, in which case that step is a complete no-op exactly
+// as if it were never wired — the four flag combinations in setupRetrieval all
+// go through here. Both guards are deliberate rather than relying on the
+// caller: take() locks the box's own mutex, so a nil box would panic on the
+// first spoken assistant chunk, i.e. mid-call, in the middle of a real
+// conversation.
 func newRetrievalChunkDecorator(
 	protocolBox *protocolRecordBox,
 	guardrailBox *guardrailRecordBox,

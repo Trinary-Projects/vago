@@ -608,3 +608,31 @@ func TestChunkDecoratorGuardrailPayloadIncludesEveryCheck(t *testing.T) {
 		t.Errorf("chunk similarity = %+v, want the selected check's 0.94", guardrail.SimilarityScore)
 	}
 }
+
+// Both record boxes must be nil-safe: the decorator serves four
+// enabled/disabled flag combinations, and take() locks the box's own mutex, so
+// a nil box would otherwise panic on the first spoken assistant chunk --
+// mid-call, in a real conversation.
+func TestRetrievalChunkDecoratorNilBoxesAreSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		protocolBox  *protocolRecordBox
+		guardrailBox *guardrailRecordBox
+	}{
+		{"both nil", nil, nil},
+		{"protocol nil", nil, &guardrailRecordBox{}},
+		{"guardrail nil", &protocolRecordBox{}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decorate := newRetrievalChunkDecorator(
+				tc.protocolBox, tc.guardrailBox, nil,
+				log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
+			)
+			chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+			decorate(chunk) // must not panic
+			if chunk.ChunkRetrievalMetrics != nil {
+				t.Fatalf("expected no metrics with no records, got %+v", chunk.ChunkRetrievalMetrics)
+			}
+		})
+	}
+}

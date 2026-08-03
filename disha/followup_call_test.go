@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
 type fakeS3GetClient struct {
@@ -378,4 +382,231 @@ func TestFollowUpGuidancePromptVariablesIncludePatientExecutiveProfile(t *testin
 	if vars["patient_executive_profile"] != patientExecutiveProfile {
 		t.Fatalf("patient_executive_profile = %#v", vars["patient_executive_profile"])
 	}
+}
+
+// ------------------------------------------------------- composeEnrichers
+
+func TestComposeEnrichersReturnsNilForZeroEnrichers(t *testing.T) {
+	if got := composeEnrichers(); got != nil {
+		t.Errorf("composeEnrichers() = %v, want nil", got)
+	}
+	if got := composeEnrichers(nil, nil, nil); got != nil {
+		t.Errorf("composeEnrichers(nil, nil, nil) = %v, want nil", got)
+	}
+}
+
+func TestComposeEnrichersReturnsTheSingleEnricherUnchanged(t *testing.T) {
+	calls := 0
+	fn := func(_ context.Context, messages []voicepipelinecore.Message) []voicepipelinecore.Message {
+		calls++
+		return messages
+	}
+
+	got := composeEnrichers(nil, fn, nil)
+	if got == nil {
+		t.Fatal("composeEnrichers(nil, fn, nil) = nil, want fn")
+	}
+	got(context.Background(), nil)
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (should be fn itself, not a wrapper)", calls)
+	}
+}
+
+// Order matters: protocol must run before guardrail (design note §6.2 /
+// AGENTS.md) because protocol recomputes its injection point from the
+// message list on every call, and guardrail appends its correction last.
+// This test proves composeEnrichers threads output into input in call order
+// generically, without knowing about either feature.
+func TestComposeEnrichersThreadsOutputIntoNextInput(t *testing.T) {
+	var order []string
+	first := func(_ context.Context, messages []voicepipelinecore.Message) []voicepipelinecore.Message {
+		order = append(order, "first")
+		return append(messages, voicepipelinecore.Message{Role: "user", Content: "from-first"})
+	}
+	second := func(_ context.Context, messages []voicepipelinecore.Message) []voicepipelinecore.Message {
+		order = append(order, "second")
+		if len(messages) == 0 || messages[len(messages)-1].Content != "from-first" {
+			t.Fatalf("second enricher did not see first's output: %+v", messages)
+		}
+		return append(messages, voicepipelinecore.Message{Role: "user", Content: "from-second"})
+	}
+
+	composed := composeEnrichers(nil, first, nil, second, nil)
+	if composed == nil {
+		t.Fatal("composeEnrichers with two enrichers = nil")
+	}
+	out := composed(context.Background(), []voicepipelinecore.Message{{Role: "system", Content: "sys"}})
+
+	if !reflect.DeepEqual(order, []string{"first", "second"}) {
+		t.Fatalf("order = %v, want [first second]", order)
+	}
+	if len(out) != 3 || out[1].Content != "from-first" || out[2].Content != "from-second" {
+		t.Fatalf("out = %+v", out)
+	}
+}
+
+// -------------------------------------------------------- setupRetrieval
+
+func newRetrievalWiringPlan(dynamic bool) *followUpPlan {
+	return &followUpPlan{
+		Startup: CallStartup{
+			Logger:         log.New(io.Discard, "", 0),
+			UserID:         "user-1",
+			ConversationID: "conv-1",
+		},
+		Dynamic:         dynamic,
+		PromptMetadata:  map[string]any{},
+		PromptVariables: DocumentVariables{},
+		Callbacks:       &CallEventCallbacks{},
+	}
+}
+
+// The two env flags are independent gates. All four combinations must wire
+// correctly: which enricher(s) exist, whether the guardrail checker
+// constructor exists (BuildTask's proxy for "does the guard processor get
+// built"), whether the shared client/warm-up exists, and whether the chunk
+// decorator is registered exactly once — with the boxes belonging to
+// whichever step(s) are actually enabled, verified by writing directly into
+// each side's own box (same package, unexported field access) and reading it
+// back through the ONE registered decorator.
+func TestSetupRetrievalFourFlagCombinations(t *testing.T) {
+	tests := []struct {
+		name         string
+		protoFlag    string
+		guardFlag    string
+		wantProtocol bool
+		wantGuardian bool
+	}{
+		{"neither enabled", "", "", false, false},
+		{"protocol only (unchanged from today)", "1", "", true, false},
+		{"guardrail only", "", "1", false, true},
+		{"both enabled", "1", "1", true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(protocolRetrievalEnabledEnv, tc.protoFlag)
+			t.Setenv(guardrailCheckEnabledEnv, tc.guardFlag)
+			t.Setenv("WEAVIATE_URL", "http://weaviate.staging.svc.cluster.local:8080")
+			t.Setenv("WEAVIATE_API_KEY", "key")
+			t.Setenv("AWS_US_BUCKET_NAME", "")
+			t.Setenv("AWS_US_REGION", "")
+
+			pl := newRetrievalWiringPlan(true)
+			setupRetrieval(pl, Deps{})
+
+			if got := pl.ProtocolEnricher != nil; got != tc.wantProtocol {
+				t.Errorf("ProtocolEnricher present = %v, want %v", got, tc.wantProtocol)
+			}
+			if got := pl.NewGuardrailChecker != nil; got != tc.wantGuardian {
+				t.Errorf("NewGuardrailChecker present = %v, want %v", got, tc.wantGuardian)
+			}
+			wantWired := tc.wantProtocol || tc.wantGuardian
+			if got := pl.Callbacks.chunkDecorator != nil; got != wantWired {
+				t.Errorf("chunk decorator registered = %v, want %v", got, wantWired)
+			}
+			if got := pl.retrievalClient != nil; got != wantWired {
+				t.Errorf("shared weaviate client built = %v, want %v (guardrail-only must still get a client to warm up)", got, wantWired)
+			}
+
+			if !wantWired {
+				return
+			}
+
+			// Prove the decorator was registered with the SAME boxes the
+			// enricher/checker write into: put a record straight into each
+			// side's own box, then read it back through the one registered
+			// decorator.
+			chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+			if pl.ProtocolEnricher != nil {
+				pl.ProtocolEnricher.box.put(protocolRetrievalRecord{Status: "ok", QueryText: "q"})
+			}
+			if pl.NewGuardrailChecker != nil {
+				checker := pl.NewGuardrailChecker(context.Background())
+				checker.box.offer(guardrailCheckRecord{Status: "ok", SelectedIndex: 0})
+			}
+			pl.Callbacks.chunkDecorator(chunk)
+
+			gotProtocol := chunk.ChunkRetrievalMetrics != nil && chunk.ChunkRetrievalMetrics.Protocol != nil
+			if gotProtocol != tc.wantProtocol {
+				t.Errorf("chunk protocol metrics present = %v, want %v", gotProtocol, tc.wantProtocol)
+			}
+			gotGuardian := chunk.ChunkRetrievalMetrics != nil && chunk.ChunkRetrievalMetrics.Guardrail != nil
+			if gotGuardian != tc.wantGuardian {
+				t.Errorf("chunk guardrail metrics present = %v, want %v", gotGuardian, tc.wantGuardian)
+			}
+		})
+	}
+}
+
+// An unconfigured Weaviate means "feature off" for BOTH steps, not a failed
+// call — regardless of which flag(s) requested them.
+func TestSetupRetrievalMissingWeaviateConfigDisablesBothSteps(t *testing.T) {
+	tests := []struct {
+		name      string
+		protoFlag string
+		guardFlag string
+	}{
+		{"protocol only requested", "1", ""},
+		{"guardrail only requested", "", "1"},
+		{"both requested", "1", "1"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(protocolRetrievalEnabledEnv, tc.protoFlag)
+			t.Setenv(guardrailCheckEnabledEnv, tc.guardFlag)
+			t.Setenv("WEAVIATE_URL", "")
+			t.Setenv("WEAVIATE_API_KEY", "")
+
+			pl := newRetrievalWiringPlan(true)
+			setupRetrieval(pl, Deps{})
+
+			if pl.ProtocolEnricher != nil {
+				t.Error("ProtocolEnricher should not be built without Weaviate config")
+			}
+			if pl.NewGuardrailChecker != nil {
+				t.Error("NewGuardrailChecker should not be built without Weaviate config")
+			}
+			if pl.Callbacks.chunkDecorator != nil {
+				t.Error("chunk decorator should not be registered without Weaviate config")
+			}
+			if pl.retrievalClient != nil {
+				t.Error("retrievalClient should not be set without Weaviate config")
+			}
+		})
+	}
+}
+
+// setupGuardrailCheck's constructor closure must actually build a usable
+// checker once BuildTask supplies the call context — Check and Enrich are
+// the two methods BuildTask wires as ResponseGuard/MessagesEnricher.
+func TestSetupGuardrailCheckConstructorBuildsAUsableChecker(t *testing.T) {
+	t.Setenv(guardrailCheckEnabledEnv, "1")
+	t.Setenv(protocolRetrievalEnabledEnv, "")
+	t.Setenv("WEAVIATE_URL", "http://weaviate.staging.svc.cluster.local:8080")
+	t.Setenv("WEAVIATE_API_KEY", "key")
+	t.Setenv("AWS_US_BUCKET_NAME", "")
+	t.Setenv("AWS_US_REGION", "")
+
+	pl := newRetrievalWiringPlan(false)
+	setupRetrieval(pl, Deps{})
+
+	if pl.NewGuardrailChecker == nil {
+		t.Fatal("NewGuardrailChecker should be set when the guardrail flag is on and Weaviate is configured")
+	}
+	checker := pl.NewGuardrailChecker(context.Background())
+	if checker == nil {
+		t.Fatal("NewGuardrailChecker(ctx) returned nil")
+	}
+	var _ voicepipelinecore.ResponseGuard = checker.Check
+	var _ voicepipelinecore.MessagesEnricher = checker.Enrich
+}
+
+// Sanity check that the shared warm-up entry point used for a guardrail-only
+// call (pl.retrievalClient with no protocolEnricher) behaves like the
+// protocol-only path: same function, same client, no panic.
+func TestSharedWarmUpWorksForGuardrailOnlyClient(t *testing.T) {
+	server := newStubWeaviate(t, fmt.Sprintf(anchorResponseTemplate, ""), nil)
+	warmUpWeaviateClient(context.Background(), server, log.New(io.Discard, "", 0))
 }

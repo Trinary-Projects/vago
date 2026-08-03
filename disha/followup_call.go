@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -58,6 +59,22 @@ type followUpPlan struct {
 	// and Weaviate is configured; nil leaves the pipeline byte-identical to
 	// before.
 	ProtocolEnricher *protocolEnricher
+
+	// NewGuardrailChecker builds the non-blocking guardrail checker for this
+	// call, given the call's own context. It is a constructor closure rather
+	// than a built value because guardrailChecker.spawnAuditJudge needs a
+	// call-lifetime context (TaskContext.Ctx) that does not exist yet at
+	// plan() time — only BuildTask has it. plan() still does all the
+	// env/config work and registers the chunk decorator here; nil means the
+	// feature is disabled or Weaviate is unconfigured, leaving the pipeline
+	// byte-identical to before.
+	NewGuardrailChecker func(callCtx context.Context) *guardrailChecker
+
+	// retrievalClient is the one *weaviate.Client shared by both retrieval
+	// steps above (they hit the same Weaviate instance), built once in
+	// setupRetrieval whenever either feature is enabled and configured.
+	// BuildTask warms it exactly once regardless of which step(s) use it.
+	retrievalClient *weaviate.Client
 }
 
 func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps) (*followUpPlan, error) {
@@ -112,39 +129,107 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
-	setupProtocolRetrieval(pl, deps.Documents)
+	setupRetrieval(pl, deps)
 	return pl, nil
 }
 
-// setupProtocolRetrieval wires blocking protocol retrieval for follow-up
-// calls — both the dynamic check-in path and the agenda-based path. Sales and
+// guardrailCheckEnabled reports whether the non-blocking guardrail check is
+// switched on. One env var, no fallback chain — mirrors
+// protocolRetrievalEnabled exactly.
+func guardrailCheckEnabled() bool {
+	return strings.TrimSpace(os.Getenv(guardrailCheckEnabledEnv)) == "1"
+}
+
+// setupRetrieval wires the two optional retrieval-shaped follow-up steps —
+// blocking protocol retrieval (before generation) and the non-blocking
+// guardrail check (during generation) — for both follow-up paths. Sales and
 // onboarding are untouched: they never call this, so their pipelines are
 // unchanged.
 //
-// A missing/incomplete Weaviate env is treated as "feature off" rather than a
-// call failure — the same posture as the other optional S3-backed features.
-func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
-	if !protocolRetrievalEnabled() {
-		return
-	}
-	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
-	if err != nil {
-		pl.Startup.Logger.Printf("disha: protocol retrieval disabled: %v\n", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err: err,
-			Tags: map[string]string{
-				"component": "disha_followup",
-				"operation": "protocol_retrieval_config",
-			},
-			Details: map[string]any{
-				"conversation_id": pl.Startup.ConversationID,
-				"user_id":         pl.Startup.UserID,
-			},
-		})
+// Both steps hit the same Weaviate, so the client is built ONCE here,
+// whenever either flag is on, and shared. A missing/incomplete Weaviate env
+// (ErrNotConfigured) is treated as "that feature is off" rather than a call
+// failure — the same posture as the other optional S3-backed features — and
+// disables BOTH steps rather than failing the call.
+//
+// SetChunkDecorator is a single-occupancy slot (disha/call_event_callbacks.go),
+// so the chunk decorator is registered AT MOST ONCE here, with whichever
+// box(es) the enabled step(s) produced, and not at all when neither step is
+// enabled.
+func setupRetrieval(pl *followUpPlan, deps Deps) {
+	protoEnabled := protocolRetrievalEnabled()
+	guardEnabled := guardrailCheckEnabled()
+	if !protoEnabled && !guardEnabled {
 		return
 	}
 
-	box := &protocolRecordBox{}
+	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
+	if err != nil {
+		if protoEnabled {
+			reportRetrievalConfigFailure(pl, err, "protocol_retrieval_config")
+		}
+		if guardEnabled {
+			reportRetrievalConfigFailure(pl, err, "guardrail_check_config")
+		}
+		return
+	}
+	pl.retrievalClient = client
+
+	// protocolBox always exists once we get here, even when protocol
+	// retrieval itself is disabled: newRetrievalChunkDecorator calls
+	// protocolBox.take() unconditionally with no nil guard on that parameter
+	// (unlike guardrailBox, which the decorator does check for nil), so an
+	// empty box that nothing ever writes to is the safe stand-in rather than
+	// a literal nil. It costs nothing — take() on an empty box always
+	// returns nil, exactly like "no protocol step ran".
+	protocolBox := &protocolRecordBox{}
+	if protoEnabled {
+		setupProtocolRetrieval(pl, client, protocolBox, deps.Documents)
+	}
+
+	var guardrailBox *guardrailRecordBox
+	if guardEnabled {
+		guardrailBox = setupGuardrailCheck(pl, client, deps)
+	}
+
+	if pl.ProtocolEnricher == nil && guardrailBox == nil {
+		return
+	}
+	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
+		protocolBox,
+		guardrailBox,
+		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
+		pl.Startup.Logger,
+		pl.Startup.UserID,
+		pl.Startup.ConversationID,
+		FollowUpBotType,
+	))
+}
+
+// reportRetrievalConfigFailure logs and Sentries a shared-client construction
+// failure under the given step's own operation tag, so a call that requested
+// only one of the two steps doesn't get the other step's operation name in
+// its Sentry event.
+func reportRetrievalConfigFailure(pl *followUpPlan, err error, operation string) {
+	pl.Startup.Logger.Printf("disha: %s disabled: %v\n", operation, err)
+	sentryutil.Capture(sentryutil.Event{
+		Err: err,
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": operation,
+		},
+		Details: map[string]any{
+			"conversation_id": pl.Startup.ConversationID,
+			"user_id":         pl.Startup.UserID,
+		},
+	})
+}
+
+// setupProtocolRetrieval builds the protocol-retrieval enricher, given the
+// shared client and box setupRetrieval already constructed. It does NOT
+// touch the chunk decorator — setupRetrieval registers that once, after
+// finding out which step(s) actually built something.
+func setupProtocolRetrieval(pl *followUpPlan, client *weaviate.Client, box *protocolRecordBox, renderer templateRenderer) {
 	pl.ProtocolEnricher = newProtocolEnricher(
 		client,
 		NewProtocolStore(),
@@ -156,16 +241,62 @@ func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
 		pl.Startup.UserID,
 		pl.Startup.ConversationID,
 	)
-	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
-		box,
-		nil, // guardrail box: wired by a later layer (guardrail_check.go)
-		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
-		pl.Startup.Logger,
-		pl.Startup.UserID,
-		pl.Startup.ConversationID,
-		FollowUpBotType,
-	))
 	pl.Startup.Logger.Printf("disha: protocol retrieval enabled (dynamic=%v)\n", pl.Dynamic)
+}
+
+// setupGuardrailCheck builds the plumbing the non-blocking guardrail check
+// needs from plan()-time config (the judge client factory, the record box)
+// and stores a constructor closure on pl for BuildTask to invoke once the
+// call's own context exists — see followUpPlan.NewGuardrailChecker. Returns
+// the box so setupRetrieval can register it with the chunk decorator; the
+// checker built later from the closure shares this exact box.
+func setupGuardrailCheck(pl *followUpPlan, client *weaviate.Client, deps Deps) *guardrailRecordBox {
+	box := &guardrailRecordBox{}
+	judgeFactory := newGuardrailJudgeClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID)
+	docs := deps.Documents
+	logger := pl.Startup.Logger
+	userID, conversationID := pl.Startup.UserID, pl.Startup.ConversationID
+	pl.NewGuardrailChecker = func(callCtx context.Context) *guardrailChecker {
+		return newGuardrailChecker(callCtx, client, docs, box, logger, judgeFactory, userID, conversationID)
+	}
+	pl.Startup.Logger.Println("disha: guardrail check enabled")
+	return box
+}
+
+// composeEnrichers threads enrichers together in order, so a
+// ContextEnricherProcessor — which holds exactly one MessagesEnricher — can
+// run several. Generic and business-free: it knows nothing about protocol
+// retrieval or guardrail correction, only that each enricher's output becomes
+// the next one's input. nil entries are skipped, so callers can pass an
+// always-present slot that happens to be disabled this call. Returns nil for
+// zero enrichers and the single enricher unchanged for exactly one, so a call
+// with nothing to compose adds no processor and a call with one enricher
+// costs nothing beyond that one call.
+//
+// Order matters at the call site (disha/followup_call.go's BuildTask):
+// protocol must run before guardrail. Protocol recomputes its injection point
+// (3 assistant turns above the tail) from the message list on every turn;
+// guardrail appends its correction as the final message. Running guardrail
+// first would shift what protocol sees as the tail.
+func composeEnrichers(enrichers ...voicepipelinecore.MessagesEnricher) voicepipelinecore.MessagesEnricher {
+	filtered := make([]voicepipelinecore.MessagesEnricher, 0, len(enrichers))
+	for _, enrich := range enrichers {
+		if enrich != nil {
+			filtered = append(filtered, enrich)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	}
+	return func(ctx context.Context, messages []voicepipelinecore.Message) []voicepipelinecore.Message {
+		for _, enrich := range filtered {
+			messages = enrich(ctx, messages)
+		}
+		return messages
+	}
 }
 
 func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Deps) (*voicepipelinecore.PipelineTask, error) {
@@ -229,21 +360,61 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		userIdle,
 		contextAggregators.User(),
 	}
-	// Protocol retrieval sits upstream of the LLM so its latency lands in its
-	// own MetricContextEnrich rather than inside llm_ttfb_ms. Absent on every
-	// non-dynamic call, leaving the processor list identical to before.
+
+	// Both retrieval-shaped steps are late-bound here because they need
+	// infrastructure that only exists once the task is built: the router
+	// (protocol's prompt-metadata refresh), UI events, the task-scoped Sentry
+	// hub, and — for the guardrail checker specifically — the call's own
+	// long-lived context (its fire-and-forget audit judge must outlive the
+	// very interrupt its own violation triggers; see
+	// guardrailChecker.spawnAuditJudge). Each is nil unless its own env flag
+	// was on AND Weaviate was configured back in plan(), so with neither flag
+	// set this whole block is a no-op and the pipeline is byte-identical to
+	// before.
+	var protocolEnrich voicepipelinecore.MessagesEnricher
 	if pl.ProtocolEnricher != nil {
 		pl.ProtocolEnricher.SetInfrastructure(routerPromptMetadataSetter(llmClient), taskCtx.UIEvents)
 		pl.ProtocolEnricher.SetSentryHub(taskCtx.SentryHub())
-		processors = append(processors,
-			voicepipelinecore.NewContextEnricherProcessor(taskCtx, pl.ProtocolEnricher.Enrich))
-		enricher := pl.ProtocolEnricher
-		go enricher.warmUp(taskCtx.Ctx)
+		protocolEnrich = pl.ProtocolEnricher.Enrich
 	}
+
+	var guardChecker *guardrailChecker
+	if pl.NewGuardrailChecker != nil {
+		guardChecker = pl.NewGuardrailChecker(taskCtx.Ctx)
+		guardChecker.SetUI(taskCtx.UIEvents)
+		guardChecker.SetSentryHub(taskCtx.SentryHub())
+	}
+	var guardrailEnrich voicepipelinecore.MessagesEnricher
+	if guardChecker != nil {
+		guardrailEnrich = guardChecker.Enrich
+	}
+
+	// One ContextEnricherProcessor for both enrichers (it holds exactly one
+	// MessagesEnricher). Protocol runs first: see composeEnrichers for why
+	// order matters here. Sits upstream of LLMProcessor so its latency lands
+	// in its own MetricContextEnrich rather than inside llm_ttfb_ms.
+	if enrich := composeEnrichers(protocolEnrich, guardrailEnrich); enrich != nil {
+		processors = append(processors, voicepipelinecore.NewContextEnricherProcessor(taskCtx, enrich))
+	}
+
+	// Exactly one warm-up goroutine regardless of which step(s) are enabled:
+	// both hit the same Weaviate through the same shared client, so there is
+	// one cold-connection cost to pay per call, not one per step.
+	if pl.retrievalClient != nil {
+		go warmUpWeaviateClient(taskCtx.Ctx, pl.retrievalClient, pl.Startup.Logger)
+	}
+
+	processors = append(processors, llm, llmResponseTimeout, llmOutputFilter)
+
+	// After LLMOutputFilterProcessor (must judge the text the user will
+	// actually hear, not raw model output with leaked artifacts) and before
+	// TTS (fragments must be observable before they're spoken). Absent
+	// unless the guardrail flag was on and Weaviate was configured.
+	if guardChecker != nil {
+		processors = append(processors, voicepipelinecore.NewResponseGuardProcessor(taskCtx, guardChecker.Check))
+	}
+
 	processors = append(processors,
-		llm,
-		llmResponseTimeout,
-		llmOutputFilter,
 		tts,
 		playback,
 		contextAggregators.Assistant(),

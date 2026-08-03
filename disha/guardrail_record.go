@@ -370,7 +370,13 @@ func (b *guardrailRecordBox) setTurnText(turnText string) {
 
 // take removes and returns the pending record, so one turn maps to exactly
 // one chunk. Resets the lock so the next turn starts unlocked.
+// Nil-receiver safe, for the same reason protocolRecordBox.take is: the chunk
+// decorator serves four flag combinations and must treat a missing box as
+// "no record", not as a mid-call panic.
 func (b *guardrailRecordBox) take() *guardrailCheckRecord {
+	if b == nil {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

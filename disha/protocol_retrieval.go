@@ -742,7 +742,14 @@ func (b *protocolRecordBox) put(record protocolRetrievalRecord) {
 
 // take removes and returns the pending record, so one retrieval maps to
 // exactly one assistant chunk.
+// take is nil-receiver safe. The chunk decorator is wired for four
+// enabled/disabled flag combinations and calls take() before it can know
+// whether a record exists, so a nil box must read as "no record" rather than
+// panicking on the first spoken assistant chunk — i.e. mid-call.
 func (b *protocolRecordBox) take() *protocolRetrievalRecord {
+	if b == nil {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	record := b.pending
@@ -1180,9 +1187,17 @@ func protocolLogVariables(protocols []residentProtocol) []any {
 	return out
 }
 
-// warmUp fires one throwaway query so the first real retrieval doesn't pay DNS,
-// TCP and TLS setup. Best-effort: a failure here is not a call problem, and the
-// real path reports its own errors.
+// warmUpWeaviateClient fires one throwaway query so the first real retrieval
+// doesn't pay DNS, TCP and TLS setup. Best-effort: a failure here is not a
+// call problem, and the real path reports its own errors.
+//
+// Shared by both retrieval-shaped follow-up steps that hit the same
+// Weaviate — protocol retrieval and the guardrail check
+// (reports/followup-guardrail-check-design-note.md §9) — so
+// disha/followup_call.go's setupRetrieval spawns this exactly once per call
+// regardless of which step(s) are enabled, instead of once per step. It is a
+// free function rather than a protocolEnricher method for exactly that
+// reason: a guardrail-only call has no protocolEnricher to hang it on.
 //
 // It gets protocolWarmUpBudget, NOT protocolRetrievalBudget. Sharing the live
 // budget made the warm-up self-defeating: cold DNS + TCP + a cross-region TLS
@@ -1192,20 +1207,33 @@ func protocolLogVariables(protocols []residentProtocol) []any {
 // connection, and left the first real query to pay the setup cost it existed to
 // absorb. This runs in its own goroutine off the critical path, so a generous
 // budget costs the call nothing.
-func (e *protocolEnricher) warmUp(ctx context.Context) {
+//
+// The throwaway query itself always targets ProtocolAnchor: both collections
+// live on the same Weaviate instance reached through the same shared client,
+// so warming the connection this way benefits a guardrail-only call exactly
+// as much as a protocol-only one — only the TCP/TLS setup is being paid for,
+// not any particular collection's data.
+func warmUpWeaviateClient(ctx context.Context, client *weaviate.Client, logger *log.Logger) {
 	warmCtx, cancel := context.WithTimeout(ctx, protocolWarmUpBudget)
 	defer cancel()
 	startedAt := time.Now()
-	_, err := queryProtocols(warmCtx, e.client, "warm up")
-	if e.logger == nil {
+	_, err := queryProtocols(warmCtx, client, "warm up")
+	if logger == nil {
 		return
 	}
 	elapsedMs := float64(time.Since(startedAt).Microseconds()) / 1000.0
 	if err != nil {
-		e.logger.Printf("disha: protocol retrieval warm-up failed after %.1fms (ignored): %v\n", elapsedMs, err)
+		logger.Printf("disha: retrieval warm-up failed after %.1fms (ignored): %v\n", elapsedMs, err)
 		return
 	}
 	// Logged on success too: this is the cold-path setup cost the first real
 	// query would otherwise have paid, and it is the number to watch.
-	e.logger.Printf("disha: protocol retrieval warm-up ok warm_ms=%.1f\n", elapsedMs)
+	logger.Printf("disha: retrieval warm-up ok warm_ms=%.1f\n", elapsedMs)
+}
+
+// warmUp is protocolEnricher's own entry point, kept so any call site that
+// already has an enricher in hand (rather than a bare client) can still warm
+// it up the same way. Delegates to the shared warmUpWeaviateClient above.
+func (e *protocolEnricher) warmUp(ctx context.Context) {
+	warmUpWeaviateClient(ctx, e.client, e.logger)
 }

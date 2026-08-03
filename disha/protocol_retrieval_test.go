@@ -1089,74 +1089,24 @@ func TestEnricherInjectsExactlyOneBlockAcrossTurns(t *testing.T) {
 }
 
 // ---------------------------------------------------------------- the wiring
+//
+// The env-flag-gating and missing-Weaviate-config wiring tests that used to
+// live here moved to disha/followup_call_test.go (TestSetupRetrieval*) when
+// setupProtocolRetrieval stopped owning the shared client and the chunk
+// decorator: both are now built once in followup_call.go's setupRetrieval so
+// the guardrail check can share them, and that orchestration — including the
+// four protocol/guardrail flag combinations — is what those tests cover.
 
-// The env flag is the only gate: both follow-up paths get retrieval when it is
-// on, and neither gets it when it is off.
-func TestSetupProtocolRetrievalGating(t *testing.T) {
-	tests := []struct {
-		name    string
-		dynamic bool
-		flag    string
-		want    bool
-	}{
-		{"dynamic and enabled", true, "1", true},
-		{"agenda follow-up and enabled", false, "1", true},
-		{"dynamic but flag off", true, "0", false},
-		{"dynamic but flag unset", true, "", false},
-		{"agenda follow-up with flag off", false, "0", false},
-		{"agenda follow-up with flag unset", false, "", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(protocolRetrievalEnabledEnv, tc.flag)
-			t.Setenv("WEAVIATE_URL", "http://weaviate.staging.svc.cluster.local:8080")
-			t.Setenv("WEAVIATE_API_KEY", "key")
-			t.Setenv("AWS_US_BUCKET_NAME", "")
-			t.Setenv("AWS_US_REGION", "")
-
-			pl := &followUpPlan{
-				Startup: CallStartup{
-					Logger:         log.New(io.Discard, "", 0),
-					UserID:         "user-1",
-					ConversationID: "conv-1",
-				},
-				Dynamic:         tc.dynamic,
-				PromptMetadata:  map[string]any{},
-				PromptVariables: DocumentVariables{},
-				Callbacks:       &CallEventCallbacks{},
-			}
-			setupProtocolRetrieval(pl, nil)
-
-			if got := pl.ProtocolEnricher != nil; got != tc.want {
-				t.Errorf("enricher present = %v, want %v", got, tc.want)
-			}
-			if got := pl.Callbacks.chunkDecorator != nil; got != tc.want {
-				t.Errorf("chunk decorator registered = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// An unconfigured Weaviate means "feature off", not a failed call.
-func TestSetupProtocolRetrievalMissingWeaviateConfig(t *testing.T) {
-	t.Setenv(protocolRetrievalEnabledEnv, "1")
-	t.Setenv("WEAVIATE_URL", "")
-	t.Setenv("WEAVIATE_API_KEY", "")
-
-	pl := &followUpPlan{
-		Startup:   CallStartup{Logger: log.New(io.Discard, "", 0)},
-		Dynamic:   true,
-		Callbacks: &CallEventCallbacks{},
-	}
-	setupProtocolRetrieval(pl, nil)
-
-	if pl.ProtocolEnricher != nil {
-		t.Error("enricher should not be built without Weaviate config")
-	}
-	if pl.Callbacks.chunkDecorator != nil {
-		t.Error("chunk decorator should not be registered without Weaviate config")
-	}
+// warmUpWeaviateClient must work standalone, independent of any
+// protocolEnricher instance: this is what lets disha/followup_call.go share
+// one warm-up between protocol retrieval and the guardrail check instead of
+// running one per step.
+func TestWarmUpWeaviateClientIsShareableWithoutAnEnricher(t *testing.T) {
+	client := newStubWeaviate(t, fmt.Sprintf(anchorResponseTemplate, ""), nil)
+	warmUpWeaviateClient(context.Background(), client, log.New(io.Discard, "", 0))
+	// Also fine with a nil logger (matches protocolEnricher.warmUp's own
+	// nil-logger short-circuit).
+	warmUpWeaviateClient(context.Background(), client, nil)
 }
 
 // A client that doesn't implement SetPromptMetadata (test stubs) must not break
