@@ -53,13 +53,29 @@ func testProtocolRetrievalRecord() protocolRetrievalRecord {
 	}
 }
 
+// newTestDecorator wires a nil guardrail box, matching how every non-
+// follow-up bot (and a protocol-only follow-up configuration) actually calls
+// newRetrievalChunkDecorator. Every existing protocol test below therefore
+// also exercises "nil guardrail box is a complete no-op".
 func newTestDecorator(t *testing.T, uploader JSONUploader) (func(*ConversationChunk), *protocolRecordBox) {
 	t.Helper()
-	box := &protocolRecordBox{}
+	protocolBox := &protocolRecordBox{}
 	decorator := newRetrievalChunkDecorator(
-		box, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
+		protocolBox, nil, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
 	)
-	return decorator, box
+	return decorator, protocolBox
+}
+
+// newTestDecoratorWithGuardrail wires a live guardrail box alongside the
+// protocol box, for tests that exercise the guardrail path.
+func newTestDecoratorWithGuardrail(t *testing.T, uploader JSONUploader) (func(*ConversationChunk), *protocolRecordBox, *guardrailRecordBox) {
+	t.Helper()
+	protocolBox := &protocolRecordBox{}
+	guardrailBox := &guardrailRecordBox{}
+	decorator := newRetrievalChunkDecorator(
+		protocolBox, guardrailBox, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
+	)
+	return decorator, protocolBox, guardrailBox
 }
 
 func TestChunkDecoratorAttachesToSpokenAssistantChunk(t *testing.T) {
@@ -425,4 +441,170 @@ func payloadKeys(m map[string]any) string {
 	}
 	sort.Strings(out)
 	return strings.Join(out, ",")
+}
+
+// ----------------------------------------------------------- guardrail path
+
+// A guardrail record must land beside an existing protocol record on the same
+// umbrella without clobbering it, and vice versa: the merge, not assign,
+// discipline is the whole point of extending one decorator instead of
+// registering a second one.
+func TestChunkDecoratorGuardrailMergesBesideProtocol(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, protocolBox, guardrailBox := newTestDecoratorWithGuardrail(t, uploader)
+	protocolBox.put(testProtocolRetrievalRecord())
+	guardrailBox.offer(testGuardrailCheckRecord(0.83, false))
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	if chunk.ChunkRetrievalMetrics == nil {
+		t.Fatal("expected ChunkRetrievalMetrics to be allocated")
+	}
+	if chunk.ChunkRetrievalMetrics.Protocol == nil {
+		t.Fatal("protocol record was clobbered by the guardrail merge")
+	}
+	if chunk.ChunkRetrievalMetrics.Protocol.Status != "ok" {
+		t.Errorf("protocol status = %q", chunk.ChunkRetrievalMetrics.Protocol.Status)
+	}
+	guardrail := chunk.ChunkRetrievalMetrics.Guardrail
+	if guardrail == nil {
+		t.Fatal("guardrail record was not attached")
+	}
+	if guardrail.SimilarityScore == nil || *guardrail.SimilarityScore != 0.83 {
+		t.Errorf("similarity score = %+v, want 0.83", guardrail.SimilarityScore)
+	}
+	if guardrail.CheckCount != 1 || guardrail.QueryText != "the entire disha turn" {
+		t.Errorf("guardrail metrics = %+v", guardrail)
+	}
+
+	keys, _ := uploader.uploaded()
+	wantProtocolKey := "protocol_retrieval/conv-1/chunk-1.json"
+	wantGuardrailKey := "guardrail_check/conv-1/chunk-1.json"
+	foundProtocol, foundGuardrail := false, false
+	for _, key := range keys {
+		if key == wantProtocolKey {
+			foundProtocol = true
+		}
+		if key == wantGuardrailKey {
+			foundGuardrail = true
+		}
+	}
+	if !foundProtocol || !foundGuardrail {
+		t.Fatalf("uploaded keys = %v, want both %s and %s", keys, wantProtocolKey, wantGuardrailKey)
+	}
+	if guardrail.RawDataS3Key != wantGuardrailKey {
+		t.Errorf("guardrail S3 key = %q, want %q", guardrail.RawDataS3Key, wantGuardrailKey)
+	}
+}
+
+// A nil guardrail box (every non-follow-up bot, and today's follow-up wiring
+// before the checker layer lands) must be a complete no-op even when a
+// protocol record is present on the same turn.
+func TestChunkDecoratorNilGuardrailBoxIsNoOp(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, protocolBox := newTestDecorator(t, uploader)
+	protocolBox.put(testProtocolRetrievalRecord())
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	if chunk.ChunkRetrievalMetrics.Protocol == nil {
+		t.Fatal("protocol metrics should still be attached")
+	}
+	if chunk.ChunkRetrievalMetrics.Guardrail != nil {
+		t.Fatalf("guardrail metrics should be nil with no guardrail box: %+v", chunk.ChunkRetrievalMetrics.Guardrail)
+	}
+	for _, key := range func() []string { k, _ := uploader.uploaded(); return k }() {
+		if strings.Contains(key, "guardrail_check") {
+			t.Fatalf("unexpected guardrail upload: %s", key)
+		}
+	}
+}
+
+// The tool-pair assistant chunk is also assistant-role and must not consume a
+// pending guardrail record, mirroring the same rule for protocol records.
+func TestChunkDecoratorGuardrailIgnoresToolPairChunk(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, _, guardrailBox := newTestDecoratorWithGuardrail(t, uploader)
+	guardrailBox.offer(testGuardrailCheckRecord(0.83, false))
+
+	chunk := &ConversationChunk{
+		ID: "c", Role: "assistant",
+		AdditionalData: map[string]any{"tool_calls": []any{}},
+	}
+	decorate(chunk)
+
+	if chunk.ChunkRetrievalMetrics != nil {
+		t.Fatalf("tool-pair chunk must not consume a guardrail record: %+v", chunk.ChunkRetrievalMetrics)
+	}
+	if guardrailBox.take() == nil {
+		t.Fatal("the pending guardrail record must still be waiting for the real assistant chunk")
+	}
+}
+
+// Upload is best-effort: the chunk is still written with the rest of the
+// guardrail metrics, just without a key.
+func TestChunkDecoratorGuardrailUploadFailureKeepsMetrics(t *testing.T) {
+	uploader := &stubJSONUploader{err: errors.New("s3 down")}
+	decorate, _, guardrailBox := newTestDecoratorWithGuardrail(t, uploader)
+	guardrailBox.offerViolation(testGuardrailCheckRecord(0.94, true))
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	guardrail := chunk.ChunkRetrievalMetrics.Guardrail
+	if guardrail == nil {
+		t.Fatal("guardrail metrics should survive an upload failure")
+	}
+	if guardrail.RawDataS3Key != "" {
+		t.Errorf("key = %q, want empty on upload failure", guardrail.RawDataS3Key)
+	}
+	if !guardrail.Interrupted || guardrail.Status != "ok" {
+		t.Errorf("upload failure must not rewrite the check result: %+v", guardrail)
+	}
+}
+
+// The S3 payload is the calibration dataset end to end through the decorator:
+// it must contain every check the turn ran, not just the one selected onto
+// the chunk.
+func TestChunkDecoratorGuardrailPayloadIncludesEveryCheck(t *testing.T) {
+	uploader := &stubJSONUploader{}
+	decorate, _, guardrailBox := newTestDecoratorWithGuardrail(t, uploader)
+
+	record := guardrailCheckRecord{
+		TurnText: "the entire disha turn",
+		Checks: []guardrailCheck{
+			testGuardrailCheck(0, 0.40, false),
+			testGuardrailCheck(1, 0.78, false),
+			testGuardrailCheck(2, 0.94, true),
+		},
+		SelectedIndex: 2,
+		Interrupted:   true,
+		CheckCount:    3,
+		Status:        "ok",
+	}
+	guardrailBox.offerViolation(record)
+
+	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
+	decorate(chunk)
+
+	_, payload := uploader.uploaded()
+	body, ok := payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T", payload)
+	}
+	checks, ok := body["checks"].([]map[string]any)
+	if !ok {
+		t.Fatalf("checks type = %T", body["checks"])
+	}
+	if len(checks) != 3 {
+		t.Fatalf("checks = %d, want all 3 checks the turn ran", len(checks))
+	}
+
+	// The chunk-level summary carries only the selected check's similarity.
+	guardrail := chunk.ChunkRetrievalMetrics.Guardrail
+	if guardrail.SimilarityScore == nil || *guardrail.SimilarityScore != 0.94 {
+		t.Errorf("chunk similarity = %+v, want the selected check's 0.94", guardrail.SimilarityScore)
+	}
 }

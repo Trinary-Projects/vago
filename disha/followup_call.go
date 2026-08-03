@@ -158,6 +158,7 @@ func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
 	)
 	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
 		box,
+		nil, // guardrail box: wired by a later layer (guardrail_check.go)
 		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
 		pl.Startup.Logger,
 		pl.Startup.UserID,

@@ -83,13 +83,14 @@ type ConversationChunk struct {
 // ChunkRetrievalMetrics is the per-chunk umbrella for every retrieval-shaped
 // step on a turn, matching the one-row-per-chunk backend table.
 //
-// Each step gets its own namespaced sub-object rather than flat fields, so the
-// planned post-LLM guardrail step (vector lookup, sometimes an LLM call, then
-// interrupt-and-regenerate) can be added as a sibling `Guardrail
-// *GuardrailCheckMetrics `json:"guardrail,omitempty"“ without renaming or
-// re-keying anything that already ships.
+// Each step gets its own namespaced sub-object rather than flat fields.
+// Protocol retrieval landed first; the post-LLM guardrail check (vector
+// lookup, sometimes an LLM call, then interrupt-and-regenerate) has now
+// landed as the Guardrail sibling below, without renaming or re-keying
+// anything Protocol already shipped.
 type ChunkRetrievalMetrics struct {
-	Protocol *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+	Protocol  *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+	Guardrail *GuardrailCheckMetrics    `json:"guardrail,omitempty"`
 }
 
 // ProtocolRetrievalMetrics summarizes one protocol-retrieval round. The full
@@ -110,6 +111,40 @@ type ProtocolRetrievalMetrics struct {
 	ProtocolsS3Key string `json:"protocols_s3_key"`
 	Status         string `json:"status"` // ok | skipped | error | timeout
 	Error          string `json:"error,omitempty"`
+}
+
+// GuardrailCheckMetrics summarizes the SELECTED check for one Disha turn (see
+// reports/followup-guardrail-check-design-note.md §5.7 for how "selected" is
+// chosen: the violating check if any check violated, otherwise the check with
+// the highest top-similarity). The full per-fragment candidate list for every
+// check that ran during the turn — the threshold-calibration dataset — lives
+// in the S3 object at RawDataS3Key.
+//
+// The `guardrail_check_` prefix is dropped inside this sub-object (it would
+// otherwise read guardrail.guardrail_check_e2e_ms), matching how the Protocol
+// sibling nests; the backend DB columns keep the prefix to match
+// protocol_retrieval_*.
+type GuardrailCheckMetrics struct {
+	// E2EMs is the SELECTED check's own latency (fragment boundary to
+	// verdict), not the whole turn's guardrail work. On the violating path
+	// this is the number that matters: how long from the sentence completing
+	// to the interrupt firing.
+	E2EMs           float64  `json:"e2e_ms"`
+	SimilarityScore *float64 `json:"similarity_score"`
+	// JudgeVerdict is "yes" | "no" | "" — the judge did not run (similarity
+	// below the judge band, or the >0.90 band's fire-and-forget audit judge
+	// had not resolved by the time the record was taken).
+	JudgeVerdict string `json:"judge_verdict,omitempty"`
+	Interrupted  bool   `json:"interrupted"`
+	CheckCount   int    `json:"check_count"`
+	// QueryText is the ENTIRE Disha turn (not a single fragment), carried
+	// inline so disha-backend can seed GuardrailLiveQueryAnchor straight from
+	// the chunk — reading it from S3 would mean one GET per Disha turn inside
+	// the chunk-sync job.
+	QueryText    string `json:"query_text,omitempty"`
+	RawDataS3Key string `json:"raw_data_s3_key"`
+	Status       string `json:"status"` // ok | skipped | error
+	Error        string `json:"error,omitempty"`
 }
 
 type UpdateConversationRequest struct {
