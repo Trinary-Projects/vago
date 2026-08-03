@@ -213,6 +213,14 @@ func (fc *fakeCartesiaConn) sendDone(contextID string) {
 	_ = fc.conn.WriteJSON(map[string]any{"type": "done", "context_id": contextID})
 }
 
+func (fc *fakeCartesiaConn) sendError(contextID, message string) {
+	_ = fc.conn.WriteJSON(map[string]any{
+		"type":       "error",
+		"context_id": contextID,
+		"error":      message,
+	})
+}
+
 // fakeCartesiaServer accepts websocket connections at a URL compatible
 // with ttsDialURL's "base + api key" concatenation.
 type fakeCartesiaServer struct {
@@ -414,6 +422,102 @@ func TestTTS_PendingEndForwardsAfterCartesiaDone(t *testing.T) {
 	}
 	if c := countFrames[EndFrame](down); c != 1 {
 		t.Errorf("expected exactly 1 EndFrame, got %d in %s", c, describeFrameTypes(down))
+	}
+}
+
+func TestTTS_ProviderErrorClosesTurnReportsOnceAndReleasesPendingEnd(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	transport := attachMockSentryHub(t, fix)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+	contextID := conn.waitForContinueFalse(t, 2*time.Second)
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	time.Sleep(100 * time.Millisecond)
+	if c := countFrames[EndFrame](sink.Captured()); c != 0 {
+		t.Fatalf("expected EndFrame deferred before provider error, got %d", c)
+	}
+
+	conn.sendError(contextID, "quota exhausted")
+	conn.sendError(contextID, "quota exhausted")
+
+	errorFrame := waitForFrameType[ErrorFrame](t, source.Captured, 3*time.Second)
+	waitForFrameType[TTSDoneFrame](t, sink.Captured, 3*time.Second)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	if errorFrame.Fatal || errorFrame.Processor != "TTS" {
+		t.Fatalf("ErrorFrame = %#v, want non-fatal TTS error", errorFrame)
+	}
+	if !strings.HasPrefix(errorFrame.Err, "Error: {") || !strings.Contains(errorFrame.Err, "quota exhausted") {
+		t.Fatalf("ErrorFrame.Err = %q, want Cartesia provider payload", errorFrame.Err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if got := countFrames[ErrorFrame](source.Captured()); got != 1 {
+		t.Errorf("ErrorFrame count = %d, want duplicate provider error reported once", got)
+	}
+	if got := countFrames[TTSDoneFrame](sink.Captured()); got != 1 {
+		t.Errorf("TTSDoneFrame count = %d, want active turn closed once", got)
+	}
+	if got := countFrames[EndFrame](sink.Captured()); got != 1 {
+		t.Errorf("EndFrame count = %d, want pending end released once", got)
+	}
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("Sentry event count = %d, want 1", len(events))
+	}
+	if events[0].Message != "TTS error: quota exhausted" || events[0].Tags["provider"] != "cartesia" {
+		t.Errorf("Sentry event = %#v, want Cartesia provider error", events[0])
+	}
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
+}
+
+func TestTTS_InvalidContextIDErrorRemainsSuppressed(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	transport := attachMockSentryHub(t, fix)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+	contextID := conn.waitForContinueFalse(t, 2*time.Second)
+	conn.sendError(contextID, "Invalid context ID")
+
+	assertNoFrameType[ErrorFrame](t, source.Captured, 200*time.Millisecond)
+	assertNoFrameType[TTSDoneFrame](t, sink.Captured, 200*time.Millisecond)
+	if events := transport.Events(); len(events) != 0 {
+		t.Fatalf("Sentry event count = %d, want Invalid context ID suppressed", len(events))
+	}
+
+	conn.sendDone(contextID)
+	waitForFrameType[TTSDoneFrame](t, sink.Captured, 3*time.Second)
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
+}
+
+func TestTTS_ProviderErrorRateLimitResetsAfterWindow(t *testing.T) {
+	p := NewTTSProcessor(newTestFixture(t).TaskCtx, nil)
+	startedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < ttsProviderErrorReportLimit; i++ {
+		if !p.shouldReportProviderError("same-error", startedAt) {
+			t.Fatalf("occurrence %d unexpectedly suppressed", i+1)
+		}
+	}
+	if p.shouldReportProviderError("same-error", startedAt.Add(ttsProviderErrorReportWindow-time.Nanosecond)) {
+		t.Fatal("occurrence above the fixed-window limit was reported")
+	}
+	if !p.shouldReportProviderError("same-error", startedAt.Add(ttsProviderErrorReportWindow)) {
+		t.Fatal("first occurrence in the next fixed window was suppressed")
 	}
 }
 

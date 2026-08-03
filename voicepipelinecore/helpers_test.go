@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
 
 // Testing infrastructure ported from Pipecat's tests/utils.py.
@@ -110,6 +112,17 @@ func newTestFixture(t *testing.T) *testFixture {
 		wg:       &wg,
 	}
 	return fix
+}
+
+func attachMockSentryHub(t *testing.T, fix *testFixture) *sentry.MockTransport {
+	t.Helper()
+	transport := &sentry.MockTransport{}
+	client, err := sentry.NewClient(sentry.ClientOptions{Transport: transport})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	fix.TaskCtx.sentryHub = sentry.NewHub(client, sentry.NewScope())
+	return transport
 }
 
 func (f *testFixture) captureMetrics(mf MetricsFrame) {

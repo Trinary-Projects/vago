@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +20,10 @@ type SonioxToken struct {
 }
 
 type SonioxResponseMessage struct {
-	Tokens   []SonioxToken `json:"tokens"`
-	Finished bool          `json:"finished"`
+	Tokens       []SonioxToken `json:"tokens"`
+	Finished     bool          `json:"finished"`
+	ErrorCode    *int          `json:"error_code"`
+	ErrorMessage *string       `json:"error_message"`
 }
 
 // sttDialURL is the Soniox websocket endpoint. Exposed as a package
@@ -31,6 +34,16 @@ var sttDialURL = "wss://stt-rt.soniox.com/transcribe-websocket"
 // attempts with short exponential backoff. Keep these as vars so tests
 // can shorten the retry window without sleeping for seconds.
 var sttConnectRetryDelays = []time.Duration{time.Second, 2 * time.Second}
+
+const (
+	sttProviderErrorReportLimit  = 100
+	sttProviderErrorReportWindow = time.Minute
+)
+
+type sttProviderErrorWindow struct {
+	startedAt time.Time
+	count     int
+}
 
 // STTProcessor uses a single cancellation signal — the embedded
 // BaseProcessor.ctx (referred to via s.ctx). Three things shut it down:
@@ -60,14 +73,17 @@ type STTProcessor struct {
 	activationReason string
 	firstAudioAt     time.Time
 	queuedBeforeConn int
+
+	providerErrorWindows map[string]sttProviderErrorWindow
 }
 
 func NewSTTProcessor(taskCtx *TaskContext) *STTProcessor {
 	p := &STTProcessor{
-		taskCtx:     taskCtx,
-		audioFrames: make(chan AudioFrame, 100),
-		connected:   make(chan struct{}),
-		activateCh:  make(chan struct{}),
+		taskCtx:              taskCtx,
+		audioFrames:          make(chan AudioFrame, 100),
+		connected:            make(chan struct{}),
+		activateCh:           make(chan struct{}),
+		providerErrorWindows: make(map[string]sttProviderErrorWindow),
 	}
 	p.BaseProcessor = NewBaseProcessor("STT", p, taskCtx)
 	return p
@@ -257,7 +273,63 @@ func (s *STTProcessor) read() {
 			//s.taskCtx.Logger.Printf("STT token received: response_id=%d finished=%v is_final=%v text=%q\n", responseID, resp.Finished, tok.IsFinal, tok.Text)
 			s.PushFrame(NewTranscriptFrame(tok.Text, tok.IsFinal, responseID, resp.Finished), Downstream)
 		}
+		s.reportProviderError(resp)
 	}
+}
+
+func (s *STTProcessor) reportProviderError(resp SonioxResponseMessage) {
+	hasErrorCode := resp.ErrorCode != nil && *resp.ErrorCode != 0
+	hasErrorMessage := resp.ErrorMessage != nil && *resp.ErrorMessage != ""
+	if !hasErrorCode && !hasErrorMessage {
+		return
+	}
+
+	errorCode := "None"
+	if resp.ErrorCode != nil {
+		errorCode = strconv.Itoa(*resp.ErrorCode)
+	}
+	errorMessage := "None"
+	if resp.ErrorMessage != nil {
+		errorMessage = *resp.ErrorMessage
+	}
+
+	message := fmt.Sprintf("Error: %s (_receive_messages) - %s", errorCode, errorMessage)
+	if !s.shouldReportProviderError(message, time.Now()) {
+		return
+	}
+
+	tags := map[string]string{
+		"component": "stt",
+		"provider":  "soniox",
+		"operation": "provider_error",
+	}
+	if hasErrorCode {
+		tags["error_code"] = errorCode
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Hub:     s.taskCtx.SentryHub(),
+		Message: "STT error: " + message,
+		Tags:    tags,
+		Details: map[string]any{
+			"error_code":    errorCode,
+			"error_message": errorMessage,
+		},
+	})
+	s.PushError(message, false)
+}
+
+func (s *STTProcessor) shouldReportProviderError(key string, now time.Time) bool {
+	window := s.providerErrorWindows[key]
+	if window.startedAt.IsZero() || now.Before(window.startedAt) || now.Sub(window.startedAt) >= sttProviderErrorReportWindow {
+		s.providerErrorWindows[key] = sttProviderErrorWindow{startedAt: now, count: 1}
+		return true
+	}
+	if window.count >= sttProviderErrorReportLimit {
+		return false
+	}
+	window.count++
+	s.providerErrorWindows[key] = window
+	return true
 }
 
 func (s *STTProcessor) handleConnectExhausted(err error) {

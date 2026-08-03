@@ -43,6 +43,9 @@ const (
 	// must handle it before the isCurrentContext check in handleTTSEvent
 	// would otherwise eat it.
 	ttsEventReconnected
+	// ttsEventProviderError carries a Cartesia error response to the
+	// orchestrator, which owns the active synthesis state.
+	ttsEventProviderError
 )
 
 type ttsEvent struct {
@@ -50,6 +53,9 @@ type ttsEvent struct {
 	contextID string
 	audioData []byte
 	words     []pendingWord
+	error     string // Python-parity ErrorFrame text, including the raw payload
+	errorKey  string // stable across context IDs for once-per-call reporting
+	summary   string // stable Sentry message; raw payload remains in Details
 }
 
 // ttsCommand is the relay envelope used by ProcessFrame to hand frames
@@ -72,6 +78,16 @@ var ttsDialURL = "wss://api.cartesia.ai/tts/websocket?cartesia_version=2025-04-1
 // up and forwarding it anyway. Exposed as a package variable so tests
 // can override it.
 var ttsPendingEndTimeout = 10 * time.Second
+
+const (
+	ttsProviderErrorReportLimit  = 100
+	ttsProviderErrorReportWindow = time.Minute
+)
+
+type ttsProviderErrorWindow struct {
+	startedAt time.Time
+	count     int
+}
 
 // TTSProcessor wraps Cartesia. After migration its shape is:
 //
@@ -122,11 +138,17 @@ type TTSProcessor struct {
 
 	websocketConn *websocket.Conn
 	closeOnce     sync.Once // idempotent websocket close
+
+	// Orchestrator-owned provider-error reporting windows.
+	providerErrorWindows map[string]ttsProviderErrorWindow
 }
 
 type CartesiaTTSMessage struct {
-	Type  string `json:"type"`
-	Error string `json:"error"`
+	Type       string `json:"type"`
+	Error      string `json:"error"`
+	Message    string `json:"message"`
+	ContextId  string `json:"context_id"`
+	StatusCode int    `json:"status_code"`
 }
 
 type CartesiaTTSAudioChunkMessage struct {
@@ -164,13 +186,14 @@ type CartesiaTTSDoneMessage struct {
 // live on the shared TaskContext. A nil/empty dict means no filtering.
 func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string) *TTSProcessor {
 	t := &TTSProcessor{
-		taskCtx:          taskCtx,
-		metrics:          NewProcessorMetrics("tts"),
-		phonetic:         newPhoneticFilter(phoneticDict),
-		outputSampleRate: outputSampleRateFromRoom(taskCtx),
-		commands:         make(chan ttsCommand, 100),
-		ttsEvents:        make(chan ttsEvent, 100),
-		connected:        make(chan struct{}),
+		taskCtx:              taskCtx,
+		metrics:              NewProcessorMetrics("tts"),
+		phonetic:             newPhoneticFilter(phoneticDict),
+		outputSampleRate:     outputSampleRateFromRoom(taskCtx),
+		commands:             make(chan ttsCommand, 100),
+		ttsEvents:            make(chan ttsEvent, 100),
+		connected:            make(chan struct{}),
+		providerErrorWindows: make(map[string]ttsProviderErrorWindow),
 	}
 	t.BaseProcessor = NewBaseProcessor("TTS", t, taskCtx)
 	return t
@@ -505,6 +528,28 @@ func (t *TTSProcessor) orchestrator() {
 				}
 				continue
 			}
+			if event.eventType == ttsEventProviderError {
+				// Pipecat only handles messages for its currently active audio
+				// context. Context-free errors (for example authentication or
+				// quota errors) are still reportable and close an active turn.
+				if event.contextID != "" && !t.isCurrentContext(event.contextID) {
+					continue
+				}
+				activeTurn := cartesiaTextSent && t.currentContextId != ""
+				if activeTurn {
+					t.pushRemainingAudioFrames()
+					t.PushFrame(NewTTSDoneFrame(), Downstream)
+					t.metrics.Reset()
+					clearTTSState()
+				}
+				t.reportProviderError(event)
+				if activeTurn {
+					if forwardPendingEnd("after provider error") {
+						return
+					}
+				}
+				continue
+			}
 			if t.handleTTSEvent(event) {
 				cartesiaTextSent = false
 				if forwardPendingEnd("after TTS done") {
@@ -528,6 +573,51 @@ func (t *TTSProcessor) orchestrator() {
 			}
 		}
 	}
+}
+
+func (t *TTSProcessor) reportProviderError(event ttsEvent) {
+	key := event.errorKey
+	if key == "" {
+		key = event.error
+	}
+	if !t.shouldReportProviderError(key, time.Now()) {
+		return
+	}
+	summary := event.summary
+	if summary == "" {
+		summary = event.error
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Hub:     t.taskCtx.SentryHub(),
+		Message: "TTS error: " + summary,
+		Tags: map[string]string{
+			"component": "tts",
+			"provider":  "cartesia",
+			"operation": "provider_error",
+		},
+		Details: map[string]any{
+			"context_id": event.contextID,
+			"error":      event.error,
+		},
+	})
+	t.PushError(event.error, false)
+}
+
+func (t *TTSProcessor) shouldReportProviderError(key string, now time.Time) bool {
+	if t.providerErrorWindows == nil {
+		t.providerErrorWindows = make(map[string]ttsProviderErrorWindow)
+	}
+	window := t.providerErrorWindows[key]
+	if window.startedAt.IsZero() || now.Before(window.startedAt) || now.Sub(window.startedAt) >= ttsProviderErrorReportWindow {
+		t.providerErrorWindows[key] = ttsProviderErrorWindow{startedAt: now, count: 1}
+		return true
+	}
+	if window.count >= ttsProviderErrorReportLimit {
+		return false
+	}
+	window.count++
+	t.providerErrorWindows[key] = window
+	return true
 }
 
 // --- Cartesia interactions (called only from orchestrator goroutine) ---
@@ -785,9 +875,28 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			t.recordAudioTiming("go_tts_json_unmarshal", time.Since(start))
 		}
 
-		if resp.Error != "" {
-			if !strings.Contains(resp.Error, "Invalid context ID") {
-				t.taskCtx.Logger.Println("TTS error message received:", resp.Error)
+		rawMessage := strings.TrimSpace(string(msg))
+		if resp.Type == "error" || resp.Error != "" {
+			if strings.Contains(resp.Error, "Invalid context ID") ||
+				strings.Contains(resp.Message, "Invalid context ID") ||
+				strings.Contains(rawMessage, "Invalid context ID") {
+				continue
+			}
+			summary := strings.TrimSpace(resp.Error)
+			if summary == "" {
+				summary = strings.TrimSpace(resp.Message)
+			}
+			if summary == "" {
+				summary = "Cartesia provider error"
+			}
+			if !t.pushTTSEvent(ttsEvent{
+				eventType: ttsEventProviderError,
+				contextID: resp.ContextId,
+				error:     "Error: " + rawMessage,
+				errorKey:  fmt.Sprintf("%s|%d|%s|%s", resp.Type, resp.StatusCode, resp.Error, resp.Message),
+				summary:   summary,
+			}) {
+				return
 			}
 			continue
 		}
@@ -865,6 +974,16 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			if !t.pushTTSEvent(ttsEvent{
 				eventType: ttsEventDone,
 				contextID: doneMsg.ContextId,
+			}) {
+				return
+			}
+		default:
+			if !t.pushTTSEvent(ttsEvent{
+				eventType: ttsEventProviderError,
+				contextID: resp.ContextId,
+				error:     "Error, unknown message type: " + rawMessage,
+				errorKey:  "unknown_message_type|" + resp.Type,
+				summary:   fmt.Sprintf("unknown message type %q", resp.Type),
 			}) {
 				return
 			}

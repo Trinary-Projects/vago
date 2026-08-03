@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // STT/TTS unit tests focus on ProcessFrame routing behaviour. The
@@ -77,6 +79,110 @@ func TestSTT_PassesThroughOtherFrames(t *testing.T) {
 
 	if c := countFrames[TextFrame](down); c != 1 {
 		t.Errorf("expected TextFrame to pass through, got %d in %s", c, describeFrameTypes(down))
+	}
+}
+
+func TestSTT_ProviderErrorPreservesTokensAndReportsOnce(t *testing.T) {
+	errorMessage := "Organization balance exhausted. Top up your account to continue using Soniox."
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var config map[string]any
+		if err := conn.ReadJSON(&config); err != nil {
+			return
+		}
+		response := map[string]any{
+			"tokens": []map[string]any{{
+				"text":     "hello",
+				"is_final": true,
+			}},
+			"finished":      true,
+			"error_code":    402,
+			"error_message": errorMessage,
+		}
+		for i := 0; i < sttProviderErrorReportLimit+2; i++ {
+			if err := conn.WriteJSON(response); err != nil {
+				return
+			}
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	originalURL := sttDialURL
+	sttDialURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	t.Cleanup(func() { sttDialURL = originalURL })
+
+	fix := newTestFixture(t)
+	transport := attachMockSentryHub(t, fix)
+	p := NewSTTProcessor(fix.TaskCtx)
+	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	source.Link(p)
+	p.Link(sink)
+	source.Start(fix.RootCtx)
+	p.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	source.QueueFrame(NewSTTConnectFrame("test", time.Now()), Downstream)
+	transcript := waitForFrameType[TranscriptFrame](t, sink.Captured, 2*time.Second)
+	errorFrame := waitForFrameType[ErrorFrame](t, source.Captured, 2*time.Second)
+
+	wantError := "Error: 402 (_receive_messages) - " + errorMessage
+	if transcript.Text != "hello" || !transcript.IsFinal {
+		t.Fatalf("transcript = %#v, want final hello token", transcript)
+	}
+	if errorFrame.Err != wantError || errorFrame.Fatal || errorFrame.Processor != "STT" {
+		t.Fatalf("ErrorFrame = %#v, want non-fatal STT error %q", errorFrame, wantError)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for countFrames[TranscriptFrame](sink.Captured()) < sttProviderErrorReportLimit+2 ||
+		countFrames[ErrorFrame](source.Captured()) < sttProviderErrorReportLimit {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for repeated Soniox responses")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := countFrames[ErrorFrame](source.Captured()); got != sttProviderErrorReportLimit {
+		t.Fatalf("ErrorFrame count = %d, want rate-limited count %d", got, sttProviderErrorReportLimit)
+	}
+	events := transport.Events()
+	if len(events) != sttProviderErrorReportLimit {
+		t.Fatalf("Sentry event count = %d, want rate-limited count %d", len(events), sttProviderErrorReportLimit)
+	}
+	if events[0].Message != "STT error: "+wantError {
+		t.Errorf("Sentry message = %q, want %q", events[0].Message, "STT error: "+wantError)
+	}
+	if events[0].Tags["provider"] != "soniox" || events[0].Tags["error_code"] != "402" {
+		t.Errorf("Sentry tags = %v, want Soniox 402 tags", events[0].Tags)
+	}
+
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
+}
+
+func TestSTT_ProviderErrorRateLimitResetsAfterWindow(t *testing.T) {
+	p := NewSTTProcessor(newTestFixture(t).TaskCtx)
+	startedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < sttProviderErrorReportLimit; i++ {
+		if !p.shouldReportProviderError("same-error", startedAt) {
+			t.Fatalf("occurrence %d unexpectedly suppressed", i+1)
+		}
+	}
+	if p.shouldReportProviderError("same-error", startedAt.Add(sttProviderErrorReportWindow-time.Nanosecond)) {
+		t.Fatal("occurrence above the fixed-window limit was reported")
+	}
+	if !p.shouldReportProviderError("same-error", startedAt.Add(sttProviderErrorReportWindow)) {
+		t.Fatal("first occurrence in the next fixed window was suppressed")
 	}
 }
 
