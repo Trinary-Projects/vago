@@ -18,6 +18,13 @@ const (
 	// own MetricTTFB: the enricher runs upstream of LLMProcessor, so
 	// llm_ttfb_ms keeps measuring only the model's time to first token.
 	MetricContextEnrich MetricLabel = "context_enrich"
+	// MetricResponseGuard times one fragment's check
+	// (ResponseGuardProcessor). It is deliberately separate from the LLM's
+	// own MetricTTFB for the same reason MetricContextEnrich is: the check
+	// runs downstream of LLMOutputFilterProcessor, after the model's own
+	// response, so llm_ttfb_ms must keep measuring only the model's time to
+	// first token.
+	MetricResponseGuard MetricLabel = "response_guard"
 )
 
 // MetricsData is a single metric measurement.

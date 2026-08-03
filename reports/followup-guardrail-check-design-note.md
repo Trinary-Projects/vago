@@ -171,7 +171,7 @@ is non-blocking and TTS never waits on it.
 | `TextFrame` | Forward first, then accumulate; on `endsWithPunctuation(aggregation)` fire a check and reset the buffer. Skip fragments with no alphanumeric content. |
 | `LLMResponseStartFrame` | Reset per-turn state. If `skipTurn` is set, clear it and guard nothing this turn (the one-retry latch). Forward. |
 | `LLMResponseEndFrame` | Nothing special: any trailing un-punctuated remainder is deliberately **not** checked (it is not a completed sentence). Forward. |
-| `InterruptFrame` | Cancel all in-flight checks for the turn, reset state, `metrics.Reset()`, forward. If the interrupt was **not** self-originated, also clear `skipTurn` so a genuine barge-in mid-regeneration does not leave the next real turn unguarded. |
+| `InterruptFrame` | Cancel all in-flight checks for the turn, reset state, **always clear `skipTurn`**, forward. |
 | `EndFrame` | Cancel in-flight checks, forward. |
 | default | Forward untouched. |
 
@@ -695,8 +695,10 @@ audit judge are logged only.
 
 ## 9. Configuration
 
-Named constants in `disha/guardrail_check.go` — behavioural decisions, not
-deployment config:
+Named constants in `disha/guardrail_record.go` — behavioural decisions, not
+deployment config. (Originally planned for `disha/guardrail_check.go`; moved
+one file earlier per §10 so the record/decorator stacked-PR layer compiles on
+its own before the checker that consumes these constants lands.)
 
 ```go
 guardrailAnchorClass            = "GuardrailAnchor"
@@ -746,12 +748,13 @@ client and runs an equivalent warm-up itself.
 own — the chunk decorator needs the record types, and the checker that produces
 them can land afterwards.
 
-- `disha/guardrail_record.go` — `guardrailCheckRecord`, `guardrailCheck`,
-  `guardrailRecordBox` (`offer` / `offerViolation` / `setAuditVerdict` /
-  `take`), and the S3 payload builder.
-- `disha/guardrail_check.go` — constants, `guardrailChecker` (the
-  `ResponseGuard` implementation), the vector query, band logic, judge call,
-  cancellation, `renderGuardrailBlock`, `appendGuardrailBlock`, the enricher,
+- `disha/guardrail_record.go` — every named constant from §9 (moved here,
+  not `guardrail_check.go`, so this layer compiles standalone),
+  `guardrailCheckRecord`, `guardrailCheck`, `guardrailRecordBox` (`offer` /
+  `offerViolation` / `setAuditVerdict` / `take`), and the S3 payload builder.
+- `disha/guardrail_check.go` — `guardrailChecker` (the `ResponseGuard`
+  implementation), the vector query, band logic, judge call, cancellation,
+  `renderGuardrailBlock`, `appendGuardrailBlock`, the enricher,
   Sentry/RTVI/publish helpers, `setupGuardrailCheck`.
 
 **Band comparison operators are load-bearing:** `similarity > 0.90` interrupts
