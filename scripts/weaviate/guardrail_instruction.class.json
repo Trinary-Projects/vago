@@ -1,0 +1,67 @@
+{
+  "class": "GuardrailInstruction",
+  "vectorizer": "text2vec-huggingface",
+  "moduleConfig": {
+    "text2vec-huggingface": {
+      "endpointURL": "http://jina-embeddings-v5-text-small.hosted-models.svc.cluster.local",
+      "vectorizeClassName": false
+    }
+  },
+  "vectorIndexConfig": {
+    "distance": "cosine"
+  },
+  "properties": [
+    {
+      "name": "instructionText",
+      "dataType": [
+        "text"
+      ],
+      "moduleConfig": {
+        "text2vec-huggingface": {
+          "skip": false,
+          "vectorizePropertyName": false
+        }
+      }
+    },
+    {
+      "name": "title",
+      "dataType": [
+        "text"
+      ],
+      "moduleConfig": {
+        "text2vec-huggingface": {
+          "skip": true,
+          "vectorizePropertyName": false
+        }
+      }
+    },
+    {
+      "name": "documentVersionPath",
+      "dataType": [
+        "text"
+      ],
+      "moduleConfig": {
+        "text2vec-huggingface": {
+          "skip": true,
+          "vectorizePropertyName": false
+        }
+      }
+    },
+    {
+      "name": "isProduction",
+      "dataType": [
+        "boolean"
+      ],
+      "indexFilterable": true,
+      "indexSearchable": false
+    },
+    {
+      "name": "isStaging",
+      "dataType": [
+        "boolean"
+      ],
+      "indexFilterable": true,
+      "indexSearchable": false
+    }
+  ]
+}
