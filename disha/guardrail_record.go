@@ -349,6 +349,25 @@ func (b *guardrailRecordBox) setAuditVerdict(detail guardrailJudgeDetail) bool {
 	return true
 }
 
+// setTurnText updates the pending record's turn text in place, without
+// otherwise touching it. No-op when nothing is pending.
+//
+// It exists because a record can be offered mid-turn (as soon as the first
+// check completes) while the turn itself keeps growing — TextFrames keep
+// streaming in and later fragments keep getting appended to the checker's
+// running turn text. Without this, the boxed record would freeze on
+// whatever partial text existed at offer time, and query_text (the field the
+// live-query corpus is seeded from) would silently be a prefix of what Disha
+// actually said instead of the whole turn.
+func (b *guardrailRecordBox) setTurnText(turnText string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pending == nil {
+		return
+	}
+	b.pending.TurnText = turnText
+}
+
 // take removes and returns the pending record, so one turn maps to exactly
 // one chunk. Resets the lock so the next turn starts unlocked.
 func (b *guardrailRecordBox) take() *guardrailCheckRecord {

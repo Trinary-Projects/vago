@@ -642,10 +642,37 @@ Inherited from protocols.
 
 ### 7.4 RTVI trace
 
-One `server-message` per turn with `data["type"] = "guardrail_check"`, mirroring
-`protocolEnricher.publish` (`disha/protocol_retrieval.go:1102`): `status`,
-`check_count`, `selected_similarity`, `band`, `judge_verdict`, `interrupted`,
-`total_ms`, and `error` when non-empty. Plus one `app.log` line per turn.
+**Corrected 2026-08-03 (implementation, `disha/guardrail_check.go`):** the
+original plan below assumed a per-turn RTVI line mirroring
+`protocolEnricher.publish`, but the checker has no turn-end signal to hang
+that on. `protocolEnricher.publish` fires once because `Enrich` itself runs
+exactly once per turn, before generation. The guardrail checker's `Enrich`
+also runs once per turn, but only to reset per-turn state and inject a
+pending correction (§9's "the only turn-start signal available") — it never
+sees the turn's *end*, and `Check` (the `ResponseGuard`) is called once per
+completed fragment, of which a single turn can produce a dozen (§5.1's
+clause-level fan-out). There is no single call in this design that
+naturally fires exactly once at turn end.
+
+**Decided:** publish one `server-message` with `data["type"] =
+"guardrail_check"` per CHECK that is interesting — judge-band or
+violated — and stay silent for below-threshold checks. This bounds RTVI/S3
+debug-log volume to the same population the judge already pays LLM cost
+for (plus every violation), rather than one line per turn (too coarse to
+see individual bands) or one line per fragment (would flood the stream at
+exactly the volume the fan-out Sentry guard exists to flag, per §5.1's
+"roughly 8-12 fragments" estimate). Every judge call and every interrupt
+still gets its own trace line; only the uninteresting majority (similarity
+below the judge threshold) is silent. Fields per interesting check: `status`,
+`band`, `violated`, `check_index`, `total_ms`, `similarity` (when a hit
+exists), `judge_verdict` (when the judge ran), and `error` when non-empty —
+the per-turn fields `check_count`/`selected_similarity`/`interrupted` from
+the original plan don't apply at check granularity and are dropped in favor
+of the per-check `check_index`/`similarity`/`violated`. `app.log` is
+unaffected by this correction: the checker still logs one line per check
+(interesting or not), which is where the original "plus one app.log line
+per turn" intent lives on, just at check granularity instead of turn
+granularity.
 
 ### 7.5 Backend DB columns
 
