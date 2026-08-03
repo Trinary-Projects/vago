@@ -560,10 +560,12 @@ func TestQueryProtocolsDropsUnusableHits(t *testing.T) {
 
 func TestQueryProtocolsUsesEnvironmentFlag(t *testing.T) {
 	for _, tc := range []struct{ environment, want string }{
-		{"prod", "isProduction"},
+		{"prod", "isProduction"},       // Python voice worker's value
+		{"production", "isProduction"}, // THIS worker's value — see weaviateEnvFlagField
+		{"PRODUCTION", "isProduction"},
 		{"staging", "isStaging"},
-		{"production", "isStaging"}, // must be exactly "prod"
 		{"", "isStaging"},
+		{"typo", "isStaging"},
 	} {
 		t.Run(tc.environment, func(t *testing.T) {
 			t.Setenv("ENVIRONMENT", tc.environment)

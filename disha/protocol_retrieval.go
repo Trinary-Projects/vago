@@ -133,17 +133,27 @@ func protocolRetrievalEnabled() bool {
 }
 
 // weaviateEnvFlagField picks the collection visibility flag to filter on.
-// ENVIRONMENT must be exactly "prod" to select isProduction; anything else
-// (unset, "production", a typo) falls back to isStaging, matching Python's
-// situation_protocol_agent.
+// ENVIRONMENT selects isProduction; anything else (unset, "staging", a typo)
+// falls back to isStaging.
+//
+// It accepts BOTH "prod" and "production", which is a deliberate divergence
+// from Python's situation_protocol_agent (exactly "prod"). The two runtimes are
+// configured differently: the Python voice worker runs ENVIRONMENT=prod, while
+// this worker runs ENVIRONMENT=production (verified on the us-east4 prod
+// deployments, 2026-08-03), and that value cannot simply be changed here — it
+// also feeds the Sentry environment tag and the Pyroscope labels. Matching
+// Python's literal would therefore have made the prod worker query the STAGING
+// protocol corpus, so effect parity beats string parity.
 //
 // Deliberately not protocol-named: the guardrail collections follow the same
 // isProduction/isStaging convention and will reuse this as-is.
 func weaviateEnvFlagField() string {
-	if strings.TrimSpace(os.Getenv("ENVIRONMENT")) == "prod" {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv("ENVIRONMENT"))) {
+	case "prod", "production":
 		return "isProduction"
+	default:
+		return "isStaging"
 	}
-	return "isStaging"
 }
 
 // --------------------------------------------------------------- data types
