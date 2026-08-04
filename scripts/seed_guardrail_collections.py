@@ -36,9 +36,9 @@ Modes (combinable; --inspect always runs first):
   --seed                       insert the fixture guardrails (instructions
                                first, then anchors cross-referencing them)
   --probe                      run nearText queries and print the similarity
-                               distribution -- this is the calibration data the
-                               design note (§9) says is required before the
-                               0.75 / 0.90 bands can be trusted
+                               distribution -- the calibration data behind the
+                               current 0.70 / 0.85 bands (design note §9).
+                               Re-run it whenever the corpus changes
 
 The collection contract comes from disha-hosted-models AGENTS.md /
 validation/weaviate_smoke.py and is NOT optional, and it is IDENTICAL for both
@@ -92,8 +92,8 @@ INSTRUCTION_CLASS = "GuardrailInstruction"
 # Deliberately NOT the same as --threshold: --threshold only controls the
 # "would qualify" summary line, while these two are the real product bands
 # probe results are judged against.
-JUDGE_THRESHOLD = 0.75
-INTERRUPT_THRESHOLD = 0.90
+JUDGE_THRESHOLD = 0.70
+INTERRUPT_THRESHOLD = 0.85
 
 # Single source of truth for the class definitions: the same files you can
 # POST straight to /v1/schema with curl. Do not inline a second copy here.
@@ -554,11 +554,14 @@ def do_probe(url: str, headers: dict, limit: int, threshold: float) -> None:
             f"min={all_scores[0]:.4f} median={statistics.median(all_scores):.4f} max={all_scores[-1]:.4f}"
         )
         print(
-            "  Compare this spread against protocol retrieval's measured floor "
-            "(irrelevant items still scoring 0.54-0.67) -- guardrails compare Disha "
-            "utterance to Disha utterance (same speaker/register/domain), so the design "
-            "note expects this floor to sit HIGHER, meaning 0.75 may already be inside "
-            "the noise. This is exactly the data needed to tell."
+            f"  Bands in force: judge >= {JUDGE_THRESHOLD}, interrupt > {INTERRUPT_THRESHOLD}. "
+            "These were set from a fixture run measuring true positives at "
+            "0.8892/0.8277/0.7768/0.7491 against true negatives at 0.6525/0.5692/0.4654 "
+            "-- an empty gap between 0.6525 and 0.7491, which is where 0.70 sits. "
+            "Two things to watch as the real corpus grows: whether any true positive "
+            "drops toward the 0.54-0.67 noise floor this model shows even on unrelated "
+            "text, and whether anything at all clears the interrupt band (nothing in "
+            "the fixture run exceeded 0.8892, so that band was dead at 0.90)."
         )
 
 
