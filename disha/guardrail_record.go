@@ -103,8 +103,10 @@ const (
 	// Langfuse prompt before rollout.
 	//
 	// The prompt must satisfy three things, all asserted by runJudge:
-	//   1. It renders with exactly two variables: guardrail_instruction and
-	//      fragment.
+	//   1. It renders with exactly two variables: guardrail and fragment. These
+	//      must match the prompt's placeholders exactly -- sending
+	//      "guardrail_instruction" to a {{guardrail}} prompt rendered the
+	//      guardrail line EMPTY on staging call d822753b.
 	//   2. It is sent as the ONLY message, with role "system" — there is no
 	//      separate user message carrying the fragment, so the prompt itself
 	//      has to place {{ fragment }}.
