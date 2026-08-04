@@ -61,8 +61,15 @@ const (
 	// This is fixture data, not live traffic. The S3 record carries every
 	// candidate from day one so these can be re-derived from real calls without
 	// a rerun.
+	// TEMPORARILY LOWERED to 0.55 (Jaideep, 2026-08-04) to exercise the judge
+	// band on staging: real benign traffic tops out at 0.6282 across calls
+	// 287f66ae and 891aaa9f, so at 0.70 no live turn ever reached the judge
+	// and the prompt stayed untested. 0.55 puts ~5 of 6 fragments per call
+	// into the band. NOT a shippable value — it gates almost everything, so
+	// the judge verdict becomes the only thing preventing false interrupts.
+	// Restore to 0.70 (the calibrated value above) before rollout.
 	guardrailInterruptThreshold = 0.85
-	guardrailJudgeThreshold     = 0.70
+	guardrailJudgeThreshold     = 0.55
 
 	// guardrailQueryLimit is how many anchors to fetch before dedupe-by-
 	// instruction-id and top-1 selection.
