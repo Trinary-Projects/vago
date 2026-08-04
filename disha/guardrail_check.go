@@ -236,7 +236,7 @@ func newGuardrailJudgeClientFactory(deps Deps, logger *log.Logger, userID, conve
 // with a boolean verdict. Field name is an assumption pending the real
 // Langfuse prompt (design note §5.6 TODO) — until it exists every real judge
 // call fails at GetDocument below and this band always fails open, so only
-// the >0.90 band functions.
+// the >0.85 band functions.
 type guardrailJudgeOutput struct {
 	Violated bool `json:"violated"`
 }
@@ -271,7 +271,7 @@ func guardrailVerdictString(violated bool) string {
 //
 // callCtx is the call's own long-lived context (TaskContext.Ctx), injected
 // separately from the per-check ctx Check() receives from
-// ResponseGuardProcessor. It exists for exactly one purpose: the >0.90
+// ResponseGuardProcessor. It exists for exactly one purpose: the >0.85
 // band's fire-and-forget audit judge (spawnAuditJudge) must survive the very
 // interrupt its own violation triggers, and that interrupt is what cancels
 // the turn ctx Check() was given. Deriving the audit's bound context from
@@ -353,7 +353,7 @@ func (c *guardrailChecker) emitter() serverMessageEmitter {
 
 // Check implements voicepipelinecore.ResponseGuard. ResponseGuardProcessor
 // invokes it on its own background goroutine per completed fragment
-// (spawnCheck) — never on the pipeline goroutine — so the 0.75-0.90 band's
+// (spawnCheck) — never on the pipeline goroutine — so the 0.70-0.85 band's
 // blocking judge call below is safe to run inline: it blocks this
 // goroutine, never TTS/playback.
 func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
@@ -376,7 +376,7 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 		check.Err = err.Error()
 		// NOT "below": we never obtained a similarity, so recording this as a
 		// below-threshold sample would pollute the S3 calibration dataset with
-		// a non-observation that reads as "scored under 0.75".
+		// a non-observation that reads as "scored under 0.70".
 		check.Band = "error"
 		check.TotalLatencyMs = msSince(started)
 		c.reportFailure(ctx, err, "guardrail_check", map[string]any{"fragment_chars": len(fragment)})
@@ -537,7 +537,7 @@ func guardrailBestSimilarityIndex(checks []guardrailCheck) int {
 
 // runJudge renders the judge prompt and runs the hedged one-shot judge
 // call, blocking the CALLING goroutine — a Check() background goroutine for
-// the 0.75-0.90 band, or the audit fire-and-forget goroutine for the >0.90
+// the 0.70-0.85 band, or the audit fire-and-forget goroutine for the >0.85
 // band. judgeCtx bounds the LLM call itself; reportCtx is the ctx checked
 // to decide the Sentry-exemption for failures — the check's own ctx for the
 // blocking judge-band path, or the call ctx for the audit path — mirroring
@@ -554,7 +554,7 @@ func guardrailBestSimilarityIndex(checks []guardrailCheck) int {
 //
 // TODO (launch blocker, design note §5.6): guardrailJudgePromptName does not
 // exist in DocumentStore yet, so every real call currently fails at
-// GetDocument and this band always fails open — only the >0.90 band
+// GetDocument and this band always fails open — only the >0.85 band
 // functions until the real Langfuse prompt lands.
 func (c *guardrailChecker) runJudge(judgeCtx, reportCtx context.Context, instructionText, fragment string, auditOnly bool) (bool, guardrailJudgeDetail) {
 	detail := guardrailJudgeDetail{Ran: true, AuditOnly: auditOnly}
@@ -620,11 +620,11 @@ func (c *guardrailChecker) runJudge(judgeCtx, reportCtx context.Context, instruc
 	return violated, detail
 }
 
-// spawnAuditJudge runs the >0.90 band's audit-only judge, fire-and-forget,
+// spawnAuditJudge runs the >0.85 band's audit-only judge, fire-and-forget,
 // purely to record whether the interrupt it accompanies was justified
 // (design note §5.6): verdict violated -> true positive; verdict not
 // violated -> false positive, meaning the anchor that fired the interrupt
-// is pulling in unrelated sentences above 0.90.
+// is pulling in unrelated sentences above 0.85.
 //
 // Derived from c.callCtx, NOT the check ctx Check() was given, because that
 // ctx is what the interrupt this very check just fired will cancel — the

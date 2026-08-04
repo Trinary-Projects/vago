@@ -248,8 +248,8 @@ func TestGuardrailCheckBelowThresholdNeverCallsJudge(t *testing.T) {
 // -------------------------------------------------------------- boundaries
 
 func TestGuardrailCheckBoundaryAtInterruptThresholdGoesToJudgeBand(t *testing.T) {
-	// Exactly 0.90: "> 0.90" is false, so this must land in the judge band
-	// (0.90 >= 0.75), NOT interrupt on similarity alone.
+	// Exactly 0.85: "> 0.85" is false, so this must land in the judge band
+	// (0.85 >= 0.70), NOT interrupt on similarity alone.
 	body := fmt.Sprintf(guardrailAnchorResponseTemplate, guardrailAnchorHit("a1", "instr-boundary-90", "instruction", distanceFor(guardrailInterruptThreshold)))
 	client := newStubWeaviate(t, body, nil)
 	docs := newTestGuardrailDocs(t, "judge {{fragment}}")
@@ -263,7 +263,7 @@ func TestGuardrailCheckBoundaryAtInterruptThresholdGoesToJudgeBand(t *testing.T)
 	checker.Check(context.Background(), "fragment")
 	record := box.take()
 	if record == nil || record.Checks[record.SelectedIndex].Band != "judge" {
-		t.Fatalf("band at exactly 0.90 = %+v, want judge", record)
+		t.Fatalf("band at exactly 0.85 = %+v, want judge", record)
 	}
 	// Only the blocking judge call, no separate audit at this band.
 	time.Sleep(20 * time.Millisecond)
@@ -273,7 +273,7 @@ func TestGuardrailCheckBoundaryAtInterruptThresholdGoesToJudgeBand(t *testing.T)
 }
 
 func TestGuardrailCheckBoundaryAtJudgeThresholdGoesToJudgeBand(t *testing.T) {
-	// Exactly 0.75: ">= 0.75" is true, so this must be judged, not "below".
+	// Exactly 0.70: ">= 0.70" is true, so this must be judged, not "below".
 	body := fmt.Sprintf(guardrailAnchorResponseTemplate, guardrailAnchorHit("a1", "instr-boundary-75", "instruction", distanceFor(guardrailJudgeThreshold)))
 	client := newStubWeaviate(t, body, nil)
 	docs := newTestGuardrailDocs(t, "judge {{fragment}}")
@@ -283,7 +283,7 @@ func TestGuardrailCheckBoundaryAtJudgeThresholdGoesToJudgeBand(t *testing.T) {
 	checker.Check(context.Background(), "fragment")
 	record := box.take()
 	if record == nil || record.Checks[record.SelectedIndex].Band != "judge" {
-		t.Fatalf("band at exactly 0.75 = %+v, want judge", record)
+		t.Fatalf("band at exactly 0.70 = %+v, want judge", record)
 	}
 }
 
@@ -493,7 +493,7 @@ func TestGuardrailAuditJudgeRecordsVerdictOnPendingRecord(t *testing.T) {
 
 	violated := checker.Check(context.Background(), "fragment")
 	if !violated {
-		t.Fatal("expected the >0.90 band to interrupt")
+		t.Fatal("expected the >0.85 band to interrupt")
 	}
 
 	select {
@@ -570,7 +570,7 @@ func TestGuardrailAuditVerdictArrivingAfterTakeIsDroppedWithoutPanic(t *testing.
 
 	violated := checker.Check(context.Background(), "fragment")
 	if !violated {
-		t.Fatal("expected the >0.90 band to interrupt")
+		t.Fatal("expected the >0.85 band to interrupt")
 	}
 
 	// Take the record well before the (artificially delayed) audit judge can
