@@ -13,7 +13,14 @@ import (
 // forwarding path is unconditional, not merely "usually" untouched.
 func TestResponseGuardTextFramesForwardUnchanged(t *testing.T) {
 	fix := newTestFixture(t)
-	guard := func(context.Context, string) bool { return true }
+	// Hold the verdict briefly. A true verdict broadcasts an InterruptFrame,
+	// and that interrupt legitimately purges interruptible frames still queued
+	// downstream — real pipeline behaviour, but unrelated to what this test
+	// asserts, and it raced the second TextFrame reaching the sink.
+	guard := func(context.Context, string) bool {
+		time.Sleep(40 * time.Millisecond)
+		return true
+	}
 	p := NewResponseGuardProcessor(fix.TaskCtx, guard)
 
 	texts := []string{"Hello, ", "world."}
@@ -25,7 +32,7 @@ func TestResponseGuardTextFramesForwardUnchanged(t *testing.T) {
 	down, _ := runProcessorTest(t, fix, runConfig{
 		processor:    p,
 		framesToSend: frames,
-		settleDelay:  50 * time.Millisecond,
+		settleDelay:  120 * time.Millisecond,
 		sendEndFrame: true,
 	})
 
@@ -397,6 +404,93 @@ func TestEndsWithSentenceTerminator(t *testing.T) {
 	} {
 		if got := endsWithSentenceTerminator(tc.in); got != tc.want {
 			t.Errorf("endsWithSentenceTerminator(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Regression for staging conversation 287f66ae: LLM deltas do not align to
+// sentence boundaries, and testing only whether the buffer ENDS with a
+// terminator silently merged two sentences into one fragment. A delta that
+// crosses a boundary must still yield one fragment per sentence.
+func TestSplitSentences(t *testing.T) {
+	for _, tc := range []struct {
+		in        string
+		want      []string
+		remainder string
+	}{
+		// The live failure: boundary inside the delta, not at its end.
+		{"सकती। अगर आपको", []string{"सकती।"}, "अगर आपको"},
+		{"One. Two. Three", []string{"One.", "Two."}, "Three"},
+		{"One. Two.", []string{"One.", "Two."}, ""},
+		{"No terminator yet", nil, "No terminator yet"},
+		{"Ends exactly here.", []string{"Ends exactly here."}, ""},
+		{`He said "stop." Then left.`, []string{`He said "stop."`, "Then left."}, ""},
+		{"Really?! Yes.", []string{"Really?!", "Yes."}, ""},
+		{"पहला। दूसरा॥ तीसरा", []string{"पहला।", "दूसरा॥"}, "तीसरा"},
+		{"", nil, ""},
+	} {
+		got, rem := splitSentences(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("splitSentences(%q) sentences = %q, want %q", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("splitSentences(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+			}
+		}
+		if rem != tc.remainder {
+			t.Errorf("splitSentences(%q) remainder = %q, want %q", tc.in, rem, tc.remainder)
+		}
+	}
+}
+
+// The end-to-end shape of the same regression: a single TextFrame carrying two
+// sentences must fire two checks, not one merged check.
+func TestResponseGuardSplitsSentencesInsideOneDelta(t *testing.T) {
+	fix := newTestFixture(t)
+
+	var mu sync.Mutex
+	var seen []string
+	guard := func(_ context.Context, fragment string) bool {
+		mu.Lock()
+		seen = append(seen, fragment)
+		mu.Unlock()
+		return false
+	}
+	p := NewResponseGuardProcessor(fix.TaskCtx, guard)
+
+	_, _ = runProcessorTest(t, fix, runConfig{
+		processor: p,
+		framesToSend: []Frame{
+			NewLLMResponseStartFrame(time.Now()),
+			// One delta, two boundaries and a dangling remainder.
+			NewTextFrame("I am a health coach. Please see a doctor. Any other"),
+			NewTextFrame(" symptoms?"),
+		},
+		settleDelay:  100 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 checks (one per sentence), got %d: %q", len(seen), seen)
+	}
+	want := map[string]bool{
+		"I am a health coach.": false,
+		"Please see a doctor.": false,
+		"Any other symptoms?":  false,
+	}
+	for _, f := range seen {
+		if _, ok := want[f]; !ok {
+			t.Fatalf("unexpected fragment %q (all: %q)", f, seen)
+		}
+		want[f] = true
+	}
+	for f, ok := range want {
+		if !ok {
+			t.Fatalf("fragment %q was never checked (all: %q)", f, seen)
 		}
 	}
 }

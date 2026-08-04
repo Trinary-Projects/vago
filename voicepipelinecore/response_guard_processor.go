@@ -44,6 +44,65 @@ func endsWithSentenceTerminator(s string) bool {
 	return false
 }
 
+// splitSentences cuts s into its complete sentences plus whatever trailing
+// text has not yet been terminated.
+//
+// This exists because testing only whether the buffer ENDS with a terminator
+// silently loses boundaries. LLM deltas do not align to sentences: a chunk
+// arriving as "…सकती। अगर आपको…" leaves the buffer ending in "आपको", so the
+// boundary inside it is skipped and two sentences merge into one fragment.
+// Observed live on staging conversation 287f66ae — a three-sentence turn
+// produced a first fragment covering two of them, which defeats the point of
+// per-sentence checking: the whole reason to check fragment-by-fragment is to
+// fire on sentence one while TTS is still on it.
+//
+// A terminator run is consumed whole ("?!", "…"), as are any closing
+// delimiters and the whitespace that follows, so `He said "stop." Then…`
+// yields two sentences and no stray leading space.
+func splitSentences(s string) (sentences []string, remainder string) {
+	start := 0
+	i := 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			break
+		}
+		if !isSentenceTerminator(r) {
+			i += size
+			continue
+		}
+		// Consume the whole terminator run, then any closing delimiters, then
+		// the trailing whitespace that separates this sentence from the next.
+		end := i + size
+		for end < len(s) {
+			r2, s2 := utf8.DecodeRuneInString(s[end:])
+			if r2 == utf8.RuneError && s2 <= 1 {
+				break
+			}
+			if isSentenceTerminator(r2) || isClosingDelimiter(r2) {
+				end += s2
+				continue
+			}
+			break
+		}
+		cut := end
+		for cut < len(s) {
+			r3, s3 := utf8.DecodeRuneInString(s[cut:])
+			if r3 == utf8.RuneError && s3 <= 1 {
+				break
+			}
+			if !unicode.IsSpace(r3) {
+				break
+			}
+			cut += s3
+		}
+		sentences = append(sentences, s[start:end])
+		start = cut
+		i = cut
+	}
+	return sentences, s[start:]
+}
+
 func isSentenceTerminator(r rune) bool {
 	switch r {
 	case '.', '!', '?',
@@ -183,23 +242,28 @@ func (p *ResponseGuardProcessor) handleText(text string) {
 	}
 	p.buffer += text
 
+	// Split rather than test-and-flush: one delta can carry several sentence
+	// boundaries, or end mid-sentence after crossing one. See splitSentences.
+	sentences, remainder := splitSentences(p.buffer)
+	p.buffer = remainder
+
 	var (
-		fire     bool
-		fragment string
-		turnCtx  context.Context
+		fragments []string
+		turnCtx   context.Context
 	)
-	if endsWithSentenceTerminator(p.buffer) {
-		fragment = p.buffer
-		p.buffer = ""
-		if containsAlnum(fragment) {
-			p.checks++
-			fire = true
-			turnCtx = p.turnCtx
+	for _, sentence := range sentences {
+		if !containsAlnum(sentence) {
+			continue
 		}
+		p.checks++
+		fragments = append(fragments, sentence)
+	}
+	if len(fragments) > 0 {
+		turnCtx = p.turnCtx
 	}
 	p.mu.Unlock()
 
-	if fire {
+	for _, fragment := range fragments {
 		p.spawnCheck(turnCtx, fragment)
 	}
 }
