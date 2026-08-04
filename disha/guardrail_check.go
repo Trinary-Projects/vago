@@ -428,6 +428,17 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 func (c *guardrailChecker) accumulate(fragment string) (index int, turnText string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Re-insert the separator splitSentences consumed when it cut this
+	// fragment off. Fragments are deliberately whitespace-free so the vector
+	// query and the calibration dataset stay tidy, but turnText is a different
+	// consumer: it becomes GuardrailCheckMetrics.QueryText and, backend-side,
+	// GuardrailLiveQueryAnchor's own text. Without this the corpus accumulates
+	// run-together sentences — observed on staging call 891aaa9f, where Disha
+	// said "…रह गई थी। जैसा कि…" and the record persisted "…थी।जैसा कि…" —
+	// which reads wrong and embeds slightly worse than what was actually said.
+	if c.turnText != "" && !strings.HasSuffix(c.turnText, " ") && !strings.HasPrefix(fragment, " ") {
+		c.turnText += " "
+	}
 	c.turnText += fragment
 	c.checkCount++
 	return c.checkCount, c.turnText

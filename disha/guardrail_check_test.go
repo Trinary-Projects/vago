@@ -224,7 +224,11 @@ func TestGuardrailCheckJudgeBandNotViolatedContinues(t *testing.T) {
 }
 
 func TestGuardrailCheckBelowThresholdNeverCallsJudge(t *testing.T) {
-	body := fmt.Sprintf(guardrailAnchorResponseTemplate, guardrailAnchorHit("a1", "instr-4", "unrelated instruction", distanceFor(0.60)))
+	// Derived from the constant, not hardcoded: the judge threshold is a knob
+	// that moves (it was 0.75, then 0.70, now 0.55 for staging testing), and a
+	// literal here silently becomes a judge-band value the moment it drops.
+	body := fmt.Sprintf(guardrailAnchorResponseTemplate,
+		guardrailAnchorHit("a1", "instr-4", "unrelated instruction", distanceFor(guardrailJudgeThreshold-0.05)))
 	client := newStubWeaviate(t, body, nil)
 	factory := func(map[string]any) (voicepipelinecore.LLMClient, error) {
 		t.Fatal("judge must not be called below the judge threshold")
@@ -712,5 +716,41 @@ func TestGuardrailEnrichResetsPerTurnState(t *testing.T) {
 	}
 	if checker.fanoutSentryFired {
 		t.Error("fanoutSentryFired = true, want false")
+	}
+}
+
+// Regression for staging call 891aaa9f. splitSentences hands over
+// whitespace-free fragments, so naively concatenating them produced
+// "…थी।जैसा कि…" for a turn Disha actually spoke as "…थी। जैसा कि…". That
+// string becomes GuardrailLiveQueryAnchor's text backend-side, so the corpus
+// would grow run-together sentences.
+func TestGuardrailAccumulateRestoresSentenceSpacing(t *testing.T) {
+	c := &guardrailChecker{}
+
+	if idx, turn := c.accumulate("हाय जयदीप, हमारी बात अधूरी रह गई थी।"); idx != 1 ||
+		turn != "हाय जयदीप, हमारी बात अधूरी रह गई थी।" {
+		t.Fatalf("first fragment: index=%d turn=%q", idx, turn)
+	}
+
+	idx, turn := c.accumulate("जैसा कि आपने बताया।")
+	if idx != 2 {
+		t.Fatalf("index = %d, want 2", idx)
+	}
+	want := "हाय जयदीप, हमारी बात अधूरी रह गई थी। जैसा कि आपने बताया।"
+	if turn != want {
+		t.Fatalf("turn text = %q, want %q", turn, want)
+	}
+}
+
+// Whitespace already present on either side must not be doubled.
+func TestGuardrailAccumulateDoesNotDoubleSpaces(t *testing.T) {
+	c := &guardrailChecker{}
+	c.accumulate("One. ")
+	_, turn := c.accumulate(" Two.")
+	if turn != "One.  Two." && turn != "One. Two." {
+		t.Fatalf("turn text = %q, want no inserted third space", turn)
+	}
+	if turn == "One.   Two." {
+		t.Fatal("inserted a space despite both sides already having one")
 	}
 }
