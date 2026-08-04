@@ -346,16 +346,29 @@ test asserts the caller override reaches the request body.
 
 Prompt comes from `DocumentStore` (`document:{name}:{env}`), **not** hardcoded.
 
-> **TODO (launch blocker):** the real Langfuse prompt name is not yet decided
-> and the prompt does not exist. This note assumes
-> `follow_up_call/guardrail_judge`. Until that key is pre-rendered into Redis by
-> Disha's Langfuse sync, every judge call fails and the 0.75–0.90 band
-> fails open to "not violated" — i.e. only the >0.90 band works. Replace the
-> constant and confirm the variable names when the prompt lands.
+**Prompt name (set 2026-08-04): `followup_call/guardrails/test_prompt`.** A
+**test** prompt, enough to exercise the 0.75–0.90 band end to end on staging;
+swap it for the production Langfuse prompt before rollout. Read as
+`document:{name}:{ENVIRONMENT}`, so it must be pre-rendered into Redis by
+Disha's Langfuse sync before the band does anything — until the key exists
+every judge call fails at `GetDocument` and the band fails open, leaving only
+the >0.90 band functioning.
 
-Assumed variables: the guardrail `instructionText` and the fragment under
-review. Assumed output contract: a JSON object with a boolean verdict;
-**malformed, empty, or unparseable output is treated as not-violated** (§8).
+The prompt must satisfy three things, all enforced by `runJudge`:
+
+1. It renders with exactly two variables, `guardrail_instruction` and
+   `fragment`.
+2. It is sent as the **only** message, role `system`. There is no separate
+   user message carrying the fragment, so the prompt itself must place
+   `{{ fragment }}`.
+3. It returns a bare JSON object `{"violated": true|false}`. A
+   `<think>…</think>` preamble is stripped first.
+
+Note the failure mode this creates: **malformed, empty, or unparseable output
+is treated as not-violated** (§8), so a prompt that chats around its JSON
+silently disables the judge band rather than erroring loudly. Verify the raw
+output shape on the first staging call rather than inferring it from the band
+appearing to work.
 
 `prompt_metadata` carries `system_prompt_name`, the **resolved** version, and
 `system_prompt_variables` — the exact variables used to render it — per the

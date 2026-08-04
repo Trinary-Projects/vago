@@ -62,15 +62,24 @@ const (
 	// taken with judge_verdict empty. See guardrailRecordBox.setAuditVerdict.
 	guardrailAuditVerdictWait = 3 * time.Second
 
-	// guardrailJudgePromptName is the DocumentStore prompt for the judge LLM.
+	// guardrailJudgePromptName is the DocumentStore prompt for the judge LLM,
+	// read from Redis as document:{name}:{ENVIRONMENT}.
 	//
-	// TODO (launch blocker, design note §5.6): the real Langfuse prompt name
-	// is not yet decided and this prompt does not exist yet. Until
-	// document:{name}:{env} is pre-rendered into Redis, every judge call fails
-	// and the 0.75-0.90 band fails open to "not violated" — only the >0.90
-	// band works. Replace this constant and confirm the variable names
-	// (instructionText, fragment) when the prompt lands.
-	guardrailJudgePromptName  = "follow_up_call/guardrail_judge"
+	// This is a TEST prompt (Jaideep, 2026-08-04), enough to exercise the
+	// 0.75-0.90 band end to end on staging. Swap it for the production
+	// Langfuse prompt before rollout.
+	//
+	// The prompt must satisfy three things, all asserted by runJudge:
+	//   1. It renders with exactly two variables: guardrail_instruction and
+	//      fragment.
+	//   2. It is sent as the ONLY message, with role "system" — there is no
+	//      separate user message carrying the fragment, so the prompt itself
+	//      has to place {{ fragment }}.
+	//   3. It returns a bare JSON object {"violated": true|false}. Anything
+	//      unparseable fails open to not-violated (§8), so a prompt that
+	//      chats around the JSON silently disables the band rather than
+	//      erroring loudly. A <think>...</think> preamble is stripped first.
+	guardrailJudgePromptName  = "followup_call/guardrails/test_prompt"
 	guardrailJudgeUsecaseType = "follow_up_guardrail_judge"
 
 	guardrailS3KeyPrefix = "guardrail_check"
