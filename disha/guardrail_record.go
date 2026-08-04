@@ -25,23 +25,44 @@ const (
 	// guardrailInterruptThreshold and guardrailJudgeThreshold are cosine
 	// similarity (1 - distance) bands on the top-1 deduped hit for one
 	// fragment:
-	//   > 0.90            -> interrupt immediately; also run the judge
+	//   > 0.85            -> interrupt immediately; also run the judge
 	//                        audit-only, off the critical path.
-	//   0.75 <= x <= 0.90 -> call the judge and wait on it; violated ->
+	//   0.70 <= x <= 0.85 -> call the judge and wait on it; violated ->
 	//                        interrupt.
-	//   < 0.75            -> nothing.
+	//   < 0.70            -> nothing.
 	//
 	// The comparison operators are load-bearing: > interrupts, >= judges, so
-	// exactly 0.90 falls in the judge band. Go and
-	// scripts/seed_guardrail_collections.py must agree exactly.
+	// exactly 0.85 falls in the judge band. Go and
+	// scripts/seed_guardrail_collections.py must agree exactly, or the
+	// calibration tool reports bands production does not use.
 	//
-	// Uncalibrated and knowingly assumed (design note §9): guardrails compare
-	// Disha utterance to Disha utterance — same speaker, same register, same
-	// domain — so the high similarity floor observed on protocol retrieval is
-	// likely higher still here. The S3 record carries every candidate from day
-	// one so the bands can be recalibrated without a rerun.
-	guardrailInterruptThreshold = 0.90
-	guardrailJudgeThreshold     = 0.75
+	// Calibrated 2026-08-04 against the seeded fixture corpus (7 probe queries,
+	// 4 guardrails, 16 anchors) rather than assumed:
+	//
+	//   true positives   0.8892  stop your BP tablets
+	//                    0.8277  take one tablet of paracetamol
+	//                    0.7768  you will definitely lose weight
+	//                    0.7491  sounds like it could be your thyroid
+	//   true negatives   0.6525  ask your doctor before changing medication
+	//                    0.5692  let's talk about your diet plan instead
+	//                    0.4654  that's a great question
+	//
+	// The first values tried, 0.75/0.90, were wrong in both directions. Nothing
+	// reached 0.90, so the interrupt band never fired and every violation took
+	// the slow judge path — the pre-speech fast path was dead. And the hedged
+	// diagnosis at 0.7491 missed the judge band by 0.0009 despite being a
+	// genuine violation.
+	//
+	// Nothing lands between 0.6525 and 0.7491, so 0.70 separates with margin on
+	// both sides. Note the floor really is high, as the design note predicted:
+	// wholly unrelated small talk still scores 0.4654, so absolute distance from
+	// zero means nothing here — only distance from the noise band does.
+	//
+	// This is fixture data, not live traffic. The S3 record carries every
+	// candidate from day one so these can be re-derived from real calls without
+	// a rerun.
+	guardrailInterruptThreshold = 0.85
+	guardrailJudgeThreshold     = 0.70
 
 	// guardrailQueryLimit is how many anchors to fetch before dedupe-by-
 	// instruction-id and top-1 selection.
@@ -63,7 +84,7 @@ const (
 	guardrailCheckTimeout = 3 * time.Second
 
 	// guardrailAuditVerdictWait bounds how long the chunk decorator's box wait
-	// for the >0.90 band's fire-and-forget audit judge before the record is
+	// for the >0.85 band's fire-and-forget audit judge before the record is
 	// taken with judge_verdict empty. See guardrailRecordBox.setAuditVerdict.
 	guardrailAuditVerdictWait = 3 * time.Second
 
@@ -71,7 +92,7 @@ const (
 	// read from Redis as document:{name}:{ENVIRONMENT}.
 	//
 	// This is a TEST prompt (Jaideep, 2026-08-04), enough to exercise the
-	// 0.75-0.90 band end to end on staging. Swap it for the production
+	// 0.70-0.85 band end to end on staging. Swap it for the production
 	// Langfuse prompt before rollout.
 	//
 	// The prompt must satisfy three things, all asserted by runJudge:
@@ -117,7 +138,7 @@ type guardrailCandidateHit struct {
 }
 
 // guardrailJudgeDetail records what the judge LLM did for one check — either
-// the 0.75-0.90 band's blocking-within-the-check-goroutine call, or the >0.90
+// the 0.70-0.85 band's blocking-within-the-check-goroutine call, or the >0.85
 // band's fire-and-forget audit of an already-fired interrupt.
 type guardrailJudgeDetail struct {
 	Ran       bool
@@ -236,7 +257,7 @@ func (b *guardrailRecordBox) offerViolation(record guardrailCheckRecord) {
 	b.locked = true
 }
 
-// setAuditVerdict fills the >0.90 band's fire-and-forget audit judge verdict
+// setAuditVerdict fills the >0.85 band's fire-and-forget audit judge verdict
 // onto the pending record's selected check. Returns false when there is no
 // pending record — it was already taken — so the caller can log that the
 // verdict arrived too late instead of silently dropping it.

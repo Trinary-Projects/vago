@@ -132,7 +132,7 @@ type GuardrailCheckMetrics struct {
 	E2EMs           float64  `json:"e2e_ms"`
 	SimilarityScore *float64 `json:"similarity_score"`
 	// JudgeVerdict is "yes" | "no" | "" — the judge did not run (similarity
-	// below the judge band, or the >0.90 band's fire-and-forget audit judge
+	// below the judge band, or the >0.85 band's fire-and-forget audit judge
 	// had not resolved by the time the record was taken).
 	JudgeVerdict string `json:"judge_verdict,omitempty"`
 	Interrupted  bool   `json:"interrupted"`

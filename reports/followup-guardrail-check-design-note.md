@@ -21,9 +21,9 @@ Two similarity bands:
 
 | Cosine similarity | Action |
 |---|---|
-| **> 0.90** | Interrupt and regenerate immediately, on similarity alone. Also run the judge **audit-only**, off the critical path, to detect false positives. |
-| **0.75 – 0.90** | Call an ultra-fast judge LLM. Violated → interrupt and regenerate. Not violated → continue. |
-| **< 0.75** | Nothing. |
+| **> 0.85** | Interrupt and regenerate immediately, on similarity alone. Also run the judge **audit-only**, off the critical path, to detect false positives. |
+| **0.70 – 0.85** | Call an ultra-fast judge LLM. Violated → interrupt and regenerate. Not violated → continue. |
+| **< 0.70** | Nothing. |
 
 Unlike protocol retrieval this step is **not** on the critical path and has **no
 hard latency budget** — it never delays a turn. Its cost is that Disha may
@@ -270,13 +270,13 @@ counterpart here.
 
 Given the top-1 hit for a fragment:
 
-- **similarity > 0.90** → return violated **immediately**. Separately spawn the
+- **similarity > 0.85** → return violated **immediately**. Separately spawn the
   **audit judge** (§5.6), fire-and-forget.
-- **0.75 ≤ similarity ≤ 0.90** → call the judge and wait for it *within this
+- **0.70 ≤ similarity ≤ 0.85** → call the judge and wait for it *within this
   check's goroutine* (never on the pipeline goroutine). Violated → return
   violated. Not violated, judge error, judge timeout, or malformed output →
   return not-violated (**fail open**, §8).
-- **similarity < 0.75** → return not-violated.
+- **similarity < 0.70** → return not-violated.
 
 All checks for a turn share one `context.WithCancel` derived from the turn
 context. **The first check to return violated cancels that context**, so every
@@ -330,7 +330,7 @@ needed — but note that `/endpoints` is **not** a valid way to validate a
 
 This mattered because these are fixed-endpoint configs with no health polling:
 unlike the gemma case there is no poll to catch a bad id, so a wrong model would
-fail 100% of judge calls and silently degrade the 0.75–0.90 band to fail-open.
+fail 100% of judge calls and silently degrade the 0.70–0.85 band to fail-open.
 
 **`MaxTokens` 512 is empirically justified, not a guess.** A live call at
 `max_tokens: 16` with `reasoning: {"effort":"low"}` returned
@@ -347,12 +347,12 @@ test asserts the caller override reaches the request body.
 Prompt comes from `DocumentStore` (`document:{name}:{env}`), **not** hardcoded.
 
 **Prompt name (set 2026-08-04): `followup_call/guardrails/test_prompt`.** A
-**test** prompt, enough to exercise the 0.75–0.90 band end to end on staging;
+**test** prompt, enough to exercise the 0.70–0.85 band end to end on staging;
 swap it for the production Langfuse prompt before rollout. Read as
 `document:{name}:{ENVIRONMENT}`, so it must be pre-rendered into Redis by
 Disha's Langfuse sync before the band does anything — until the key exists
 every judge call fails at `GetDocument` and the band fails open, leaving only
-the >0.90 band functioning.
+the >0.85 band functioning.
 
 The prompt must satisfy three things, all enforced by `runJudge`:
 
@@ -375,14 +375,14 @@ appearing to work.
 standing strict prompt-metadata rule. `usecase_type` is
 `follow_up_guardrail_judge`.
 
-**The audit judge** exists only to close the loop on the >0.90 band, where the
+**The audit judge** exists only to close the loop on the >0.85 band, where the
 interrupt fires on similarity alone. It runs the *same* prompt against the same
 fragment, concurrently with the regeneration, purely to record whether the
 interrupt was justified:
 
 - verdict **violated** → true positive.
 - verdict **not violated** → **false positive**: we interrupted and regenerated
-  for nothing, which points at an anchor pulling unrelated sentences over 0.90.
+  for nothing, which points at an anchor pulling unrelated sentences over 0.85.
 
 It is fire-and-forget on a context **derived from the call context, not the
 cancelled check context** (it must survive the very cancellation its own
@@ -529,7 +529,7 @@ seconds later, gets the complete record with the verdict present.
 
 This is the difference between having and not having the false-positive signal:
 boxing immediately would attach the record to the partial chunk with
-`judge_verdict` null, which is precisely the data the >0.90 audit exists to
+`judge_verdict` null, which is precisely the data the >0.85 audit exists to
 collect.
 
 Non-triggering turns are unaffected — one chunk, record boxed as soon as the
@@ -599,7 +599,7 @@ exactly the data needed to tune the bands later.
 { "chunk_id": "...", "conversation_id": "...", "user_id": "...",
   "bot_type": "follow_up", "checked_at": "...",
   "turn_text": "the entire Disha turn as generated",
-  "thresholds": {"metric": "cosine_similarity", "interrupt": 0.9, "judge": 0.75},
+  "thresholds": {"metric": "cosine_similarity", "interrupt": 0.85, "judge": 0.70},
   "check_count": 4, "selected_index": 2, "interrupted": true,
   "checks": [
     { "index": 0, "fragment": "...", "latency_ms": {"vector_query": 0, "judge": 0, "total": 0},
@@ -727,8 +727,8 @@ its own before the checker that consumes these constants lands.)
 ```go
 guardrailAnchorClass            = "GuardrailAnchor"
 guardrailInstructionClass       = "GuardrailInstruction"
-guardrailInterruptThreshold     = 0.90
-guardrailJudgeThreshold         = 0.75
+guardrailInterruptThreshold     = 0.85
+guardrailJudgeThreshold         = 0.70
 guardrailQueryLimit             = 10
 guardrailFanoutSentryThreshold  = 10
 guardrailCheckTimeout           = 3 * time.Second  // per check, generous: not on the critical path
@@ -743,14 +743,33 @@ One env var, no fallback chain: `FOLLOWUP_GUARDRAIL_CHECK_ENABLED=1`.
 Weaviate connection reuses `WEAVIATE_URL` / `WEAVIATE_API_KEY`; the judge
 reuses `OPENROUTER_API_KEY`.
 
-**Thresholds are uncalibrated and knowingly assumed.** Decided: ship the stated
-values and calibrate later from the accumulated S3 records. Expect them to be
-wrong in a specific direction — the TEI model showed a high similarity floor on
-protocols (irrelevant items still scoring 0.54–0.67, a narrow discriminative
-band), and guardrails compare *Disha utterance to Disha utterance*: same
-speaker, same register, same domain. The floor is likely higher still, so 0.75
-may sit inside the noise. The S3 record carries every candidate from day one
-precisely so this can be measured without a rerun.
+**Thresholds are calibrated against fixture data (2026-08-04), not assumed.**
+Seeded 4 guardrails / 16 anchors and probed 7 queries against the US instance:
+
+| | similarity |
+|---|---|
+| stop your BP tablets | 0.8892 |
+| take one tablet of paracetamol | 0.8277 |
+| you will definitely lose weight | 0.7768 |
+| sounds like it could be your thyroid | 0.7491 |
+| ask your doctor before changing medication *(safe)* | 0.6525 |
+| let's talk about your diet plan instead *(safe)* | 0.5692 |
+| that's a great question *(safe)* | 0.4654 |
+
+The originally-chosen 0.75/0.90 was wrong in both directions. **Nothing reached
+0.90**, so the interrupt band never fired and every violation took the slow
+judge path — the pre-speech fast path of §14.1 was dead on arrival. And the
+hedged diagnosis at 0.7491 missed the judge band by 0.0009 despite being a
+genuine violation.
+
+Nothing lands between 0.6525 and 0.7491, so **0.70** separates with margin on
+both sides, and **0.85** revives the interrupt band for near-verbatim matches.
+
+The high floor the design predicted is real: unrelated small talk still scores
+0.4654, so absolute distance from zero means nothing here — only distance from
+the noise band does. This is fixture data rather than live traffic, and the S3
+record carries every candidate from day one so the bands can be re-derived from
+real calls without a rerun.
 
 **Shared Weaviate client.** Both retrieval steps use one `*weaviate.Client` so
 the guardrail path inherits the protocol path's warm-up
@@ -781,8 +800,8 @@ them can land afterwards.
   `renderGuardrailBlock`, `appendGuardrailBlock`, the enricher,
   Sentry/RTVI/publish helpers, `setupGuardrailCheck`.
 
-**Band comparison operators are load-bearing:** `similarity > 0.90` interrupts
-and `similarity >= 0.75` judges, so exactly 0.90 falls in the judge band. Go and
+**Band comparison operators are load-bearing:** `similarity > 0.85` interrupts
+and `similarity >= 0.70` judges, so exactly 0.85 falls in the judge band. Go and
 `scripts/seed_guardrail_collections.py` must agree exactly, or the calibration
 tool misreports what production does.
 
@@ -825,7 +844,7 @@ tool misreports what production does.
    early. (`redis_dict_to_model` reads named keys only, so an unknown chunk key
    is dropped harmlessly regardless.)
 2. **The judge prompt** into Langfuse, and confirm `document:{name}:{env}` is
-   pre-rendered into Redis. Until this exists the 0.75–0.90 band is dead
+   pre-rendered into Redis. Until this exists the 0.70–0.85 band is dead
    (fails open).
 3. **Seed `GuardrailInstruction` / `GuardrailAnchor`** with the real corpus and
    run `--probe` to sanity-check the score distribution against §9's warning.
@@ -907,7 +926,7 @@ that same fragment at the same moment.
 Per-fragment triggering is what makes this tolerable rather than fatal. Firing
 on the **first** fragment gives the check a real chance to complete before
 Cartesia has produced any audio at all: the measured vector-query path is p50
-~17ms / p95 ~21ms, against Cartesia TTFB plus playback pacing. The >0.90 band is
+~17ms / p95 ~21ms, against Cartesia TTFB plus playback pacing. The >0.85 band is
 therefore often a genuine **pre-speech** guardrail; the judge band, which adds a
 few hundred milliseconds, is usually a **mid-speech correction**.
 
@@ -927,7 +946,7 @@ Accepted (Jaideep, 2026-08-03). Tool calls execute **after**
 `procCtx` and with it any pending tool execution. A farewell turn like
 *"Okay, take care, bye"* + `end_call` would have its hangup cancelled by a
 guardrail trigger. Rare, and a farewell is unlikely to be a true positive — but
-a >0.90 false positive leaves the call running after Disha has said goodbye.
+a >0.85 false positive leaves the call running after Disha has said goodbye.
 Detecting "this generation had pending tool calls" is not possible at this
 pipeline position without a new signal, which was judged not worth it for v1.
 
