@@ -6,7 +6,65 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
+
+// endsWithSentenceTerminator reports whether s ends a sentence.
+//
+// Deliberately NOT tts_processor.go's endsWithPunctuation, and the divergence
+// is the point. That helper is unicode.IsPunct on the final rune, so it also
+// flushes on commas, semicolons, colons, dashes and quotes — which is right
+// for TTS, where flushing a clause early gets audio started sooner, but wrong
+// for a guard. A clause is usually too little context for a similarity match
+// to mean anything, and clause-level splitting produced roughly 8-12 checks on
+// an ordinary three-sentence turn instead of 3.
+//
+// Trailing closing delimiters and whitespace are skipped before the test, so
+// `He said "stop."` and `(that's final!)` both terminate.
+//
+// The Devanagari danda is included: Disha speaks Hindi and Hinglish, and a
+// Hindi sentence ends in U+0964, not a full stop.
+//
+// Known and accepted: an abbreviation ("Dr.") or a decimal mid-number
+// ("take 2.5 mg", momentarily buffered as "take 2.") terminates early and
+// costs one extra check. That check fails open and is harmless — cheaper than
+// the sentence-segmentation machinery avoiding it would need.
+func endsWithSentenceTerminator(s string) bool {
+	for len(s) > 0 {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r == utf8.RuneError && size <= 1 {
+			return false
+		}
+		if unicode.IsSpace(r) || isClosingDelimiter(r) {
+			s = s[:len(s)-size]
+			continue
+		}
+		return isSentenceTerminator(r)
+	}
+	return false
+}
+
+func isSentenceTerminator(r rune) bool {
+	switch r {
+	case '.', '!', '?',
+		'…', // … horizontal ellipsis
+		'।', // । Devanagari danda
+		'॥': // ॥ Devanagari double danda
+		return true
+	}
+	return false
+}
+
+func isClosingDelimiter(r rune) bool {
+	switch r {
+	case '"', '\'', ')', ']', '}',
+		'”', // ” right double quote
+		'’', // ’ right single quote
+		'»': // » right guillemet
+		return true
+	}
+	return false
+}
 
 // responseGuardProcessorName labels this processor's metrics. Unlike every
 // other processor here, the guard does NOT use a ProcessorMetrics timer map:
@@ -110,10 +168,11 @@ func (p *ResponseGuardProcessor) ProcessFrame(ctx context.Context, frame Frame, 
 }
 
 // handleText accumulates text into the per-turn buffer and fires a check
-// whenever the buffer ends on punctuation, mirroring TTS's own
-// aggregate-then-flush loop (tts_processor.go) and reusing its
-// endsWithPunctuation helper. Fragments with no alphanumeric content (a bare
-// "." or " -") are skipped without counting as a check. When the current
+// whenever the buffer ends a sentence. The aggregate-then-flush shape mirrors
+// TTS's loop (tts_processor.go), but the boundary test does NOT: TTS flushes
+// on any punctuation, while a guard wants whole sentences — see
+// endsWithSentenceTerminator. Fragments with no alphanumeric content (a bare
+// "..." or " —") are skipped without counting as a check. When the current
 // turn has no turnCtx (the skipTurn latch consumed it — see
 // handleTurnStart), nothing is accumulated or fired: no checks run this turn.
 func (p *ResponseGuardProcessor) handleText(text string) {
@@ -129,7 +188,7 @@ func (p *ResponseGuardProcessor) handleText(text string) {
 		fragment string
 		turnCtx  context.Context
 	)
-	if endsWithPunctuation(p.buffer) {
+	if endsWithSentenceTerminator(p.buffer) {
 		fragment = p.buffer
 		p.buffer = ""
 		if containsAlnum(fragment) {

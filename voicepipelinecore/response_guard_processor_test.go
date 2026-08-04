@@ -65,8 +65,8 @@ func TestResponseGuardFiresOncePerFragmentBoundary(t *testing.T) {
 		framesToSend: []Frame{
 			NewLLMResponseStartFrame(time.Now()),
 			NewTextFrame("Hello, "),
-			NewTextFrame("world."),
-			NewTextFrame(" —"), // punctuation-only: must flush the buffer, must not fire
+			NewTextFrame("world."), // the comma did NOT flush; the full stop does
+			NewTextFrame(" ..."),   // terminator but no alphanumerics: flushes, must not fire
 			NewTextFrame("More text!"),
 		},
 		settleDelay:  100 * time.Millisecond,
@@ -364,6 +364,79 @@ func TestResponseGuardRequiresGuard(t *testing.T) {
 		}
 	}()
 	NewResponseGuardProcessor(fix.TaskCtx, nil)
+}
+
+// The guard splits on sentence terminators only, deliberately diverging from
+// tts_processor.go's endsWithPunctuation (unicode.IsPunct), which also flushes
+// on commas, semicolons, colons and dashes. A clause is too little context for
+// a similarity match to be meaningful, and clause-level splitting quadrupled
+// the check count on an ordinary turn.
+func TestEndsWithSentenceTerminator(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		// Terminators.
+		{"That is final.", true},
+		{"Stop that!", true},
+		{"Are you sure?", true},
+		{"Well…", true},
+		{"यह ठीक है।", true},      // Devanagari danda
+		{"समाप्त॥", true},         // Devanagari double danda
+		{`He said "stop."`, true}, // closing quote after the terminator
+		{"(that's final!)", true},
+		{"Done. ", true}, // trailing whitespace
+
+		// NOT terminators — these are exactly what TTS would have flushed on.
+		{"Hello, ", false},
+		{"First clause; second", false},
+		{"As follows:", false},
+		{"An aside —", false},
+		{"mid sentence", false},
+		{"", false},
+	} {
+		if got := endsWithSentenceTerminator(tc.in); got != tc.want {
+			t.Errorf("endsWithSentenceTerminator(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Commas must accumulate rather than fire, so one sentence containing several
+// clauses is exactly one check.
+func TestResponseGuardDoesNotSplitOnClausePunctuation(t *testing.T) {
+	fix := newTestFixture(t)
+
+	var mu sync.Mutex
+	var seen []string
+	guard := func(_ context.Context, fragment string) bool {
+		mu.Lock()
+		seen = append(seen, fragment)
+		mu.Unlock()
+		return false
+	}
+	p := NewResponseGuardProcessor(fix.TaskCtx, guard)
+
+	_, _ = runProcessorTest(t, fix, runConfig{
+		processor: p,
+		framesToSend: []Frame{
+			NewLLMResponseStartFrame(time.Now()),
+			NewTextFrame("First, "),
+			NewTextFrame("second; "),
+			NewTextFrame("third: "),
+			NewTextFrame("all one sentence."),
+		},
+		settleDelay:  100 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("expected 1 check for a single multi-clause sentence, got %d: %v", len(seen), seen)
+	}
+	if want := "First, second; third: all one sentence."; seen[0] != want {
+		t.Fatalf("fragment = %q, want %q", seen[0], want)
+	}
 }
 
 // A turn fans out to one check per fragment, and every check must contribute

@@ -47,7 +47,7 @@ the processor and their pipelines stay byte-identical.
 | `newRetrievalChunkDecorator` | `disha/retrieval_chunk_decorator.go:40` | Extended to take a second record box. `SetChunkDecorator` is a **single-occupancy slot** (`disha/call_event_callbacks.go:46`), so extending is the only option — a second decorator cannot be registered. |
 | Interrupt-and-regenerate | `voicepipelinecore/llm_response_timeout_processor.go:111-112` | **Copied verbatim.** `Broadcast(NewInterruptFrame())` + `PushFrame(NewLLMMessagesAppendFrame(nil, true), Upstream)`, consumed at `user_context_aggregator.go:244-261`. Ordering is safe: the interrupt lands in `inputSysCh` and is dispatched inline before the append is forwarded from `inputDataCh`, so the append is not purged by the interrupt preceding it. |
 | `ContextEnricherProcessor` / `MessagesEnricher` | `voicepipelinecore/context_enricher_processor.go` | Reused to inject the correction message into the regeneration snapshot only. Composed with the protocol enricher (§6.2). |
-| `endsWithPunctuation` | `voicepipelinecore/tts_processor.go:21-27` | **Reused directly.** Unexported, but the new processor lives in the same package. See §5.1 for the fan-out consequence. |
+| `endsWithPunctuation` | `voicepipelinecore/tts_processor.go:21-27` | **NOT reused** — the guard defines its own `endsWithSentenceTerminator`. TTS flushes on any punctuation; a guard needs whole sentences. See §5.1. |
 | Hedged one-shot LLM client | `voicepipelinecore/llmrouter` `NewHedged(HedgedConfig{...})` | The judge client. Its `LogSink` wrapper already drops `Interrupted` entries, so cancelled judge calls do not pollute `llmlog`. |
 | `NewUSBucketJSONUploaderFromEnv`, `JSONUploader` | `disha/s3_uploader.go:69`, `:31` | The S3 record uploader. |
 | `taskSentryHub` / `SetSentryHub` late-binding | `disha/protocol_retrieval.go` (`protocolEnricher`) | Same pattern for the checker. |
@@ -168,7 +168,7 @@ is non-blocking and TTS never waits on it.
 
 | Frame | Behaviour |
 |---|---|
-| `TextFrame` | Forward first, then accumulate; on `endsWithPunctuation(aggregation)` fire a check and reset the buffer. Skip fragments with no alphanumeric content. |
+| `TextFrame` | Forward first, then accumulate; on `endsWithSentenceTerminator(aggregation)` fire a check and reset the buffer. Skip fragments with no alphanumeric content. |
 | `LLMResponseStartFrame` | Reset per-turn state. If `skipTurn` is set, clear it and guard nothing this turn (the one-retry latch). Forward. |
 | `LLMResponseEndFrame` | Nothing special: any trailing un-punctuated remainder is deliberately **not** checked (it is not a completed sentence). Forward. |
 | `InterruptFrame` | Cancel all in-flight checks for the turn, reset state, **always clear `skipTurn`**, forward. |
@@ -183,31 +183,42 @@ half-open.
 
 ## 5. The check round
 
-### 5.1 Fragment boundaries — reuse `endsWithPunctuation`
+### 5.1 Fragment boundaries — sentence terminators only
 
-**Decided: reuse `voicepipelinecore/tts_processor.go:21-27` as-is**, mirroring
-TTS's own aggregate-then-flush loop (`tts_processor.go:425-447`): append the
-delta, test the buffer, reset on match.
+**Decided (revised 2026-08-04): the guard splits on sentence terminators
+only**, via its own `endsWithSentenceTerminator` in
+`voicepipelinecore/response_guard_processor.go`. The aggregate-then-flush shape
+still mirrors TTS's loop (`tts_processor.go:425-447`) — append the delta, test
+the buffer, reset on match — but the boundary test deliberately differs.
 
-Consequence to be explicit about: `endsWithPunctuation` is
-`unicode.IsPunct` on the last rune, so it flushes on **commas, semicolons,
-colons and quotes**, not only sentence terminators. Fan-out is therefore
-clause-level, not sentence-level. A three-sentence turn with ordinary comma use
-produces roughly 8–12 fragments, each its own vector query and potentially its
-own judge call.
+This reverses an earlier decision to reuse `endsWithPunctuation`
+(`tts_processor.go:21-27`). That helper is `unicode.IsPunct` on the final rune,
+so it also flushes on **commas, semicolons, colons, dashes and quotes**. That
+is right for TTS, where flushing a clause early gets audio started sooner, but
+wrong for a guard on two counts: a clause is usually too little context for a
+similarity match to mean anything, and clause-level splitting produced roughly
+**8–12 fragments** on an ordinary three-sentence turn instead of 3 — each one a
+vector query and potentially a judge call.
 
-This was chosen over a stricter terminal-`.!?`-plus-minimum-word-count
-predicate for consistency with what TTS already treats as a flushable unit, and
-because more frequent checks fire earlier, which is the whole point (§14.1).
-The cost is query and judge volume.
+Terminators: `.` `!` `?` `…`, plus the Devanagari danda `।` and double danda
+`॥`, since Disha speaks Hindi and Hinglish and a Hindi sentence does not end in
+a full stop. Trailing closing delimiters and whitespace are skipped before the
+test, so `He said "stop."` and `(that's final!)` both terminate.
+
+Accepted imprecision: an abbreviation (`Dr.`) or a decimal caught mid-number
+(`take 2.5 mg`, momentarily buffered as `take 2.`) terminates early and costs
+one extra check. That check fails open and is harmless — cheaper than the
+sentence-segmentation machinery needed to avoid it. A minimum-word-count gate
+is the obvious next lever if these prove noisy; it is deliberately not shipped.
 
 **No cap on parallel checks.** If a single turn exceeds
 `guardrailFanoutSentryThreshold` (10) checks, capture a Sentry event
-(`operation: guardrail_check_fanout`) once for that turn and keep going.
-Expect this to be noisy at 10 given the clause-level fan-out; the threshold is
-a named constant and the first tuning knob to reach for.
+(`operation: guardrail_check_fanout`) once for that turn and keep going. At
+sentence granularity a typical turn is ~3 checks, so 10 now means a genuinely
+anomalous turn rather than routine traffic — the threshold became meaningful as
+a direct result of this change.
 
-Fragments with no alphanumeric content (a bare `"."`, `" —"`) are skipped
+Fragments with no alphanumeric content (a bare `"..."`, `" —"`) are skipped
 without counting as a check.
 
 ### 5.2 Query text is the fragment, never the accumulation
@@ -910,8 +921,8 @@ pipeline position without a new signal, which was judged not worth it for v1.
 ### 14.3 Other accepted deltas
 
 - **Cross-boundary violations are not detected** (§5.2).
-- **Clause-level fan-out** from reusing `endsWithPunctuation` (§5.1), with a
-  predictably noisy Sentry threshold at 10.
+- **Sentence-level fan-out** (§5.1), ~3 checks on a typical turn. Abbreviations
+  and mid-number decimals terminate early and cost one extra harmless check.
 - **Two consecutive assistant messages persist** after a regeneration, and the
   violating text outlives the correction (§6.1).
 - **The trailing un-punctuated remainder of a response is never checked** — it
