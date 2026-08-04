@@ -309,11 +309,25 @@ func (b *guardrailRecordBox) offerViolation(record guardrailCheckRecord, awaitAu
 	}
 }
 
-// setAuditVerdict fills the >0.85 band's fire-and-forget audit judge verdict
-// onto the pending record's selected check. Returns false when there is no
-// pending record — it was already taken — so the caller can log that the
-// verdict arrived too late instead of silently dropping it.
-func (b *guardrailRecordBox) setAuditVerdict(verdict string) bool {
+// setAuditVerdict records the >0.85 band's fire-and-forget audit judge result
+// onto the pending record's selected check.
+//
+// Takes the whole detail rather than just the verdict string: model, latency
+// and error were being dropped, so the record said WHAT the audit decided but
+// not WHICH model decided it or how long it took. Observed on staging call
+// 0b1d00ab, where the record carried judge.model "" and latency_ms 0 while
+// llmlog had llama-3.1-8b at 648ms. The model matters — a hedge swap silently
+// changes who is auditing, and the audit is the only false-positive detector
+// this band has.
+//
+// JudgeLatencyMs is set for completeness even though it can exceed the check's
+// own latency_ms.total: the audit runs off the critical path, deliberately
+// after the interrupt has already fired.
+//
+// Returns false when there is no pending record — it was already taken — so
+// the caller can log that the result arrived too late instead of silently
+// dropping it.
+func (b *guardrailRecordBox) setAuditVerdict(detail guardrailJudgeDetail) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.pending == nil {
@@ -324,10 +338,13 @@ func (b *guardrailRecordBox) setAuditVerdict(verdict string) bool {
 		return false
 	}
 	check := &b.pending.Checks[idx]
+	check.Judge = detail
 	check.Judge.Ran = true
 	check.Judge.AuditOnly = true
-	check.Judge.Verdict = verdict
-	// Fully resolved now, so the record may be released.
+	check.JudgeLatencyMs = detail.LatencyMs
+	// Resolved either way — verdict or error — so stop holding the record.
+	// A failed audit will never produce a verdict, and waiting out the full
+	// deadline for one would only delay the record.
 	b.auditPending = false
 	return true
 }

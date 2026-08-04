@@ -122,7 +122,7 @@ func TestGuardrailRecordBoxSetAuditVerdictBeforeTake(t *testing.T) {
 	box := &guardrailRecordBox{}
 	box.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 
-	if ok := box.setAuditVerdict("no"); !ok {
+	if ok := box.setAuditVerdict(guardrailJudgeDetail{Verdict: "no", Model: "audit-model", LatencyMs: 648}); !ok {
 		t.Fatal("setAuditVerdict should succeed on a pending record")
 	}
 
@@ -141,14 +141,14 @@ func TestGuardrailRecordBoxSetAuditVerdictAfterTakeReturnsFalse(t *testing.T) {
 	box.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 	box.take()
 
-	if ok := box.setAuditVerdict("yes"); ok {
+	if ok := box.setAuditVerdict(guardrailJudgeDetail{Verdict: "yes"}); ok {
 		t.Fatal("setAuditVerdict must return false once the record has been taken")
 	}
 }
 
 func TestGuardrailRecordBoxSetAuditVerdictNoPendingRecord(t *testing.T) {
 	box := &guardrailRecordBox{}
-	if ok := box.setAuditVerdict("yes"); ok {
+	if ok := box.setAuditVerdict(guardrailJudgeDetail{Verdict: "yes"}); ok {
 		t.Fatal("setAuditVerdict must return false with nothing ever offered")
 	}
 }
@@ -339,7 +339,7 @@ func TestGuardrailRecordBoxHoldsRecordUntilAuditVerdict(t *testing.T) {
 		t.Fatalf("take() returned a record while the audit verdict was outstanding: %+v", got)
 	}
 
-	if ok := box.setAuditVerdict("no"); !ok {
+	if ok := box.setAuditVerdict(guardrailJudgeDetail{Verdict: "no", Model: "audit-model", LatencyMs: 648}); !ok {
 		t.Fatal("setAuditVerdict returned false — the record must still be held, not taken")
 	}
 
@@ -348,11 +348,23 @@ func TestGuardrailRecordBoxHoldsRecordUntilAuditVerdict(t *testing.T) {
 	if got == nil {
 		t.Fatal("take() returned nil after the audit verdict landed")
 	}
-	if v := got.Checks[got.SelectedIndex].Judge.Verdict; v != "no" {
+	audited := got.Checks[got.SelectedIndex]
+	if v := audited.Judge.Verdict; v != "no" {
 		t.Fatalf("audit verdict = %q, want %q — this is the false-positive signal", v, "no")
 	}
-	if !got.Checks[got.SelectedIndex].Judge.AuditOnly {
-		t.Fatal("expected AuditOnly to be marked on the audited check")
+	if !audited.Judge.AuditOnly || !audited.Judge.Ran {
+		t.Fatalf("expected Ran+AuditOnly on the audited check, got %+v", audited.Judge)
+	}
+	// The audit's identity and cost must survive too: a hedge swap silently
+	// changes which model is auditing, and the record is where we would see it.
+	if audited.Judge.Model != "audit-model" {
+		t.Fatalf("audit model = %q, want %q", audited.Judge.Model, "audit-model")
+	}
+	if audited.Judge.LatencyMs != 648 {
+		t.Fatalf("audit latency = %v, want 648", audited.Judge.LatencyMs)
+	}
+	if audited.JudgeLatencyMs != 648 {
+		t.Fatalf("check JudgeLatencyMs = %v, want 648", audited.JudgeLatencyMs)
 	}
 }
 
@@ -406,5 +418,44 @@ func TestGuardrailRecordBoxDoesNotHoldJudgeBandViolation(t *testing.T) {
 	}
 	if v := got.Checks[0].Judge.Verdict; v != "yes" {
 		t.Fatalf("verdict = %q, want yes", v)
+	}
+}
+
+// A failed audit must still be recorded, and must release the hold. "Ran and
+// errored" is a different fact from "never ran": only the former says the
+// interrupt went unverified. Waiting out the full deadline for a verdict that
+// will never arrive would just delay the record.
+func TestGuardrailRecordBoxRecordsFailedAudit(t *testing.T) {
+	box := &guardrailRecordBox{}
+	box.offerViolation(guardrailCheckRecord{
+		Checks:        []guardrailCheck{{Index: 1, Violated: true, Top: &guardrailTopHit{Similarity: 0.91}}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+		Interrupted:   true,
+	}, true)
+
+	if got := box.take(); got != nil {
+		t.Fatal("expected the record to be held before the audit resolved")
+	}
+
+	if ok := box.setAuditVerdict(guardrailJudgeDetail{
+		Ran: true, AuditOnly: true, Verdict: "", Error: "judge unavailable", LatencyMs: 12,
+	}); !ok {
+		t.Fatal("setAuditVerdict returned false on a held record")
+	}
+
+	got := box.take()
+	if got == nil {
+		t.Fatal("a failed audit must release the hold, not strand the record")
+	}
+	audited := got.Checks[got.SelectedIndex]
+	if audited.Judge.Error != "judge unavailable" {
+		t.Fatalf("audit error = %q, want it preserved", audited.Judge.Error)
+	}
+	if !audited.Judge.Ran {
+		t.Fatal("a failed audit still ran; Ran must be true so it is distinguishable from never running")
+	}
+	if audited.Judge.Verdict != "" {
+		t.Fatalf("verdict = %q, want empty on a failed audit", audited.Judge.Verdict)
 	}
 }
