@@ -379,3 +379,90 @@ func TestFollowUpGuidancePromptVariablesIncludePatientExecutiveProfile(t *testin
 		t.Fatalf("patient_executive_profile = %#v", vars["patient_executive_profile"])
 	}
 }
+
+// followUpProtocolVariables are the names retrieved protocol instruction texts
+// render but no follow-up prompt does. A protocol referencing a name missing
+// from this store is dropped before the model sees it (VAGO-24), so the store
+// must carry every one of them — keep in sync with
+// `_FOLLOW_UP_PROTOCOL_VARIABLES` in disha-backend bots/bot_session_manager.py.
+var followUpProtocolVariables = []string{
+	"diet_chart_available",
+	"diet_plan_today",
+	"membership_status",
+	"membership_expiry_date",
+	"subscription_status",
+	"subscription_amount",
+	"next_payment_due_date",
+	"payment_overdue",
+}
+
+func TestFollowUpPromptVariablesCarryEveryProtocolVariable(t *testing.T) {
+	amount := 1499.0
+	overdue := true
+	status := "active"
+	expiry := "14 Aug 2026"
+	subStatus := "ACTIVE"
+	nextCharge := "1 Sep 2026"
+
+	vars := followUpPromptVariables(&ConversationData{
+		UserProfile: UserProfileData{
+			MembershipStatus:     &status,
+			MembershipExpiryDate: &expiry,
+			SubscriptionStatus:   &subStatus,
+			SubscriptionAmount:   &amount,
+			NextPaymentDueDate:   &nextCharge,
+			PaymentOverdue:       &overdue,
+		},
+	}, "")
+
+	for _, name := range followUpProtocolVariables {
+		if _, ok := vars[name]; !ok {
+			t.Errorf("followUpPromptVariables() is missing %q, so protocols using it are dropped", name)
+		}
+	}
+	if got := vars["membership_status"]; got != &status {
+		t.Errorf("membership_status = %#v, want the resolved pointer", got)
+	}
+	if got := vars["subscription_amount"]; got != &amount {
+		t.Errorf("subscription_amount = %#v, want the resolved pointer", got)
+	}
+}
+
+// A user with no membership/subscription row resolves to null on the backend.
+// Those nulls must survive into the store as nulls: the key being PRESENT is
+// what keeps the protocol from being dropped, and null (not "") is what the
+// chatV3/tool_fetch_info prompts render for the same names.
+func TestFollowUpPromptVariablesKeepUnsubscribedNullsPresent(t *testing.T) {
+	vars := followUpPromptVariables(&ConversationData{}, "")
+
+	for _, name := range followUpProtocolVariables {
+		value, ok := vars[name]
+		if !ok {
+			t.Errorf("followUpPromptVariables() is missing %q for an unsubscribed user", name)
+			continue
+		}
+		switch name {
+		case "diet_chart_available", "diet_plan_today":
+			// Pre-existing shape: bool zero value and a dereferenced string.
+			continue
+		}
+		if value != nil && !isNilPointer(value) {
+			t.Errorf("%s = %#v, want null so the renderer renders it as None", name, value)
+		}
+	}
+}
+
+// isNilPointer reports whether a variable holds a typed nil pointer, which
+// marshals to JSON null exactly like an untyped nil.
+func isNilPointer(value any) bool {
+	switch v := value.(type) {
+	case *string:
+		return v == nil
+	case *float64:
+		return v == nil
+	case *bool:
+		return v == nil
+	default:
+		return false
+	}
+}

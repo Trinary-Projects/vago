@@ -335,13 +335,25 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"his_her":                   possessivePronoun(gender),
 		"call_flow":                 callFlowValue,
 
-		// Not referenced by any follow-up prompt today — these two exist for
+		// Not referenced by any follow-up prompt today — these exist for
 		// retrieved protocol instruction texts, which are rendered against
 		// this same store. Python resolves them in
 		// user_prompt_variable_resolver (_diet_chart_available /
 		// _today_diet_plan) and fetch_conversation forwards them here.
 		"diet_chart_available": user.DietChartAvailable,
 		"diet_plan_today":      derefString(user.DietPlanToday),
+
+		// Same deal, from Python's subscription_prompt_variable_resolver.
+		// Deliberately forwarded as pointers rather than dereferenced: a user
+		// with no membership/subscription row resolves to null, and the key
+		// being PRESENT is what keeps a protocol from being dropped, so the
+		// nulls have to survive as nulls rather than collapse to "".
+		"membership_status":      user.MembershipStatus,
+		"membership_expiry_date": user.MembershipExpiryDate,
+		"subscription_status":    user.SubscriptionStatus,
+		"subscription_amount":    user.SubscriptionAmount,
+		"next_payment_due_date":  user.NextPaymentDueDate,
+		"payment_overdue":        user.PaymentOverdue,
 	}
 }
 

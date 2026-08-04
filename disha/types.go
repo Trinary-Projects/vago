@@ -40,6 +40,12 @@ type UserProfileData struct {
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
 	DietChartAvailable                bool           `json:"diet_chart_available"`
 	DietPlanToday                     *string        `json:"diet_plan_today"`
+	MembershipStatus                  *string        `json:"membership_status"`
+	MembershipExpiryDate              *string        `json:"membership_expiry_date"`
+	SubscriptionStatus                *string        `json:"subscription_status"`
+	SubscriptionAmount                *float64       `json:"subscription_amount"`
+	NextPaymentDueDate                *string        `json:"next_payment_due_date"`
+	PaymentOverdue                    *bool          `json:"payment_overdue"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
 	DevanagariName                    string         `json:"devanagari_name"`
 	FirstName                         string         `json:"first_name"`
