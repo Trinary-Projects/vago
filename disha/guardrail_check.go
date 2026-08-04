@@ -709,15 +709,16 @@ func (c *guardrailChecker) spawnAuditJudge(top *guardrailTopHit, instructionText
 		defer cancel()
 
 		_, detail := c.runJudge(auditCtx, c.callCtx, instructionText, fragment, true)
-		if detail.Verdict == "" {
-			// runJudge already reported the failure (or, if callCtx itself
-			// was already done, logged the cancellation) — nothing to
-			// attach to the record.
-			return
-		}
-		if ok := c.box.setAuditVerdict(detail.Verdict); !ok {
-			c.logf("guardrail audit verdict arrived after the record was taken instruction=%s verdict=%s",
-				top.InstructionID, detail.Verdict)
+
+		// Record the outcome even when the audit failed. "Ran and errored" is
+		// a different fact from "never ran": only the former says this
+		// interrupt went unverified, and this band's audit is the only
+		// false-positive detector it has. runJudge has already logged and
+		// Sentried the failure itself. Handing the detail over also releases
+		// the box's hold, which a silent return would have left to time out.
+		if ok := c.box.setAuditVerdict(detail); !ok {
+			c.logf("guardrail audit result arrived after the record was taken instruction=%s verdict=%q err=%q",
+				top.InstructionID, detail.Verdict, detail.Error)
 		}
 	}()
 }
