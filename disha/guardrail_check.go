@@ -572,7 +572,12 @@ func (c *guardrailChecker) finish(check guardrailCheck, violated bool) {
 		Err:           checksCopy[selectedIndex].Err,
 	}
 	if violated {
-		c.box.offerViolation(record)
+		// awaitAudit only for the >0.85 band: its interrupt fires on similarity
+		// alone and the audit judge answers later, so the box must hold the
+		// record until that verdict lands (see guardrailRecordBox.take). A
+		// judge-band violation already knows its verdict and is released at
+		// once, landing on the partial chunk -- the violating turn itself.
+		c.box.offerViolation(record, check.Band == "interrupt")
 		return
 	}
 	c.box.offer(record)

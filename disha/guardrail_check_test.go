@@ -166,6 +166,16 @@ func TestGuardrailCheckInterruptBandFiresWithoutBlockingOnJudge(t *testing.T) {
 		t.Fatal("expected violated=true above the interrupt threshold, on similarity alone")
 	}
 
+	// The interrupt-band record is deliberately HELD until the audit verdict
+	// lands, so the partial chunk committed by this very interrupt cannot
+	// consume it. Expire the hold to inspect the record here.
+	if held := box.take(); held != nil {
+		t.Fatalf("interrupt-band record must be held for the audit verdict, got %+v", held)
+	}
+	box.mu.Lock()
+	box.auditDeadline = time.Now().Add(-time.Millisecond)
+	box.mu.Unlock()
+
 	record := box.take()
 	if record == nil || !record.Interrupted {
 		t.Fatalf("expected an interrupted record, got %+v", record)
@@ -577,10 +587,17 @@ func TestGuardrailAuditVerdictArrivingAfterTakeIsDroppedWithoutPanic(t *testing.
 		t.Fatal("expected the >0.85 band to interrupt")
 	}
 
-	// Take the record well before the (artificially delayed) audit judge can
-	// possibly complete, simulating the regenerated chunk committing first.
+	// The record is held for the audit verdict, so reaching the "arrived too
+	// late" path now requires the hold to expire first — which is exactly the
+	// real scenario it guards: the audit judge overran
+	// guardrailAuditVerdictWait, the record was released without a verdict, and
+	// the verdict turns up afterwards with nowhere to go.
+	box.mu.Lock()
+	box.auditDeadline = time.Now().Add(-time.Millisecond)
+	box.mu.Unlock()
+
 	if record := box.take(); record == nil {
-		t.Fatal("expected a record")
+		t.Fatal("expected a record once the audit hold expired")
 	}
 
 	select {
