@@ -47,10 +47,15 @@ const (
 	// instruction-id and top-1 selection.
 	guardrailQueryLimit = 10
 
-	// guardrailFanoutSentryThreshold: reusing endsWithPunctuation for fragment
-	// boundaries produces clause-level (not sentence-level) fan-out, so a
-	// single turn can trigger many checks. Above this many checks in one turn,
-	// capture one Sentry event and keep going rather than one per check.
+	// guardrailFanoutSentryThreshold: above this many checks in one turn,
+	// capture one Sentry event and keep going (there is no cap, and it is one
+	// event per turn rather than one per check).
+	//
+	// Fragments are whole sentences
+	// (voicepipelinecore.endsWithSentenceTerminator), so a typical turn is ~3
+	// checks and 10 means a genuinely unusual turn. Under the earlier
+	// clause-level boundary an ordinary turn ran 8-12 checks, which would have
+	// made this alert pure noise.
 	guardrailFanoutSentryThreshold = 10
 
 	// guardrailCheckTimeout bounds one fragment's whole check (vector query +
