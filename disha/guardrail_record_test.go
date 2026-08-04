@@ -1,6 +1,9 @@
 package disha
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // testGuardrailCheck builds one check with a top hit at the given similarity.
 // Violated/band are set independently so tests can construct the exact
@@ -67,7 +70,7 @@ func TestGuardrailRecordBoxViolationBeatsHigherSimilarity(t *testing.T) {
 	// A non-violating check with higher similarity arrives first...
 	box.offer(testGuardrailCheckRecord(0.95, false))
 	// ...but a violating check, even at lower similarity, must win.
-	box.offerViolation(testGuardrailCheckRecord(0.78, true))
+	box.offerViolation(testGuardrailCheckRecord(0.78, true), false)
 
 	record := box.take()
 	if record == nil {
@@ -99,12 +102,12 @@ func TestGuardrailRecordBoxAbsentViolationHighestSimilarityWins(t *testing.T) {
 
 func TestGuardrailRecordBoxOfferCannotOverwriteAfterViolation(t *testing.T) {
 	box := &guardrailRecordBox{}
-	box.offerViolation(testGuardrailCheckRecord(0.78, true))
+	box.offerViolation(testGuardrailCheckRecord(0.78, true), false)
 	// A later-completing check with much higher similarity must not
 	// overwrite the locked violation.
 	box.offer(testGuardrailCheckRecord(0.99, false))
 	// Nor can a second violation.
-	box.offerViolation(testGuardrailCheckRecord(0.91, true))
+	box.offerViolation(testGuardrailCheckRecord(0.91, true), false)
 
 	record := box.take()
 	if record == nil {
@@ -117,7 +120,7 @@ func TestGuardrailRecordBoxOfferCannotOverwriteAfterViolation(t *testing.T) {
 
 func TestGuardrailRecordBoxSetAuditVerdictBeforeTake(t *testing.T) {
 	box := &guardrailRecordBox{}
-	box.offerViolation(testGuardrailCheckRecord(0.94, true))
+	box.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 
 	if ok := box.setAuditVerdict("no"); !ok {
 		t.Fatal("setAuditVerdict should succeed on a pending record")
@@ -135,7 +138,7 @@ func TestGuardrailRecordBoxSetAuditVerdictBeforeTake(t *testing.T) {
 
 func TestGuardrailRecordBoxSetAuditVerdictAfterTakeReturnsFalse(t *testing.T) {
 	box := &guardrailRecordBox{}
-	box.offerViolation(testGuardrailCheckRecord(0.94, true))
+	box.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 	box.take()
 
 	if ok := box.setAuditVerdict("yes"); ok {
@@ -164,7 +167,7 @@ func TestGuardrailRecordBoxTakeEmptiesBox(t *testing.T) {
 
 func TestGuardrailRecordBoxTakeResetsLockForNextTurn(t *testing.T) {
 	box := &guardrailRecordBox{}
-	box.offerViolation(testGuardrailCheckRecord(0.94, true))
+	box.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 	box.take()
 
 	// A fresh turn: a non-violating offer must be accepted, proving the lock
@@ -286,7 +289,7 @@ func TestGuardrailRecordBoxViolationBeatsMoreCompleteRecord(t *testing.T) {
 		SelectedIndex: 0,
 		CheckCount:    1,
 		Interrupted:   true,
-	})
+	}, false)
 	box.offer(guardrailCheckRecord{
 		Checks: []guardrailCheck{
 			{Index: 1, Top: &guardrailTopHit{Similarity: 0.91}},
@@ -300,7 +303,108 @@ func TestGuardrailRecordBoxViolationBeatsMoreCompleteRecord(t *testing.T) {
 	if got == nil || !got.Interrupted {
 		t.Fatalf("expected the violating record to survive, got %+v", got)
 	}
-	if len(got.Checks) != 1 {
-		t.Fatalf("violating record was overwritten by a later offer: %d checks", len(got.Checks))
+	// Selection is what the lock protects, not the check list. A later offer
+	// must not steal Interrupted/SelectedIndex...
+	if got.SelectedIndex != 0 {
+		t.Fatalf("SelectedIndex = %d, want 0 — the lock must preserve the violating selection", got.SelectedIndex)
+	}
+	// ...but its checks ARE adopted, so the calibration dataset keeps every
+	// check that ran rather than only those that beat the violation.
+	if len(got.Checks) != 2 {
+		t.Fatalf("kept %d checks, want 2 — a locked box must still adopt later checks", len(got.Checks))
+	}
+	if got.CheckCount != 2 {
+		t.Fatalf("CheckCount = %d, want 2", got.CheckCount)
+	}
+}
+
+// The >0.85 band interrupts on similarity alone and its audit judge is the only
+// false-positive detector for it. The interrupt commits whatever was already
+// spoken as a chunk almost immediately, so if the box released the record then,
+// the verdict would arrive to an empty box and be dropped — the detector would
+// produce nothing, ever. Verified on staging call 3a7d60a2, where judge-band
+// records did land on the partial chunk.
+func TestGuardrailRecordBoxHoldsRecordUntilAuditVerdict(t *testing.T) {
+	box := &guardrailRecordBox{}
+	box.offerViolation(guardrailCheckRecord{
+		Checks:        []guardrailCheck{{Index: 1, Violated: true, Top: &guardrailTopHit{Similarity: 0.91}}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+		Interrupted:   true,
+	}, true) // awaitAudit: the >0.85 band
+
+	// The partial chunk, committed microseconds after the interrupt, must get
+	// nothing rather than consuming a record whose verdict has not landed.
+	if got := box.take(); got != nil {
+		t.Fatalf("take() returned a record while the audit verdict was outstanding: %+v", got)
+	}
+
+	if ok := box.setAuditVerdict("no"); !ok {
+		t.Fatal("setAuditVerdict returned false — the record must still be held, not taken")
+	}
+
+	// The regenerated chunk, committed seconds later, collects the resolved record.
+	got := box.take()
+	if got == nil {
+		t.Fatal("take() returned nil after the audit verdict landed")
+	}
+	if v := got.Checks[got.SelectedIndex].Judge.Verdict; v != "no" {
+		t.Fatalf("audit verdict = %q, want %q — this is the false-positive signal", v, "no")
+	}
+	if !got.Checks[got.SelectedIndex].Judge.AuditOnly {
+		t.Fatal("expected AuditOnly to be marked on the audited check")
+	}
+}
+
+// The hold must be bounded: if the audit judge never answers, the record is
+// released with an empty verdict rather than being stranded forever.
+func TestGuardrailRecordBoxReleasesRecordAfterAuditDeadline(t *testing.T) {
+	box := &guardrailRecordBox{}
+	box.offerViolation(guardrailCheckRecord{
+		Checks:        []guardrailCheck{{Index: 1, Violated: true, Top: &guardrailTopHit{Similarity: 0.91}}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+		Interrupted:   true,
+	}, true)
+
+	if got := box.take(); got != nil {
+		t.Fatalf("expected the record to be held before the deadline, got %+v", got)
+	}
+
+	// Expire the hold rather than sleeping for guardrailAuditVerdictWait.
+	box.mu.Lock()
+	box.auditDeadline = time.Now().Add(-time.Millisecond)
+	box.mu.Unlock()
+
+	got := box.take()
+	if got == nil {
+		t.Fatal("record was still held after the audit deadline passed")
+	}
+	if v := got.Checks[got.SelectedIndex].Judge.Verdict; v != "" {
+		t.Fatalf("verdict = %q, want empty — no audit answer arrived", v)
+	}
+}
+
+// A judge-band violation already knows its verdict, so it must NOT be held —
+// its record belongs on the partial chunk, which is the violating turn.
+func TestGuardrailRecordBoxDoesNotHoldJudgeBandViolation(t *testing.T) {
+	box := &guardrailRecordBox{}
+	box.offerViolation(guardrailCheckRecord{
+		Checks: []guardrailCheck{{
+			Index: 1, Violated: true,
+			Top:   &guardrailTopHit{Similarity: 0.60},
+			Judge: guardrailJudgeDetail{Ran: true, Verdict: "yes"},
+		}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+		Interrupted:   true,
+	}, false) // awaitAudit false: verdict already known
+
+	got := box.take()
+	if got == nil {
+		t.Fatal("judge-band violation must be available immediately, not held")
+	}
+	if v := got.Checks[0].Judge.Verdict; v != "yes" {
+		t.Fatalf("verdict = %q, want yes", v)
 	}
 }

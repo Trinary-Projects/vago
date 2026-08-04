@@ -236,6 +236,11 @@ type guardrailRecordBox struct {
 	mu      sync.Mutex
 	pending *guardrailCheckRecord
 	locked  bool // a violating record has been stored; later completions cannot overwrite
+
+	// auditPending holds the record back until the >0.85 band's audit judge
+	// answers, or auditDeadline passes. See take() for why that matters.
+	auditPending  bool
+	auditDeadline time.Time
 }
 
 // offer keeps the better of the pending and the given record: ignored once the
@@ -258,6 +263,21 @@ func (b *guardrailRecordBox) offer(record guardrailCheckRecord) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.locked {
+		// A violation already claimed this turn and must keep its selection,
+		// but still adopt the longer check list. Offers carry the whole
+		// accumulated list in completion order, so a later one is a
+		// prefix-superset and SelectedIndex keeps pointing at the same check.
+		//
+		// Without this, checks finishing after the violation vanished from the
+		// record: on staging call 3a7d60a2 turn one ran four checks and
+		// persisted three, losing a judge-band sample at 0.5702. The S3 record
+		// is the calibration dataset, so dropping its tail biases exactly the
+		// data the thresholds get re-derived from -- and biases it toward
+		// whichever check happened to win the race.
+		if b.pending != nil && len(record.Checks) > len(b.pending.Checks) {
+			b.pending.Checks = record.Checks
+			b.pending.CheckCount = len(record.Checks)
+		}
 		return
 	}
 	if b.pending == nil ||
@@ -272,7 +292,10 @@ func (b *guardrailRecordBox) offer(record guardrailCheckRecord) {
 // completions — including a losing race to offerViolation itself, or the
 // eventual audit judge's own record if it were mistakenly re-offered — cannot
 // overwrite the record that fired the interrupt.
-func (b *guardrailRecordBox) offerViolation(record guardrailCheckRecord) {
+// awaitAudit must be true when the violation came from the >0.85 band, whose
+// audit judge is still running: the record is then held back until that
+// verdict lands (see take).
+func (b *guardrailRecordBox) offerViolation(record guardrailCheckRecord, awaitAudit bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.locked {
@@ -280,6 +303,10 @@ func (b *guardrailRecordBox) offerViolation(record guardrailCheckRecord) {
 	}
 	b.pending = &record
 	b.locked = true
+	b.auditPending = awaitAudit
+	if awaitAudit {
+		b.auditDeadline = time.Now().Add(guardrailAuditVerdictWait)
+	}
 }
 
 // setAuditVerdict fills the >0.85 band's fire-and-forget audit judge verdict
@@ -300,6 +327,8 @@ func (b *guardrailRecordBox) setAuditVerdict(verdict string) bool {
 	check.Judge.Ran = true
 	check.Judge.AuditOnly = true
 	check.Judge.Verdict = verdict
+	// Fully resolved now, so the record may be released.
+	b.auditPending = false
 	return true
 }
 
@@ -308,9 +337,33 @@ func (b *guardrailRecordBox) setAuditVerdict(verdict string) bool {
 func (b *guardrailRecordBox) take() *guardrailCheckRecord {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Hold the record while the >0.85 band's audit verdict is outstanding.
+	//
+	// That band interrupts on similarity alone, and its audit judge is the ONLY
+	// false-positive detector for it, answering a few hundred ms later. The
+	// interrupt commits whatever was already spoken as a chunk almost
+	// immediately, so releasing the record now would hand it to that partial
+	// chunk and the verdict would then arrive to an empty box and be dropped --
+	// the detector would produce nothing, ever.
+	//
+	// Returning nil lets the partial chunk through without metrics; the
+	// regenerated chunk, committed seconds later, collects the resolved record
+	// instead. Deliberately does NOT block: take() runs on the call-events
+	// dispatcher during the Redis chunk write, and stalling that to wait on a
+	// judge would be far worse than losing telemetry.
+	//
+	// Judge-band violations already know their verdict, are not held, and their
+	// record lands on the partial chunk -- which IS the violating turn, and the
+	// honest place for it.
+	if b.pending != nil && b.auditPending && time.Now().Before(b.auditDeadline) {
+		return nil
+	}
+
 	record := b.pending
 	b.pending = nil
 	b.locked = false
+	b.auditPending = false
 	return record
 }
 

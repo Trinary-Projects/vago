@@ -548,7 +548,7 @@ func TestChunkDecoratorGuardrailIgnoresToolPairChunk(t *testing.T) {
 func TestChunkDecoratorGuardrailUploadFailureKeepsMetrics(t *testing.T) {
 	uploader := &stubJSONUploader{err: errors.New("s3 down")}
 	decorate, _, guardrailBox := newTestDecoratorWithGuardrail(t, uploader)
-	guardrailBox.offerViolation(testGuardrailCheckRecord(0.94, true))
+	guardrailBox.offerViolation(testGuardrailCheckRecord(0.94, true), false)
 
 	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
 	decorate(chunk)
@@ -584,7 +584,7 @@ func TestChunkDecoratorGuardrailPayloadIncludesEveryCheck(t *testing.T) {
 		CheckCount:    3,
 		Status:        "ok",
 	}
-	guardrailBox.offerViolation(record)
+	guardrailBox.offerViolation(record, false)
 
 	chunk := &ConversationChunk{ID: "chunk-1", Role: "assistant"}
 	decorate(chunk)
