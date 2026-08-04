@@ -92,7 +92,7 @@ INSTRUCTION_CLASS = "GuardrailInstruction"
 # Deliberately NOT the same as --threshold: --threshold only controls the
 # "would qualify" summary line, while these two are the real product bands
 # probe results are judged against.
-JUDGE_THRESHOLD = 0.70
+JUDGE_THRESHOLD = 0.55  # TEST-ONLY, see disha/guardrail_record.go
 INTERRUPT_THRESHOLD = 0.85
 
 # Single source of truth for the class definitions: the same files you can
