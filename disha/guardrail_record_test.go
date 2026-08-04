@@ -234,3 +234,73 @@ func TestGuardrailCheckRecordPayloadIncludesEveryCheck(t *testing.T) {
 		t.Errorf("top similarity = %v, want 0.40", top["similarity"])
 	}
 }
+
+// Regression for staging call 287f66ae. Each offer from a turn carries the
+// whole accumulated check list, so a later offer is a strict superset; but
+// selectedSimilarity is the max across that list and so only non-decreasing.
+// Comparing on similarity alone with a strict > therefore discarded the more
+// complete record whenever the newest check was not the best one — the live
+// call persisted check_count 1 for a turn that had run two checks.
+func TestGuardrailRecordBoxPrefersTheMoreCompleteRecord(t *testing.T) {
+	box := &guardrailRecordBox{}
+
+	first := guardrailCheckRecord{
+		Checks:        []guardrailCheck{{Index: 1, Top: &guardrailTopHit{Similarity: 0.6176}}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+	}
+	// The second check scored LOWER, so the cumulative record's selected
+	// similarity is unchanged — but it now holds both checks.
+	second := guardrailCheckRecord{
+		Checks: []guardrailCheck{
+			{Index: 1, Top: &guardrailTopHit{Similarity: 0.6176}},
+			{Index: 2, Top: &guardrailTopHit{Similarity: 0.6172}},
+		},
+		SelectedIndex: 0,
+		CheckCount:    2,
+	}
+
+	box.offer(first)
+	box.offer(second)
+
+	got := box.take()
+	if got == nil {
+		t.Fatal("expected a pending record")
+	}
+	if len(got.Checks) != 2 {
+		t.Fatalf("kept %d checks, want 2 — the more complete record must win even when "+
+			"its selected similarity ties", len(got.Checks))
+	}
+	if got.SelectedIndex != 0 {
+		t.Fatalf("SelectedIndex = %d, want 0 (the higher-scoring check)", got.SelectedIndex)
+	}
+}
+
+// A violation still beats a later, more complete non-violating record: the box
+// locks, so completeness must not override the record that actually fired.
+func TestGuardrailRecordBoxViolationBeatsMoreCompleteRecord(t *testing.T) {
+	box := &guardrailRecordBox{}
+
+	box.offerViolation(guardrailCheckRecord{
+		Checks:        []guardrailCheck{{Index: 1, Violated: true, Top: &guardrailTopHit{Similarity: 0.91}}},
+		SelectedIndex: 0,
+		CheckCount:    1,
+		Interrupted:   true,
+	})
+	box.offer(guardrailCheckRecord{
+		Checks: []guardrailCheck{
+			{Index: 1, Top: &guardrailTopHit{Similarity: 0.91}},
+			{Index: 2, Top: &guardrailTopHit{Similarity: 0.40}},
+		},
+		SelectedIndex: 0,
+		CheckCount:    2,
+	})
+
+	got := box.take()
+	if got == nil || !got.Interrupted {
+		t.Fatalf("expected the violating record to survive, got %+v", got)
+	}
+	if len(got.Checks) != 1 {
+		t.Fatalf("violating record was overwritten by a later offer: %d checks", len(got.Checks))
+	}
+}

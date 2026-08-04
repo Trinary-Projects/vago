@@ -230,15 +230,31 @@ type guardrailRecordBox struct {
 }
 
 // offer keeps the better of the pending and the given record: ignored once the
-// box is locked by a violation; otherwise the record with the higher
-// selected-check similarity wins.
+// box is locked by a violation; otherwise the MORE COMPLETE record wins, with
+// similarity only as a tie-break.
+//
+// Completeness has to come first. Every offer from a turn carries that turn's
+// whole accumulated check list, so a later offer is a strict superset of an
+// earlier one, while selectedSimilarity is the max across the list and is
+// therefore merely non-decreasing — equal whenever the newly finished check
+// was not the best one.
+//
+// Comparing on similarity alone with a strict > silently dropped those
+// records. Observed on staging call 287f66ae: turn two ran two checks,
+// 0.6176 then 0.6172. The second offer held BOTH checks but still scored
+// 0.6176, so `0.6176 > 0.6176` was false and the one-check record survived —
+// the chunk persisted check_count 1 while its turn_text covered the sentence
+// whose check had been discarded.
 func (b *guardrailRecordBox) offer(record guardrailCheckRecord) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.locked {
 		return
 	}
-	if b.pending == nil || record.selectedSimilarity() > b.pending.selectedSimilarity() {
+	if b.pending == nil ||
+		len(record.Checks) > len(b.pending.Checks) ||
+		(len(record.Checks) == len(b.pending.Checks) &&
+			record.selectedSimilarity() > b.pending.selectedSimilarity()) {
 		b.pending = &record
 	}
 }
