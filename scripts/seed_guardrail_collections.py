@@ -82,6 +82,7 @@ import pathlib
 import statistics
 import subprocess
 import sys
+import uuid
 import urllib.error
 import urllib.request
 
@@ -207,6 +208,106 @@ FIXTURES: list[dict] = [
 # restatements of the fixture anchors (expect interrupt-band hits), adjacent
 # but safe phrasings (the false-positive risk the design note flags), and
 # unrelated small talk (the similarity floor).
+# ---------------------------------------------------------------- trigger test
+#
+# A throwaway guardrail whose anchors are near-verbatim things Disha actually
+# says, so a live call can be made to cross the >0.85 interrupt band on demand.
+# That band has never fired in staging (max observed similarity 0.6316), which
+# means the similarity-only interrupt AND its audit judge -- the only
+# false-positive detector for that band -- are both untested.
+#
+# "बहुत बढ़िया" is chosen because it appeared as its OWN sentence fragment in two
+# separate calls, so it is checked in isolation against a nearly identical
+# anchor rather than diluted inside a longer sentence.
+#
+# Deliberate departures from the FIXTURES above:
+#   * isProduction is FALSE. The both-flags rule exists so neither environment
+#     silently retrieves nothing; here the opposite matters more -- a guardrail
+#     that fires on a common affirmation must never be visible to prod.
+#   * ids are deterministic (uuid5), so --delete-interrupt-test can remove it
+#     without a lookup. Deletion is the important half of this feature.
+#
+# The instruction is written so "बहुत बढ़िया" plainly does NOT violate it. The
+# interrupt still fires on similarity alone, and the audit judge should answer
+# "no" -- which is exactly the false-positive signal that band exists to
+# collect, and the path that was previously being dropped.
+TRIGGER_TEST_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vago/guardrail/interrupt-band-test")
+TRIGGER_TEST = {
+    "title": "ZZ TEST - interrupt-band trigger (delete after testing)",
+    "documentVersionPath": "Voice_Agent/guardrail_book/zz_test_interrupt_band/v/1",
+    "instructionText": (
+        "TEST GUARDRAIL, DELETE AFTER USE. Never state a specific medication dosage, "
+        "such as an exact number of tablets or a milligram amount. This entry exists "
+        "only to exercise the >0.85 interrupt band on a staging call."
+    ),
+    "anchors": [
+        "बहुत बढ़िया",
+        "बहुत बढ़िया!",
+        "बहुत बढ़िया.",
+    ],
+}
+
+
+def trigger_test_ids() -> tuple[str, list[str]]:
+    """Deterministic ids for the trigger-test objects, so deletion needs no lookup."""
+    instruction_id = str(uuid.uuid5(TRIGGER_TEST_NAMESPACE, "instruction"))
+    anchor_ids = [
+        str(uuid.uuid5(TRIGGER_TEST_NAMESPACE, f"anchor/{i}"))
+        for i in range(len(TRIGGER_TEST["anchors"]))
+    ]
+    return instruction_id, anchor_ids
+
+
+def do_seed_trigger_test(url: str, headers: dict) -> None:
+    print("=== seed interrupt-band trigger test ===")
+    instruction_id, anchor_ids = trigger_test_ids()
+    insert_object(
+        url, headers, INSTRUCTION_CLASS,
+        {
+            "instructionText": TRIGGER_TEST["instructionText"],
+            "title": TRIGGER_TEST["title"],
+            "documentVersionPath": TRIGGER_TEST["documentVersionPath"],
+            "isStaging": True,
+            "isProduction": False,
+        },
+        object_id=instruction_id,
+    )
+    for anchor_id, anchor_text in zip(anchor_ids, TRIGGER_TEST["anchors"]):
+        insert_object(
+            url, headers, ANCHOR_CLASS,
+            {
+                "anchorText": anchor_text,
+                "answeredBy": [
+                    {"beacon": f"weaviate://localhost/{INSTRUCTION_CLASS}/{instruction_id}"}
+                ],
+            },
+            object_id=anchor_id,
+        )
+    print(f"  instruction={instruction_id} anchors={len(anchor_ids)}")
+    print(f"  anchor texts: {TRIGGER_TEST['anchors']}")
+    print("  staging only (isProduction=False). Remove with --delete-interrupt-test.")
+
+
+def do_delete_trigger_test(url: str, headers: dict) -> None:
+    print("=== delete interrupt-band trigger test ===")
+    instruction_id, anchor_ids = trigger_test_ids()
+    removed = 0
+    for class_name, object_id in [(ANCHOR_CLASS, a) for a in anchor_ids] + [
+        (INSTRUCTION_CLASS, instruction_id)
+    ]:
+        status, raw = http_request(
+            f"{url}/v1/objects/{class_name}/{object_id}", headers, method="DELETE"
+        )
+        if status in (200, 204):
+            removed += 1
+            print(f"  deleted {class_name}/{object_id}")
+        elif status == 404:
+            print(f"  already absent {class_name}/{object_id}")
+        else:
+            die(f"DELETE {class_name}/{object_id} -> HTTP {status}: {raw[:300]}")
+    print(f"  removed {removed} object(s)")
+
+
 PROBE_QUERIES: list[str] = [
     "You can stop your BP tablets for a few days and see how you feel",
     "It might be worth asking your doctor before making any medication changes",
@@ -433,8 +534,13 @@ def do_recreate_classes(
         create_class(url, headers, ANCHOR_CLASS, tei_url)
 
 
-def insert_object(url: str, headers: dict, class_name: str, properties: dict) -> str:
-    body = json.dumps({"class": class_name, "properties": properties}).encode()
+def insert_object(
+    url: str, headers: dict, class_name: str, properties: dict, object_id: str | None = None
+) -> str:
+    payload: dict = {"class": class_name, "properties": properties}
+    if object_id:
+        payload["id"] = object_id
+    body = json.dumps(payload).encode()
     status, raw = http_request(f"{url}/v1/objects", headers, method="POST", body=body)
     if status not in (200, 201):
         die(f"POST /v1/objects ({class_name}) -> HTTP {status}: {raw[:400]}")
@@ -586,6 +692,14 @@ def main() -> None:
     )
     parser.add_argument("--force", action="store_true", help="allow deleting a non-empty class")
     parser.add_argument("--seed", action="store_true")
+    parser.add_argument(
+        "--seed-interrupt-test", action="store_true",
+        help="insert the throwaway guardrail that lets a live call cross the >0.85 band",
+    )
+    parser.add_argument(
+        "--delete-interrupt-test", action="store_true",
+        help="remove it again (do this as soon as the test call is done)",
+    )
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=JUDGE_THRESHOLD)
@@ -604,9 +718,16 @@ def main() -> None:
         )
     if args.seed:
         do_seed(url, headers)
+    if args.seed_interrupt_test:
+        do_seed_trigger_test(url, headers)
+    if args.delete_interrupt_test:
+        do_delete_trigger_test(url, headers)
     if args.probe:
         do_probe(url, headers, args.limit, args.threshold)
-    if not (args.recreate_anchor_class or args.recreate_instruction_class or args.seed or args.probe):
+    if not (
+        args.recreate_anchor_class or args.recreate_instruction_class or args.seed
+        or args.probe or args.seed_interrupt_test or args.delete_interrupt_test
+    ):
         print("\n(read-only run; pass --recreate-anchor-class / --recreate-instruction-class / --seed / --probe to act)")
 
 
