@@ -232,13 +232,59 @@ func newGuardrailJudgeClientFactory(deps Deps, logger *log.Logger, userID, conve
 	}
 }
 
-// guardrailJudgeOutput is the assumed judge output contract: a JSON object
-// with a boolean verdict. Field name is an assumption pending the real
-// Langfuse prompt (design note §5.6 TODO) — until it exists every real judge
-// call fails at GetDocument below and this band always fails open, so only
-// the >0.85 band functions.
+// guardrailJudgeOutput is the judge output contract: a JSON object carrying a
+// "violated" verdict.
 type guardrailJudgeOutput struct {
-	Violated bool `json:"violated"`
+	Violated guardrailJudgeVerdict `json:"violated"`
+}
+
+// guardrailJudgeVerdict decodes "violated" from either a JSON boolean or a
+// quoted string.
+//
+// Both forms are real. The staging prompt
+// (followup_call/guardrails/test_prompt) specifies `"violated": "true" or
+// "false"` — quoted STRINGS — while a bare bool is the shape a reader would
+// assume. A strict bool decode rejected the string form outright, and because
+// an unparseable verdict fails OPEN (§8) the whole judge band went quiet
+// without erroring anywhere visible. Accepting both costs nothing and removes
+// a silent failure mode that depends on how a human happened to word a prompt.
+type guardrailJudgeVerdict bool
+
+func (v *guardrailJudgeVerdict) UnmarshalJSON(b []byte) error {
+	var asBool bool
+	if err := json.Unmarshal(b, &asBool); err == nil {
+		*v = guardrailJudgeVerdict(asBool)
+		return nil
+	}
+	var asString string
+	if err := json.Unmarshal(b, &asString); err == nil {
+		switch strings.ToLower(strings.TrimSpace(asString)) {
+		case "true", "yes", "violated", "1":
+			*v = true
+			return nil
+		case "false", "no", "not_violated", "0":
+			*v = false
+			return nil
+		}
+		return fmt.Errorf("unrecognised violated value %q", asString)
+	}
+	return fmt.Errorf("violated is neither boolean nor string: %s", string(b))
+}
+
+// guardrailJSONObject extracts the outermost {...} span from raw model output.
+//
+// Models wrap JSON in markdown fences — the staging prompt literally asks for
+// a ```-fenced block — and some add a sentence of preamble. Either defeats a
+// bare Unmarshal of the whole response. Taking the first "{" through the last
+// "}" handles fences, prose and both together without needing to recognise
+// each wrapper individually. Returns "" when there is no object at all.
+func guardrailJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end < start {
+		return ""
+	}
+	return s[start : end+1]
 }
 
 // parseGuardrailJudgeOutput strips <think>...</think> (thinkBlockRe, shared
@@ -247,14 +293,15 @@ type guardrailJudgeOutput struct {
 // unparseable output, which the caller treats as fail-open.
 func parseGuardrailJudgeOutput(raw string) (violated, ok bool) {
 	cleaned := strings.TrimSpace(thinkBlockRe.ReplaceAllString(raw, ""))
-	if cleaned == "" {
+	object := guardrailJSONObject(cleaned)
+	if object == "" {
 		return false, false
 	}
 	var out guardrailJudgeOutput
-	if err := json.Unmarshal([]byte(cleaned), &out); err != nil {
+	if err := json.Unmarshal([]byte(object), &out); err != nil {
 		return false, false
 	}
-	return out.Violated, true
+	return bool(out.Violated), true
 }
 
 func guardrailVerdictString(violated bool) string {
@@ -585,9 +632,14 @@ func (c *guardrailChecker) runJudge(judgeCtx, reportCtx context.Context, instruc
 		return fail(errors.New("disha: guardrail judge client factory is not configured"))
 	}
 
+	// Key names must match the deployed prompt exactly. It reads {{guardrail}}
+	// and {{fragment}}; sending "guardrail_instruction" rendered the guardrail
+	// line EMPTY, so the judge was asked to rule on a fragment against no rule
+	// at all — and still answered, which is why this surfaced as a parse
+	// problem rather than an obvious blank-prompt error.
 	variables := DocumentVariables{
-		"guardrail_instruction": instructionText,
-		"fragment":              fragment,
+		"guardrail": instructionText,
+		"fragment":  fragment,
 	}
 	sysText, version, err := c.docs.GetDocument(judgeCtx, guardrailJudgePromptName, 0, variables)
 	if err != nil {

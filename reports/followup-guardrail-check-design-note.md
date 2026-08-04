@@ -356,13 +356,20 @@ the >0.85 band functioning.
 
 The prompt must satisfy three things, all enforced by `runJudge`:
 
-1. It renders with exactly two variables, `guardrail_instruction` and
-   `fragment`.
+1. It renders with exactly two variables, `guardrail` and `fragment`. These
+   must match the prompt's placeholders exactly: sending
+   `guardrail_instruction` against a prompt reading `{{guardrail}}` rendered
+   the guardrail line EMPTY on staging call d822753b, so the judge ruled on a
+   fragment against no rule at all.
 2. It is sent as the **only** message, role `system`. There is no separate
    user message carrying the fragment, so the prompt itself must place
    `{{ fragment }}`.
-3. It returns a bare JSON object `{"violated": true|false}`. A
-   `<think>…</think>` preamble is stripped first.
+3. It returns a JSON object carrying `violated`. The parser is deliberately
+   tolerant: `true`/`false`, the quoted `"true"`/`"false"` the staging prompt
+   asks for, and `yes`/`no` all decode, a `<think>…</think>` preamble is
+   stripped, and the object is extracted from first `{` to last `}` so
+   markdown fences and surrounding prose do not matter. Tolerance is the point
+   — every parse failure here fails OPEN and silently disables the band.
 
 Note the failure mode this creates: **malformed, empty, or unparseable output
 is treated as not-violated** (§8), so a prompt that chats around its JSON

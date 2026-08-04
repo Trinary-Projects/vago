@@ -184,7 +184,7 @@ func TestGuardrailCheckInterruptBandFiresWithoutBlockingOnJudge(t *testing.T) {
 func TestGuardrailCheckJudgeBandViolatedInterrupts(t *testing.T) {
 	body := fmt.Sprintf(guardrailAnchorResponseTemplate, guardrailAnchorHit("a1", "instr-2", "borderline instruction", distanceFor(0.83)))
 	client := newStubWeaviate(t, body, nil)
-	docs := newTestGuardrailDocs(t, "judge instruction={{guardrail_instruction}} fragment={{fragment}}")
+	docs := newTestGuardrailDocs(t, "judge instruction={{guardrail}} fragment={{fragment}}")
 	factory := stubJudgeFactory(&stubGuardrailLLMClient{output: `{"violated":true}`, model: "judge-model"}, nil)
 	checker, box, _, _ := newTestGuardrailChecker(t, client, factory, docs)
 
@@ -752,5 +752,47 @@ func TestGuardrailAccumulateDoesNotDoubleSpaces(t *testing.T) {
 	}
 	if turn == "One.   Two." {
 		t.Fatal("inserted a space despite both sides already having one")
+	}
+}
+
+// The judge's raw output arrives in whatever shape the prompt and model
+// negotiate. Every case below was either produced live or is explicitly asked
+// for by the deployed staging prompt, and each one previously failed to parse
+// — which fails OPEN, so the band went quiet with nothing logged as broken.
+func TestParseGuardrailJudgeOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		wantViolated bool
+		wantOK       bool
+	}{
+		{"bare bool true", `{"violated": true}`, true, true},
+		{"bare bool false", `{"violated": false}`, false, true},
+		// What followup_call/guardrails/test_prompt actually specifies.
+		{"quoted string true", `{"violated": "true"}`, true, true},
+		{"quoted string false", `{"violated": "false"}`, false, true},
+		{"yes/no", `{"violated": "yes"}`, true, true},
+		{"no", `{"violated": "no"}`, false, true},
+		// The prompt asks for a ```-fenced block.
+		{"fenced json", "```json\n{\"violated\": true}\n```", true, true},
+		{"fenced plain", "```\n{\"violated\": false}\n```", false, true},
+		{"prose around it", "Sure! Here is the verdict:\n{\"violated\": true}\nHope that helps.", true, true},
+		{"think block then fenced", "<think>hmm</think>\n```json\n{\"violated\": true}\n```", true, true},
+		{"whitespace", "  \n{\"violated\": true}\n  ", true, true},
+		// Still fails open.
+		{"empty", "", false, false},
+		{"no object", "I think it is fine.", false, false},
+		{"unparseable verdict", `{"violated": "maybe"}`, false, false},
+		{"malformed json", `{"violated": tru`, false, false},
+		{"only think block", "<think>reasoning</think>", false, false},
+	} {
+		violated, ok := parseGuardrailJudgeOutput(tc.raw)
+		if ok != tc.wantOK {
+			t.Errorf("%s: ok = %v, want %v (raw=%q)", tc.name, ok, tc.wantOK, tc.raw)
+			continue
+		}
+		if ok && violated != tc.wantViolated {
+			t.Errorf("%s: violated = %v, want %v", tc.name, violated, tc.wantViolated)
+		}
 	}
 }
