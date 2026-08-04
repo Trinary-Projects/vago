@@ -434,9 +434,12 @@ func (c *guardrailChecker) accumulate(fragment string) (index int, turnText stri
 }
 
 // maybeReportFanout captures ONE Sentry event per turn once check volume
-// exceeds guardrailFanoutSentryThreshold, then keeps going — reusing
-// endsWithPunctuation for fragment boundaries produces clause-level (not
-// sentence-level) fan-out, so this is expected to be noisy at the threshold.
+// exceeds guardrailFanoutSentryThreshold, then keeps going (there is no cap).
+//
+// Fragments are whole sentences (voicepipelinecore.endsWithSentenceTerminator),
+// so a typical turn is ~3 checks and crossing 10 means a genuinely unusual
+// turn worth looking at — not routine traffic. That was not true of the
+// earlier clause-level boundary, under which this alert would have been noise.
 func (c *guardrailChecker) maybeReportFanout(index int) {
 	if index <= guardrailFanoutSentryThreshold {
 		return
