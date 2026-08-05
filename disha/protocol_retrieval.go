@@ -753,7 +753,12 @@ func (b *protocolRecordBox) take() *protocolRetrievalRecord {
 // protocolTemplateRenderer renders only protocol instruction text against the
 // call's prompt variables. Production uses Gonja; narrow so tests can stub it.
 type protocolTemplateRenderer interface {
-	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (string, error)
+	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (protocolTemplateRenderResult, error)
+}
+
+type protocolTemplateRenderResult struct {
+	Text             string
+	MissingVariables []string
 }
 
 // protocolEnricher implements voicepipelinecore.MessagesEnricher.
@@ -976,7 +981,7 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 	}
 
 	startedAt := time.Now()
-	text, err := e.renderer.RenderTemplate(r.budgetCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
+	result, err := e.renderer.RenderTemplate(r.budgetCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
 	elapsedMs := float64(time.Since(startedAt).Microseconds()) / 1000.0
 	r.totalMs += elapsedMs
 	r.count++
@@ -991,6 +996,10 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 		e.dropUnrendered(r.turnCtx, candidate, err)
 		return "", false
 	}
+	if len(result.MissingVariables) > 0 {
+		e.reportMissingProtocolVariables(candidate, result.MissingVariables)
+	}
+	text := result.Text
 	if templateNeedsRender(text) {
 		e.dropUnrendered(r.turnCtx, candidate, errors.New("template syntax survived rendering"))
 		return "", false
@@ -1001,6 +1010,30 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 		return "", false
 	}
 	return trimmed, true
+}
+
+func (e *protocolEnricher) reportMissingProtocolVariables(candidate protocolCandidate, names []string) {
+	err := fmt.Errorf("protocol template references missing variables: %s", strings.Join(names, ", "))
+	if e.logger != nil {
+		e.logger.Printf("disha: protocol %s (%s) rendered with missing variables: %s\n", shortID(candidate.InstructionID), candidate.Title, strings.Join(names, ", "))
+	}
+	event := sentryutil.Event{
+		Hub: e.sentryHub(),
+		Err: err,
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": "protocol_instruction_missing_variables",
+		},
+		Details: map[string]any{
+			"conversation_id":       e.conversationID,
+			"user_id":               e.userID,
+			"instruction_id":        candidate.InstructionID,
+			"document_version_path": candidate.DocumentPath,
+			"title":                 candidate.Title,
+			"missing_variables":     append([]string(nil), names...),
+		},
+	}
+	sentryutil.Capture(event)
 }
 
 // templateNeedsRender reports whether text carries Jinja syntax. Deliberately

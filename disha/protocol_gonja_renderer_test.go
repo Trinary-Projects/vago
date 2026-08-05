@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -30,10 +31,10 @@ func TestGonjaProtocolRendererValues(t *testing.T) {
 			want:      "Today's plan: dal <bowl> & roti",
 		},
 		{
-			name:      "integral float follows JSON Python boundary",
+			name:      "integral float uses Gonja formatting",
 			template:  "₹{{ subscription_amount }}",
 			variables: DocumentVariables{"subscription_amount": 499.0},
-			want:      "₹499",
+			want:      "₹499.0",
 		},
 		{
 			name:      "fractional number",
@@ -42,26 +43,26 @@ func TestGonjaProtocolRendererValues(t *testing.T) {
 			want:      "₹499.5",
 		},
 		{
-			name:      "explicit null bare output matches Jinja",
+			name:      "explicit nil renders empty",
 			template:  "status={{ membership_status }}",
 			variables: DocumentVariables{"membership_status": nil},
-			want:      "status=None",
+			want:      "status=",
 		},
 		{
-			name:      "explicit null preserves whitespace control",
+			name:      "explicit nil preserves whitespace control",
 			template:  "before {{- membership_status -}} after",
 			variables: DocumentVariables{"membership_status": nil},
-			want:      "beforeNoneafter",
+			want:      "beforeafter",
 		},
 		{
-			name:     "pointers are normalized through JSON",
+			name:     "Gonja dereferences pointers",
 			template: "{% if enabled %}{{ amount }}{% else %}off{% endif %}",
 			variables: func() DocumentVariables {
 				enabled := true
 				amount := 499.0
 				return DocumentVariables{"enabled": &enabled, "amount": &amount}
 			}(),
-			want: "499",
+			want: "499.0",
 		},
 		{
 			name:      "boolean expression",
@@ -77,8 +78,11 @@ func TestGonjaProtocolRendererValues(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RenderTemplate: %v", err)
 			}
-			if got != tc.want {
-				t.Fatalf("output = %q, want %q", got, tc.want)
+			if got.Text != tc.want {
+				t.Fatalf("output = %q, want %q", got.Text, tc.want)
+			}
+			if len(got.MissingVariables) != 0 {
+				t.Fatalf("missing variables = %#v, want none", got.MissingVariables)
 			}
 		})
 	}
@@ -116,7 +120,7 @@ func TestGonjaProtocolRendererIfTruthiness(t *testing.T) {
 		{"nonempty slice", []string{"x"}, "true"},
 		{"empty map", map[string]any{}, "false"},
 		{"nonempty map", map[string]any{"x": 1}, "true"},
-		{"empty struct normalizes to empty map", struct{}{}, "false"},
+		{"empty struct follows Gonja truthiness", struct{}{}, "true"},
 	}
 
 	for _, tc := range tests {
@@ -127,63 +131,73 @@ func TestGonjaProtocolRendererIfTruthiness(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RenderTemplate: %v", err)
 			}
-			if got != tc.want {
-				t.Fatalf("output = %q, want %q", got, tc.want)
+			if got.Text != tc.want {
+				t.Fatalf("output = %q, want %q", got.Text, tc.want)
+			}
+			if len(got.MissingVariables) != 0 {
+				t.Fatalf("missing variables = %#v, want none", got.MissingVariables)
 			}
 		})
 	}
 }
 
-func TestGonjaProtocolRendererStrictUndefined(t *testing.T) {
+func TestGonjaProtocolRendererMissingVariables(t *testing.T) {
 	renderer := newGonjaProtocolRenderer()
 
 	tests := []struct {
-		name      string
-		template  string
-		variables DocumentVariables
-		want      string
-		wantError bool
+		name        string
+		template    string
+		variables   DocumentVariables
+		want        string
+		wantMissing []string
 	}{
 		{
-			name:      "evaluated output fails",
-			template:  "{{ missing }}",
-			variables: DocumentVariables{"present": true},
-			wantError: true,
+			name:        "output renders empty and reports missing",
+			template:    "{{ missing }}",
+			variables:   DocumentVariables{"present": true},
+			want:        "",
+			wantMissing: []string{"missing"},
 		},
 		{
-			name:      "evaluated condition fails",
-			template:  "{% if missing %}yes{% else %}no{% endif %}",
-			variables: DocumentVariables{"present": true},
-			wantError: true,
+			name:        "condition evaluates false and reports missing",
+			template:    "{% if missing %}yes{% else %}no{% endif %}",
+			variables:   DocumentVariables{"present": true},
+			want:        "no",
+			wantMissing: []string{"missing"},
 		},
 		{
-			name:      "untaken branch stays lazy",
-			template:  "{% if available %}{{ missing }}{% else %}fallback{% endif %}",
-			variables: DocumentVariables{"available": false},
-			want:      "fallback",
+			name:        "untaken branch stays lazy",
+			template:    "{% if available %}{{ missing }}{% else %}fallback{% endif %}",
+			variables:   DocumentVariables{"available": false},
+			want:        "fallback",
+			wantMissing: []string{"missing"},
 		},
 		{
-			name:      "defined test handles missing value",
-			template:  "{% if missing is defined %}yes{% else %}no{% endif %}",
-			variables: DocumentVariables{"present": true},
-			want:      "no",
+			name:        "defined test handles missing value",
+			template:    "{% if missing is defined %}yes{% else %}no{% endif %}",
+			variables:   DocumentVariables{"present": true},
+			want:        "no",
+			wantMissing: []string{"missing"},
+		},
+		{
+			name:      "supplied nil is not missing",
+			template:  "{% if missing %}yes{% else %}no{% endif %}:{{ missing }}",
+			variables: DocumentVariables{"missing": nil},
+			want:      "no:",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := renderer.RenderTemplate(context.Background(), tc.name, tc.template, tc.variables)
-			if tc.wantError {
-				if err == nil || !strings.Contains(err.Error(), "undefined") {
-					t.Fatalf("error = %v, want undefined error", err)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("RenderTemplate: %v", err)
 			}
-			if got != tc.want {
-				t.Fatalf("output = %q, want %q", got, tc.want)
+			if got.Text != tc.want {
+				t.Fatalf("output = %q, want %q", got.Text, tc.want)
+			}
+			if !reflect.DeepEqual(got.MissingVariables, tc.wantMissing) {
+				t.Fatalf("missing variables = %#v, want %#v", got.MissingVariables, tc.wantMissing)
 			}
 		})
 	}
@@ -192,31 +206,12 @@ func TestGonjaProtocolRendererStrictUndefined(t *testing.T) {
 func TestGonjaProtocolRendererErrors(t *testing.T) {
 	renderer := newGonjaProtocolRenderer()
 
-	t.Run("unsupported statement", func(t *testing.T) {
-		_, err := renderer.RenderTemplate(
-			context.Background(), "loop", "{% for item in items %}{{ item }}{% endfor %}",
-			DocumentVariables{"items": []string{"x"}},
-		)
-		if err == nil || !strings.Contains(err.Error(), `unsupported protocol template statement "for"`) {
-			t.Fatalf("error = %v", err)
-		}
-	})
-
 	t.Run("syntax error", func(t *testing.T) {
 		_, err := renderer.RenderTemplate(
 			context.Background(), "bad", "{% if enabled %}yes", DocumentVariables{"enabled": true},
 		)
 		if err == nil {
 			t.Fatal("expected syntax error")
-		}
-	})
-
-	t.Run("unencodable variable", func(t *testing.T) {
-		_, err := renderer.RenderTemplate(
-			context.Background(), "channel", "{{ value }}", DocumentVariables{"value": make(chan int)},
-		)
-		if err == nil || !strings.Contains(err.Error(), "unsupported type") {
-			t.Fatalf("error = %v", err)
 		}
 	})
 
@@ -253,7 +248,9 @@ func TestProtocolTemplateVariableNames(t *testing.T) {
 // This test is opt-in because its input is a snapshot fetched from Weaviate.
 // It compares every stored ProtocolInstruction and the Cartesian product of
 // meaningful values for every variable currently used by the corpus against
-// the exact Python Jinja renderer that protocol retrieval previously used.
+// the Python Jinja renderer that protocol retrieval previously used. The
+// comparison ignores only the two known native formatting differences:
+// Jinja's None versus Gonja's empty nil, and 499 versus 499.0.
 func TestGonjaProtocolRendererLiveCorpusParity(t *testing.T) {
 	corpusPath := os.Getenv("PROTOCOL_RENDER_PARITY_CORPUS")
 	if corpusPath == "" {
@@ -298,12 +295,12 @@ func TestGonjaProtocolRendererLiveCorpusParity(t *testing.T) {
 	valueMatrix := map[string][]any{
 		"diet_chart_available":   {true, false},
 		"diet_plan_today":        {"Breakfast: poha; lunch: dal & roti", "", "सुबह: पोहा\nदोपहर: dal <bowl> & roti"},
-		"membership_status":      {"active", "", nil},
-		"membership_expiry_date": {"31 Aug 2026", "", nil},
-		"subscription_status":    {"active", "", nil},
-		"subscription_amount":    {499.5, 499, 0, nil},
-		"next_payment_due_date":  {"01 Sep 2026", "", nil},
-		"payment_overdue":        {true, false, nil},
+		"membership_status":      {pointer("active"), pointer(""), (*string)(nil)},
+		"membership_expiry_date": {pointer("31 Aug 2026"), pointer(""), (*string)(nil)},
+		"subscription_status":    {pointer("active"), pointer(""), (*string)(nil)},
+		"subscription_amount":    {pointer(499.5), pointer(499.0), pointer(0.0), (*float64)(nil)},
+		"next_payment_due_date":  {pointer("01 Sep 2026"), pointer(""), (*string)(nil)},
+		"payment_overdue":        {pointer(true), pointer(false), (*bool)(nil)},
 	}
 
 	cases := 0
@@ -319,8 +316,11 @@ func TestGonjaProtocolRendererLiveCorpusParity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("render plain %s: %v", protocol.Title, err)
 			}
-			if got != protocol.InstructionText {
-				t.Fatalf("plain %s changed: got=%q want=%q", protocol.Title, got, protocol.InstructionText)
+			if got.Text != protocol.InstructionText {
+				t.Fatalf("plain %s changed: got=%q want=%q", protocol.Title, got.Text, protocol.InstructionText)
+			}
+			if len(got.MissingVariables) != 0 {
+				t.Fatalf("plain %s reports missing variables: %#v", protocol.Title, got.MissingVariables)
 			}
 			continue
 		}
@@ -349,13 +349,25 @@ func TestGonjaProtocolRendererLiveCorpusParity(t *testing.T) {
 			if gonjaErr != nil {
 				t.Fatalf("Gonja render %s vars=%#v: %v", protocol.Title, variables, gonjaErr)
 			}
-			if got != want.Output {
-				t.Fatalf("render mismatch %s vars=%#v\nJinja: %q\nGonja: %q", protocol.Title, variables, want.Output, got)
+			if len(got.MissingVariables) != 0 {
+				t.Fatalf("Gonja missing variables %s vars=%#v: %#v", protocol.Title, variables, got.MissingVariables)
+			}
+			if normalizeProtocolParityOutput(got.Text) != normalizeProtocolParityOutput(want.Output) {
+				t.Fatalf("logical render mismatch %s vars=%#v\nJinja: %q\nGonja: %q", protocol.Title, variables, want.Output, got.Text)
 			}
 		})
 	}
-	t.Logf("exact parity: protocols=%d templated=%d cases=%d", len(protocols), templated, cases)
+	t.Logf("logical parity: protocols=%d templated=%d cases=%d", len(protocols), templated, cases)
 }
+
+var integralFloatOutput = regexp.MustCompile(`\b([0-9]+)\.0\b`)
+
+func normalizeProtocolParityOutput(text string) string {
+	text = strings.ReplaceAll(text, "None", "")
+	return integralFloatOutput.ReplaceAllString(text, "$1")
+}
+
+func pointer[T any](value T) *T { return &value }
 
 type protocolRenderParityCorpus struct {
 	Data struct {

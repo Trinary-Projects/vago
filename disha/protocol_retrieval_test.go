@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/weaviate"
 	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
@@ -629,23 +630,23 @@ type stubRenderer struct {
 	vars  []DocumentVariables
 }
 
-func (r *stubRenderer) RenderTemplate(ctx context.Context, _ string, text string, variables DocumentVariables) (string, error) {
+func (r *stubRenderer) RenderTemplate(ctx context.Context, _ string, text string, variables DocumentVariables) (protocolTemplateRenderResult, error) {
 	r.mu.Lock()
 	r.vars = append(r.vars, variables)
 	err, block := r.err, r.block
 	r.mu.Unlock()
 	if block {
 		<-ctx.Done()
-		return "", ctx.Err()
+		return protocolTemplateRenderResult{}, ctx.Err()
 	}
 	if err != nil {
-		return "", err
+		return protocolTemplateRenderResult{}, err
 	}
 	for name, value := range variables {
 		text = strings.ReplaceAll(text, "{{"+name+"}}", fmt.Sprint(value))
 		text = strings.ReplaceAll(text, "{{ "+name+" }}", fmt.Sprint(value))
 	}
-	return text, nil
+	return protocolTemplateRenderResult{Text: text}, nil
 }
 
 func (r *stubRenderer) calls() []DocumentVariables {
@@ -761,6 +762,48 @@ func TestEnricherRendersInstructionVariables(t *testing.T) {
 	}
 	if record.Injected[0].Text != "Today's plan: dal chawal at 1pm" {
 		t.Errorf("resident text = %q, want the rendered text", record.Injected[0].Text)
+	}
+}
+
+func TestEnricherReportsMissingVariablesAndKeepsRenderedProtocol(t *testing.T) {
+	body := fmt.Sprintf(anchorResponseTemplate,
+		anchorHit("a1", "instr-A", "Membership status: {{ missing_status }}", 0.1, 3))
+	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
+	enricher.renderer = newGonjaProtocolRenderer()
+
+	transport := &sentry.MockTransport{}
+	client, err := sentry.NewClient(sentry.ClientOptions{Transport: transport})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	hub := sentry.NewHub(client, sentry.NewScope())
+	hub.Scope().SetTag("task_scope", "protocol-test")
+	enricher.SetSentryHub(hub)
+
+	out := enricher.Enrich(context.Background(), conversation("membership ka status kya hai"))
+	block := findProtocolBlock(t, out)
+	if !strings.Contains(block, "Membership status:") {
+		t.Fatalf("protocol rendered with a missing value was dropped:\n%s", block)
+	}
+	if strings.Contains(block, "missing_status") || strings.Contains(block, "{{") {
+		t.Fatalf("missing template syntax leaked into the protocol block:\n%s", block)
+	}
+
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("Sentry events = %d, want 1", len(events))
+	}
+	event := events[0]
+	if event.Tags["operation"] != "protocol_instruction_missing_variables" {
+		t.Fatalf("operation tag = %q", event.Tags["operation"])
+	}
+	if event.Tags["task_scope"] != "protocol-test" {
+		t.Fatalf("task-scoped Sentry tag missing: %#v", event.Tags)
+	}
+	details := event.Contexts["details"]
+	names, ok := details["missing_variables"].([]string)
+	if !ok || len(names) != 1 || names[0] != "missing_status" {
+		t.Fatalf("missing variable details = %#v", details["missing_variables"])
 	}
 }
 
