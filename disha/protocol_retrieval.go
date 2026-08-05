@@ -750,10 +750,15 @@ func (b *protocolRecordBox) take() *protocolRetrievalRecord {
 	return record
 }
 
-// templateRenderer renders a protocol's instruction text against the call's
-// prompt variables. Satisfied by *DocumentStore; narrow so tests can stub it.
-type templateRenderer interface {
-	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (string, error)
+// protocolTemplateRenderer renders only protocol instruction text against the
+// call's prompt variables. Production uses Gonja; narrow so tests can stub it.
+type protocolTemplateRenderer interface {
+	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (protocolTemplateRenderResult, error)
+}
+
+type protocolTemplateRenderResult struct {
+	Text             string
+	MissingVariables []string
 }
 
 // protocolEnricher implements voicepipelinecore.MessagesEnricher.
@@ -762,7 +767,7 @@ type protocolEnricher struct {
 	store    *ProtocolStore
 	box      *protocolRecordBox
 	logger   *log.Logger
-	renderer templateRenderer
+	renderer protocolTemplateRenderer
 
 	router promptMetadataSetter
 	ui     serverMessageEmitter
@@ -782,7 +787,7 @@ func newProtocolEnricher(
 	store *ProtocolStore,
 	box *protocolRecordBox,
 	logger *log.Logger,
-	renderer templateRenderer,
+	renderer protocolTemplateRenderer,
 	baseMetadata map[string]any,
 	baseVariables DocumentVariables,
 	userID, conversationID string,
@@ -942,9 +947,8 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 // A protocol whose template fails to render is DROPPED, not injected raw:
 // leaking `{% if diet_chart_available %}` into the context shows the model both
 // branches of a conditional as if both were true, which is worse than the
-// protocol being absent. Text with no template syntax (28 of the 30 live
-// protocols) skips the renderer entirely, so the common case costs no IPC on
-// this blocking path.
+// protocol being absent. Text with no template syntax skips the renderer
+// entirely, so the common case does no template parsing on this blocking path.
 //
 // budgetCtx carries whatever is left of protocolRetrievalBudget after the
 // vector query, and every render shares it — the step cannot exceed the budget
@@ -977,7 +981,7 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 	}
 
 	startedAt := time.Now()
-	text, err := e.renderer.RenderTemplate(r.budgetCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
+	result, err := e.renderer.RenderTemplate(r.budgetCtx, protocolRenderLabel(candidate), candidate.Text, e.baseVariables)
 	elapsedMs := float64(time.Since(startedAt).Microseconds()) / 1000.0
 	r.totalMs += elapsedMs
 	r.count++
@@ -992,6 +996,10 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 		e.dropUnrendered(r.turnCtx, candidate, err)
 		return "", false
 	}
+	if len(result.MissingVariables) > 0 {
+		e.reportMissingProtocolVariables(candidate, result.MissingVariables)
+	}
+	text := result.Text
 	if templateNeedsRender(text) {
 		e.dropUnrendered(r.turnCtx, candidate, errors.New("template syntax survived rendering"))
 		return "", false
@@ -1002,6 +1010,30 @@ func (r *instructionRenderer) render(candidate protocolCandidate) (string, bool)
 		return "", false
 	}
 	return trimmed, true
+}
+
+func (e *protocolEnricher) reportMissingProtocolVariables(candidate protocolCandidate, names []string) {
+	err := fmt.Errorf("protocol template references missing variables: %s", strings.Join(names, ", "))
+	if e.logger != nil {
+		e.logger.Printf("disha: protocol %s (%s) rendered with missing variables: %s\n", shortID(candidate.InstructionID), candidate.Title, strings.Join(names, ", "))
+	}
+	event := sentryutil.Event{
+		Hub: e.sentryHub(),
+		Err: err,
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": "protocol_instruction_missing_variables",
+		},
+		Details: map[string]any{
+			"conversation_id":       e.conversationID,
+			"user_id":               e.userID,
+			"instruction_id":        candidate.InstructionID,
+			"document_version_path": candidate.DocumentPath,
+			"title":                 candidate.Title,
+			"missing_variables":     append([]string(nil), names...),
+		},
+	}
+	sentryutil.Capture(event)
 }
 
 // templateNeedsRender reports whether text carries Jinja syntax. Deliberately
