@@ -750,9 +750,9 @@ func (b *protocolRecordBox) take() *protocolRetrievalRecord {
 	return record
 }
 
-// templateRenderer renders a protocol's instruction text against the call's
-// prompt variables. Satisfied by *DocumentStore; narrow so tests can stub it.
-type templateRenderer interface {
+// protocolTemplateRenderer renders only protocol instruction text against the
+// call's prompt variables. Production uses Gonja; narrow so tests can stub it.
+type protocolTemplateRenderer interface {
 	RenderTemplate(ctx context.Context, label, text string, variables DocumentVariables) (string, error)
 }
 
@@ -762,7 +762,7 @@ type protocolEnricher struct {
 	store    *ProtocolStore
 	box      *protocolRecordBox
 	logger   *log.Logger
-	renderer templateRenderer
+	renderer protocolTemplateRenderer
 
 	router promptMetadataSetter
 	ui     serverMessageEmitter
@@ -782,7 +782,7 @@ func newProtocolEnricher(
 	store *ProtocolStore,
 	box *protocolRecordBox,
 	logger *log.Logger,
-	renderer templateRenderer,
+	renderer protocolTemplateRenderer,
 	baseMetadata map[string]any,
 	baseVariables DocumentVariables,
 	userID, conversationID string,
@@ -942,9 +942,8 @@ func (e *protocolEnricher) retrieve(ctx context.Context, query string) protocolR
 // A protocol whose template fails to render is DROPPED, not injected raw:
 // leaking `{% if diet_chart_available %}` into the context shows the model both
 // branches of a conditional as if both were true, which is worse than the
-// protocol being absent. Text with no template syntax (28 of the 30 live
-// protocols) skips the renderer entirely, so the common case costs no IPC on
-// this blocking path.
+// protocol being absent. Text with no template syntax skips the renderer
+// entirely, so the common case does no template parsing on this blocking path.
 //
 // budgetCtx carries whatever is left of protocolRetrievalBudget after the
 // vector query, and every render shares it — the step cannot exceed the budget

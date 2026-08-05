@@ -619,7 +619,7 @@ func (s *stubMetadataSetter) snapshot() (map[string]any, int) {
 	return s.metadata, s.calls
 }
 
-// stubRenderer stands in for the Jinja subprocess. It does a literal
+// stubRenderer stands in for the protocol template renderer. It does a literal
 // `{{ name }}` substitution and nothing else, which is enough to prove the
 // enricher routes instruction text through a renderer and handles the outcomes.
 type stubRenderer struct {
@@ -733,9 +733,8 @@ func TestEnricherInjectsAndRecords(t *testing.T) {
 	}
 }
 
-// Two of the 30 live protocols carry Jinja. Their instruction text must be
-// rendered against the same variable store the call's prompts were rendered
-// with, so the model never sees `{% if diet_chart_available %}`.
+// Templated protocols must be rendered against the same variable store the
+// call's prompts were rendered with, so the model never sees raw Jinja syntax.
 func TestEnricherRendersInstructionVariables(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate,
 		anchorHit("a1", "instr-A", "Today's plan: {{ diet_plan_today }}", 0.1, 3))
@@ -765,8 +764,8 @@ func TestEnricherRendersInstructionVariables(t *testing.T) {
 	}
 }
 
-// Protocols without template syntax — 28 of the 30 live ones — must not pay
-// for an IPC round trip on this blocking path.
+// Protocols without template syntax must not pay for parsing/rendering on this
+// blocking path.
 func TestEnricherSkipsRendererForPlainText(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "plain protocol body", 0.1, 3))
 	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
@@ -1126,10 +1125,15 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 				PromptVariables: DocumentVariables{},
 				Callbacks:       &CallEventCallbacks{},
 			}
-			setupProtocolRetrieval(pl, nil)
+			setupProtocolRetrieval(pl)
 
 			if got := pl.ProtocolEnricher != nil; got != tc.want {
 				t.Errorf("enricher present = %v, want %v", got, tc.want)
+			}
+			if tc.want {
+				if _, ok := pl.ProtocolEnricher.renderer.(*gonjaProtocolRenderer); !ok {
+					t.Errorf("renderer = %T, want *gonjaProtocolRenderer", pl.ProtocolEnricher.renderer)
+				}
 			}
 			if got := pl.Callbacks.chunkDecorator != nil; got != tc.want {
 				t.Errorf("chunk decorator registered = %v, want %v", got, tc.want)
@@ -1149,7 +1153,7 @@ func TestSetupProtocolRetrievalMissingWeaviateConfig(t *testing.T) {
 		Dynamic:   true,
 		Callbacks: &CallEventCallbacks{},
 	}
-	setupProtocolRetrieval(pl, nil)
+	setupProtocolRetrieval(pl)
 
 	if pl.ProtocolEnricher != nil {
 		t.Error("enricher should not be built without Weaviate config")

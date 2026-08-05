@@ -112,7 +112,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
-	setupProtocolRetrieval(pl, deps.Documents)
+	setupProtocolRetrieval(pl)
 	return pl, nil
 }
 
@@ -123,7 +123,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 //
 // A missing/incomplete Weaviate env is treated as "feature off" rather than a
 // call failure — the same posture as the other optional S3-backed features.
-func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
+func setupProtocolRetrieval(pl *followUpPlan) {
 	if !protocolRetrievalEnabled() {
 		return
 	}
@@ -150,7 +150,7 @@ func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer) {
 		NewProtocolStore(),
 		box,
 		pl.Startup.Logger,
-		renderer,
+		newGonjaProtocolRenderer(),
 		pl.PromptMetadata,
 		pl.PromptVariables,
 		pl.Startup.UserID,
