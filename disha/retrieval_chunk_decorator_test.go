@@ -57,7 +57,7 @@ func newTestDecorator(t *testing.T, uploader JSONUploader) (func(*ConversationCh
 	t.Helper()
 	box := &protocolRecordBox{}
 	decorator := newRetrievalChunkDecorator(
-		box, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
+		box, nil, uploader, log.New(io.Discard, "", 0), "user-1", "conv-1", FollowUpBotType,
 	)
 	return decorator, box
 }

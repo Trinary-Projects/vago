@@ -89,13 +89,12 @@ type ConversationChunk struct {
 // ChunkRetrievalMetrics is the per-chunk umbrella for every retrieval-shaped
 // step on a turn, matching the one-row-per-chunk backend table.
 //
-// Each step gets its own namespaced sub-object rather than flat fields, so the
-// planned post-LLM guardrail step (vector lookup, sometimes an LLM call, then
-// interrupt-and-regenerate) can be added as a sibling `Guardrail
-// *GuardrailCheckMetrics `json:"guardrail,omitempty"“ without renaming or
-// re-keying anything that already ships.
+// Each step gets its own namespaced sub-object rather than flat fields, so
+// protocol retrieval and the post-LLM guardrail check can merge independently
+// without renaming or re-keying anything that already ships.
 type ChunkRetrievalMetrics struct {
-	Protocol *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+	Protocol  *ProtocolRetrievalMetrics `json:"protocol,omitempty"`
+	Guardrail *GuardrailCheckMetrics    `json:"guardrail,omitempty"`
 }
 
 // ProtocolRetrievalMetrics summarizes one protocol-retrieval round. The full
@@ -116,6 +115,18 @@ type ProtocolRetrievalMetrics struct {
 	ProtocolsS3Key string `json:"protocols_s3_key"`
 	Status         string `json:"status"` // ok | skipped | error | timeout
 	Error          string `json:"error,omitempty"`
+}
+
+type GuardrailCheckMetrics struct {
+	E2EMs           float64  `json:"e2e_ms"`           // slowest check in the turn
+	SimilarityScore *float64 `json:"similarity_score"` // HIGHEST across the turn's sentences
+	Interrupted     bool     `json:"interrupted"`
+	CheckCount      int      `json:"check_count"`          // captured
+	ChecksFired     int      `json:"checks_fired"`         // started; > CheckCount means the turn was truncated
+	QueryText       string   `json:"query_text,omitempty"` // whole turn; seeds the live-query anchor
+	RawDataS3Key    string   `json:"raw_data_s3_key"`
+	Status          string   `json:"status"` // ok | skipped | error
+	Error           string   `json:"error,omitempty"`
 }
 
 type UpdateConversationRequest struct {
