@@ -9,6 +9,10 @@ import (
 )
 
 // ResponseGuard checks one completed sentence of an in-flight LLM response.
+// The index is the sentence's 1-based text-order position within its turn;
+// only sentences that fire checks are numbered. Implementations must treat
+// it as the authoritative ordering because checks run concurrently and may
+// start in any order.
 // It returns true when the sentence violates a policy and the turn must be
 // interrupted and regenerated. Implementations own all policy, recording and
 // error handling; a guard that cannot decide must return false (fail open).
@@ -17,7 +21,7 @@ import (
 // supply the implementation (Disha's follow-up calls check against a vector
 // store of response policies), keeping vector databases and judge prompts out
 // of the pipeline package.
-type ResponseGuard func(ctx context.Context, fragment string) bool
+type ResponseGuard func(ctx context.Context, index int, fragment string) bool
 
 // ResponseGuardProcessor sits between LLMOutputFilterProcessor and
 // TTSProcessor. It observes the downstream TextFrame stream of the LLM's
@@ -237,7 +241,7 @@ func (p *ResponseGuardProcessor) handleText(text string) {
 func (p *ResponseGuardProcessor) fireCheck(turnCtx context.Context, index int, sentence string) {
 	p.Go(func() {
 		start := time.Now()
-		violated := p.guard(turnCtx, sentence)
+		violated := p.guard(turnCtx, index, sentence)
 		elapsedMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 		if turnCtx.Err() != nil {

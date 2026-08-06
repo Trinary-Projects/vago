@@ -153,7 +153,7 @@ func TestGuardrailThresholdRouting(t *testing.T) {
 			ui := &guardrailUIRecorder{}
 			checker.SetUI(ui)
 
-			if got := checker.Check(context.Background(), "raw fragment."); got != tc.wantResult {
+			if got := checker.Check(context.Background(), 1, "raw fragment."); got != tc.wantResult {
 				t.Fatalf("Check() = %v, want %v", got, tc.wantResult)
 			}
 			record := box.take()
@@ -171,18 +171,23 @@ func TestGuardrailThresholdRouting(t *testing.T) {
 				t.Errorf("similarity = %v, want %v", check.Similarity, tc.similarity)
 			}
 			messages := ui.snapshot()
-			wantMessages := 0
-			if tc.wantBand == "offline_judge" || tc.wantResult {
-				wantMessages = 1
+			if len(messages) != 1 {
+				t.Fatalf("RTVI messages = %v, want 1", messages)
 			}
-			if len(messages) != wantMessages {
-				t.Fatalf("RTVI messages = %v, want %d", messages, wantMessages)
+			data := messages[0].(map[string]any)
+			if got := payloadKeys(data); got != "band,fragment,index,latency_ms,query_ms,similarity,status,title,type,violated" {
+				t.Fatalf("RTVI keys = %s", got)
 			}
-			if len(messages) == 1 {
-				data := messages[0].(map[string]any)
-				if data["type"] != "guardrail_check" || data["band"] != tc.wantBand || data["violated"] != tc.wantResult {
-					t.Fatalf("RTVI data = %+v", data)
-				}
+			if data["type"] != "guardrail_check" || data["index"] != 1 || data["status"] != "ok" ||
+				data["band"] != tc.wantBand || data["violated"] != tc.wantResult ||
+				!guardrailFloatEqual(data["similarity"].(float64), tc.similarity) {
+				t.Fatalf("RTVI data = %+v", data)
+			}
+			if data["latency_ms"].(float64) < 0 || data["query_ms"].(float64) < 0 {
+				t.Fatalf("RTVI latency data = %+v", data)
+			}
+			if data["fragment"] != "raw fragment." {
+				t.Fatalf("RTVI fragment = %v", data["fragment"])
 			}
 
 			query := stub.query(0)
@@ -213,7 +218,7 @@ func TestGuardrailDedupeKeepsBestAnchorAndSelectsTopInstruction(t *testing.T) {
 	})
 	checker, box, _ := newGuardrailTestChecker(t, client)
 
-	if !checker.Check(context.Background(), "fragment.") {
+	if !checker.Check(context.Background(), 1, "fragment.") {
 		t.Fatal("best deduped candidate should interrupt")
 	}
 	record := box.take()
@@ -242,14 +247,48 @@ func TestGuardrailTurnSimilarityIsMaximumAcrossSentences(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	checker.Check(ctx, "first.")
-	checker.Check(ctx, "second.")
+	checker.Check(ctx, 1, "first.")
+	checker.Check(ctx, 2, "second.")
 	record := box.take()
 	if record.highestSimilarity == nil || !guardrailFloatEqual(*record.highestSimilarity, second) {
 		t.Fatalf("highest similarity = %v, want %v", record.highestSimilarity, second)
 	}
 	if record.CheckCount != 2 || record.ChecksFired != 2 {
 		t.Fatalf("counts = completed %d fired %d", record.CheckCount, record.ChecksFired)
+	}
+}
+
+func TestGuardrailChecksStayInTextOrderWhenArrivalIsOutOfOrder(t *testing.T) {
+	indexThreeSimilarity := guardrailOfflineJudgeThreshold - 0.05
+	indexTwoSimilarity := guardrailOfflineJudgeThreshold - 0.15
+	responses := []float64{indexThreeSimilarity, indexTwoSimilarity}
+	client, _ := newGuardrailStubClient(t, func(call int) (int, any) {
+		return http.StatusOK, guardrailGraphQLResponse(
+			guardrailHit("anchor", "instruction", "Instruction", "Title", responses[call]),
+		)
+	})
+	checker, box, _ := newGuardrailTestChecker(t, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	checker.Check(ctx, 3, "third sentence.")
+	checker.Check(ctx, 2, "second sentence.")
+
+	record := box.take()
+	if record == nil || len(record.Checks) != 2 {
+		t.Fatalf("record = %+v", record)
+	}
+	if record.TurnText != "second sentence. third sentence." {
+		t.Fatalf("turn text = %q", record.TurnText)
+	}
+	second, third := record.Checks[0], record.Checks[1]
+	if second.Index != 2 || second.Fragment != "second sentence." || second.Similarity == nil ||
+		!guardrailFloatEqual(*second.Similarity, indexTwoSimilarity) {
+		t.Fatalf("index 2 check = %+v", second)
+	}
+	if third.Index != 3 || third.Fragment != "third sentence." || third.Similarity == nil ||
+		!guardrailFloatEqual(*third.Similarity, indexThreeSimilarity) {
+		t.Fatalf("index 3 check = %+v", third)
 	}
 }
 
@@ -263,7 +302,9 @@ func TestGuardrailQueryErrorFailsOpenAndCapturesSentry(t *testing.T) {
 	})
 	checker, box, transport := newGuardrailTestChecker(t, client)
 
-	if checker.Check(context.Background(), "fragment.") {
+	ui := &guardrailUIRecorder{}
+	checker.SetUI(ui)
+	if checker.Check(context.Background(), 1, "fragment.") {
 		t.Fatal("query error must fail open")
 	}
 	record := box.take()
@@ -280,6 +321,21 @@ func TestGuardrailQueryErrorFailsOpenAndCapturesSentry(t *testing.T) {
 	}
 	if events[0].Tags["operation"] != "guardrail_check" {
 		t.Fatalf("Sentry tags = %v", events[0].Tags)
+	}
+	messages := ui.snapshot()
+	if len(messages) != 1 {
+		t.Fatalf("RTVI messages = %v, want 1", messages)
+	}
+	data := messages[0].(map[string]any)
+	if got := payloadKeys(data); got != "band,fragment,index,latency_ms,query_ms,status,type,violated" {
+		t.Fatalf("RTVI keys = %s", got)
+	}
+	if data["type"] != "guardrail_check" || data["index"] != 1 || data["status"] != "error" ||
+		data["band"] != "error" || data["violated"] != false {
+		t.Fatalf("RTVI data = %+v", data)
+	}
+	if fragment, ok := data["fragment"].(string); !ok || fragment == "" {
+		t.Fatalf("RTVI error payload missing fragment excerpt: %+v", data)
 	}
 }
 
@@ -312,9 +368,11 @@ func TestGuardrailCancelledQueryDoesNotCaptureSentryAndLeavesPlaceholder(t *test
 		t.Fatalf("weaviate.New: %v", err)
 	}
 	checker, box, transport := newGuardrailTestChecker(t, client)
+	ui := &guardrailUIRecorder{}
+	checker.SetUI(ui)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan bool, 1)
-	go func() { done <- checker.Check(ctx, "cancel me.") }()
+	go func() { done <- checker.Check(ctx, 1, "cancel me.") }()
 	<-started
 	cancel()
 	close(release)
@@ -333,6 +391,9 @@ func TestGuardrailCancelledQueryDoesNotCaptureSentryAndLeavesPlaceholder(t *test
 	if len(transport.Events()) != 0 {
 		t.Fatalf("context cancellation emitted Sentry: %+v", transport.Events())
 	}
+	if messages := ui.snapshot(); len(messages) != 0 {
+		t.Fatalf("cancelled check emitted RTVI: %+v", messages)
+	}
 }
 
 func TestGuardrailFanoutSentryFiresOncePerTurn(t *testing.T) {
@@ -347,7 +408,7 @@ func TestGuardrailFanoutSentryFiresOncePerTurn(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	defer cancel1()
 	for i := 0; i < guardrailFanoutSentryThreshold+3; i++ {
-		checker.Check(ctx1, "sentence.")
+		checker.Check(ctx1, i+1, "sentence.")
 	}
 	if got := len(transport.Events()); got != 1 {
 		t.Fatalf("first turn Sentry events = %d, want 1", got)
@@ -359,7 +420,7 @@ func TestGuardrailFanoutSentryFiresOncePerTurn(t *testing.T) {
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	for i := 0; i < guardrailFanoutSentryThreshold+1; i++ {
-		checker.Check(ctx2, "another sentence.")
+		checker.Check(ctx2, i+1, "another sentence.")
 	}
 	if got := len(transport.Events()); got != 2 {
 		t.Fatalf("two turns Sentry events = %d, want 2", got)
@@ -629,8 +690,8 @@ func TestGuardrailNewTurnContextResetsRecordAndCounters(t *testing.T) {
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 
-	checker.Check(ctx1, "old turn.")
-	checker.Check(ctx2, "new turn.")
+	checker.Check(ctx1, 1, "old turn.")
+	checker.Check(ctx2, 1, "new turn.")
 	record := box.take()
 	if record.ChecksFired != 1 || record.CheckCount != 1 || len(record.Checks) != 1 {
 		t.Fatalf("new-turn counters were not reset: %+v", record)

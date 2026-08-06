@@ -78,7 +78,7 @@ func (c *guardrailChecker) SetUI(ui serverMessageEmitter) {
 // Check is the ResponseGuard. It never returns true on an infrastructure
 // failure: failing open is safer than truncating a valid response and burning
 // the turn's one regeneration.
-func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
+func (c *guardrailChecker) Check(ctx context.Context, index int, fragment string) bool {
 	startedAt := time.Now()
 
 	c.mu.Lock()
@@ -110,19 +110,22 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 		// old one; by then the old chunk was taken or can no longer commit first.
 	}
 
-	index := c.checksFired + 1
 	c.checksFired++
 	c.record.ChecksFired = c.checksFired
 	// Copy-on-write keeps every shallow record snapshot in guardrailRecordBox
 	// immutable while another sentence finishes on a different goroutine.
+	insertAt := sort.Search(len(c.record.Checks), func(i int) bool {
+		return c.record.Checks[i].Index >= index
+	})
 	checks := make([]guardrailSentenceCheck, len(c.record.Checks)+1)
-	copy(checks, c.record.Checks)
-	checks[len(checks)-1] = guardrailSentenceCheck{
+	copy(checks, c.record.Checks[:insertAt])
+	checks[insertAt] = guardrailSentenceCheck{
 		Index:      index,
 		Fragment:   fragment,
 		Status:     "cancelled",
 		Candidates: []guardrailCandidate{},
 	}
+	copy(checks[insertAt+1:], c.record.Checks[insertAt:])
 	c.record.Checks = checks
 	c.record.TurnText = guardrailTurnText(c.record.Checks)
 	c.box.put(*c.record)
@@ -134,10 +137,11 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	if reportFanout {
 		c.fanoutReported = true
 	}
+	checksFired := c.checksFired
 	c.mu.Unlock()
 
 	if reportFanout {
-		c.reportFanout(index)
+		c.reportFanout(checksFired)
 	}
 
 	queryCtx, cancel := context.WithTimeout(ctx, guardrailCheckTimeout)
@@ -166,7 +170,12 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 		}
 		totalMs := guardrailElapsedMs(startedAt)
 		checks := append([]guardrailSentenceCheck(nil), c.record.Checks...)
-		check := &checks[index-1]
+		check := guardrailCheckByIndex(checks, index)
+		if check == nil {
+			c.mu.Unlock()
+			c.reportPlaceholderMissing(index)
+			return false
+		}
 		check.Status = "error"
 		check.Band = "error"
 		check.Error = err.Error()
@@ -179,8 +188,10 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 			c.record.slowestTotalMs = totalMs
 		}
 		c.box.put(*c.record)
+		ui := c.ui
 		c.mu.Unlock()
 
+		emitGuardrailCheckResult(ui, index, fragment, "error", "error", false, totalMs, vectorQueryMs, nil, nil)
 		c.reportFailure(ctx, err, fragment, index, totalMs)
 		return false
 	}
@@ -223,7 +234,12 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	}
 	totalMs := guardrailElapsedMs(startedAt)
 	checks = append([]guardrailSentenceCheck(nil), c.record.Checks...)
-	check := &checks[index-1]
+	check := guardrailCheckByIndex(checks, index)
+	if check == nil {
+		c.mu.Unlock()
+		c.reportPlaceholderMissing(index)
+		return false
+	}
 	check.Similarity = similarity
 	check.Band = band
 	check.Violated = violated
@@ -275,18 +291,42 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	ui := c.ui
 	c.mu.Unlock()
 
-	if (band == "offline_judge" || violated) && top != nil && ui != nil {
-		ui.ServerMessage(map[string]any{
-			"type":           "guardrail_check",
-			"index":          index,
-			"similarity":     *similarity,
-			"band":           band,
-			"violated":       violated,
-			"title":          top.Title,
-			"instruction_id": top.InstructionID,
-		}, time.Now())
-	}
+	emitGuardrailCheckResult(ui, index, fragment, "ok", band, violated, totalMs, vectorQueryMs, similarity, top)
 	return violated
+}
+
+func emitGuardrailCheckResult(
+	ui serverMessageEmitter,
+	index int,
+	fragment string,
+	status, band string,
+	violated bool,
+	totalMs, queryMs float64,
+	similarity *float64,
+	top *guardrailTopHit,
+) {
+	if ui == nil {
+		return
+	}
+	data := map[string]any{
+		"type":  "guardrail_check",
+		"index": index,
+		// Truncated start only — the full sentence stays out of the RTVI
+		// stream by design; it lives in the S3 record.
+		"fragment":   guardrailLogExcerpt(fragment, 60),
+		"status":     status,
+		"band":       band,
+		"violated":   violated,
+		"latency_ms": totalMs,
+		"query_ms":   queryMs,
+	}
+	if similarity != nil {
+		data["similarity"] = *similarity
+	}
+	if top != nil {
+		data["title"] = top.Title
+	}
+	ui.ServerMessage(data, time.Now())
 }
 
 // EnrichCorrection appends the matched instruction to the regeneration's
@@ -397,6 +437,40 @@ func guardrailCompletedCheckCount(checks []guardrailSentenceCheck) int {
 		}
 	}
 	return count
+}
+
+// guardrailCheckByIndex returns nil when the placeholder is missing — an
+// invariant breach (fire always creates it under the same turn identity), but
+// this runs on background check goroutines, so callers must fail open rather
+// than let a panic take down the whole multi-session worker.
+func guardrailCheckByIndex(checks []guardrailSentenceCheck, index int) *guardrailSentenceCheck {
+	for i := range checks {
+		if checks[i].Index == index {
+			return &checks[i]
+		}
+	}
+	return nil
+}
+
+// reportPlaceholderMissing makes the invariant breach loud without crashing:
+// the check's result is dropped (fail open) and the bug is surfaced once.
+func (c *guardrailChecker) reportPlaceholderMissing(index int) {
+	if c.logger != nil {
+		c.logger.Printf("disha: guardrail check %d placeholder missing, result dropped\n", index)
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Hub:     c.sentryHub(),
+		Message: "guardrail check placeholder missing, result dropped",
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": "guardrail_check",
+		},
+		Details: map[string]any{
+			"conversation_id": c.conversationID,
+			"user_id":         c.userID,
+			"index":           index,
+		},
+	})
 }
 
 func guardrailElapsedMs(startedAt time.Time) float64 {

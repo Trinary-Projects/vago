@@ -24,7 +24,7 @@ func TestResponseGuardForwardsTextFramesRegardlessOfVerdict(t *testing.T) {
 			fix := newTestFixture(t)
 			release := make(chan struct{})
 			guardStarted := make(chan struct{}, 1)
-			guard := func(context.Context, string) bool {
+			guard := func(context.Context, int, string) bool {
 				guardStarted <- struct{}{}
 				<-release
 				return verdict
@@ -75,10 +75,10 @@ func TestResponseGuardForwardsTextFramesRegardlessOfVerdict(t *testing.T) {
 func TestResponseGuardOneCheckPerSentence(t *testing.T) {
 	fix := newTestFixture(t)
 	var mu sync.Mutex
-	var seen []string
-	guard := func(_ context.Context, fragment string) bool {
+	seen := make(map[int]string)
+	guard := func(_ context.Context, index int, fragment string) bool {
 		mu.Lock()
-		seen = append(seen, fragment)
+		seen[index] = fragment
 		mu.Unlock()
 		return false
 	}
@@ -96,7 +96,9 @@ func TestResponseGuardOneCheckPerSentence(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assertSameSentences(t, seen, []string{"Sentence one.", "Sentence two."})
+	if len(seen) != 2 || seen[1] != "Sentence one." || seen[2] != "Sentence two." {
+		t.Fatalf("indexed checks = %v", seen)
+	}
 }
 
 // 3. A delta straddling a sentence boundary still yields one check per
@@ -105,7 +107,7 @@ func TestResponseGuardDeltaStraddlingSentenceBoundary(t *testing.T) {
 	fix := newTestFixture(t)
 	var mu sync.Mutex
 	var seen []string
-	guard := func(_ context.Context, fragment string) bool {
+	guard := func(_ context.Context, _ int, fragment string) bool {
 		mu.Lock()
 		seen = append(seen, fragment)
 		mu.Unlock()
@@ -134,7 +136,7 @@ func TestResponseGuardDeltaStraddlingSentenceBoundary(t *testing.T) {
 func TestResponseGuardSkipsPunctuationOnlyFragments(t *testing.T) {
 	fix := newTestFixture(t)
 	var calls atomic.Int32
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		calls.Add(1)
 		return false
 	}
@@ -162,7 +164,7 @@ func TestResponseGuardConcurrentViolationsProduceOneInterrupt(t *testing.T) {
 	const n = 3
 	var waiting atomic.Int32
 	release := make(chan struct{})
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		waiting.Add(1)
 		<-release
 		return true
@@ -203,7 +205,7 @@ func TestResponseGuardConcurrentViolationsProduceOneInterrupt(t *testing.T) {
 func TestResponseGuardSkipTurnConsumedByOneGeneration(t *testing.T) {
 	fix := newTestFixture(t)
 	var calls atomic.Int32
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		calls.Add(1)
 		return true
 	}
@@ -237,7 +239,7 @@ func TestResponseGuardSkipTurnConsumedByOneGeneration(t *testing.T) {
 func TestResponseGuardForeignInterruptClearsSkipTurn(t *testing.T) {
 	fix := newTestFixture(t)
 	var calls atomic.Int32
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		calls.Add(1)
 		return true
 	}
@@ -270,7 +272,7 @@ func TestResponseGuardForeignInterruptClearsSkipTurn(t *testing.T) {
 func TestResponseGuardInterruptCancelsInFlightChecks(t *testing.T) {
 	fix := newTestFixture(t)
 	observedCancel := make(chan struct{})
-	guard := func(ctx context.Context, fragment string) bool {
+	guard := func(ctx context.Context, _ int, fragment string) bool {
 		select {
 		case <-ctx.Done():
 			close(observedCancel)
@@ -303,7 +305,7 @@ func TestResponseGuardInterruptCancelsInFlightChecks(t *testing.T) {
 func TestResponseGuardEndFrameCancelsInFlightChecks(t *testing.T) {
 	fix := newTestFixture(t)
 	observedCancel := make(chan struct{})
-	guard := func(ctx context.Context, fragment string) bool {
+	guard := func(ctx context.Context, _ int, fragment string) bool {
 		select {
 		case <-ctx.Done():
 			close(observedCancel)
@@ -336,7 +338,7 @@ func TestResponseGuardSlowGuardNeverDelaysTextFrames(t *testing.T) {
 	fix := newTestFixture(t)
 	release := make(chan struct{})
 	guardStarted := make(chan struct{}, 1)
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		guardStarted <- struct{}{}
 		<-release
 		return false
@@ -386,7 +388,7 @@ func TestResponseGuardSlowGuardNeverDelaysTextFrames(t *testing.T) {
 func TestResponseGuardViolationCancelsRemainingChecks(t *testing.T) {
 	fix := newTestFixture(t)
 	observedCancel := make(chan struct{})
-	guard := func(ctx context.Context, fragment string) bool {
+	guard := func(ctx context.Context, _ int, fragment string) bool {
 		if strings.Contains(fragment, "Trigger") {
 			return true
 		}
@@ -422,7 +424,7 @@ func TestResponseGuardStaleCheckWithTrueVerdictDropped(t *testing.T) {
 	fix := newTestFixture(t)
 	release := make(chan struct{})
 	guardStarted := make(chan struct{}, 1)
-	guard := func(context.Context, string) bool {
+	guard := func(context.Context, int, string) bool {
 		guardStarted <- struct{}{}
 		<-release
 		return true // must still be dropped: the turn is cancelled before this returns.
@@ -471,7 +473,7 @@ func TestResponseGuardStragglerFromPreviousTurnNeverAttachesToNext(t *testing.T)
 	fix := newTestFixture(t)
 	release := make(chan struct{})
 	guardStarted := make(chan struct{}, 1)
-	guard := func(_ context.Context, fragment string) bool {
+	guard := func(_ context.Context, _ int, fragment string) bool {
 		if fragment == "Stale sentence." {
 			guardStarted <- struct{}{}
 			<-release
