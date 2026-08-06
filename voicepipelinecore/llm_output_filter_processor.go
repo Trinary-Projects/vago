@@ -15,16 +15,19 @@ var (
 )
 
 type llmOutputFilterState struct {
-	suppressing       bool
-	suppressionReason string
-	suppressionPrefix string
-	suppressedText    string
-	anyTextPushed     bool
+	suppressing         bool
+	suppressionReason   string
+	suppressionPrefix   string
+	suppressedText      string
+	anyTextPushed       bool
+	pendingKillAfter    string
+	pendingKillAfterDir Direction
 }
 
 // LLMOutputFilterProcessor filters known LLM hallucination/control-token
-// leaks before they reach TTS. It mirrors Disha backend's
-// bots.llm_output_filter.LLMOutputFilter behavior.
+// leaks before they reach TTS. It follows Disha backend's
+// bots.llm_output_filter.LLMOutputFilter behavior while handling kill-after
+// prefixes safely across streaming frame boundaries.
 type LLMOutputFilterProcessor struct {
 	*BaseProcessor
 	taskCtx           *TaskContext
@@ -60,7 +63,11 @@ func (p *LLMOutputFilterProcessor) ProcessFrame(ctx context.Context, frame Frame
 	case TextFrame:
 		p.handleTextFrame(f, dir)
 	case LLMResponseEndFrame:
+		p.flushPendingKillAfter()
 		p.onResponseEnd()
+		p.PushFrame(f, dir)
+	case InterruptFrame:
+		p.clearPendingKillAfter()
 		p.PushFrame(f, dir)
 	default:
 		p.PushFrame(frame, dir)
@@ -90,15 +97,79 @@ func (p *LLMOutputFilterProcessor) handleTextFrame(frame TextFrame, dir Directio
 		p.state.suppressedText += frame.Text
 		return
 	}
+	if p.state.pendingKillAfter != "" {
+		if frame.Text == "" {
+			return
+		}
+		p.startSuppressionAfterPending(frame)
+		return
+	}
 
 	prefix, pos, includePrefix, ok := p.findEarliestKillPrefix(frame.Text)
 	if ok {
+		if includePrefix && pos+len(prefix) == len(frame.Text) {
+			p.deferTrailingKillAfter(frame, dir, prefix, pos)
+			return
+		}
 		p.startSuppressionFromPrefix(frame, dir, prefix, pos, includePrefix)
 		return
 	}
 
 	p.state.anyTextPushed = true
 	p.PushFrame(frame, dir)
+}
+
+// deferTrailingKillAfter holds a kill-after prefix at a stream-chunk boundary
+// until the next text frame tells us whether the response actually continued.
+// Text before the prefix can still flow immediately; only the prefix itself
+// needs to be delayed.
+func (p *LLMOutputFilterProcessor) deferTrailingKillAfter(frame TextFrame, dir Direction, prefix string, pos int) {
+	before := frame.Text[:pos]
+	if before != "" {
+		p.PushFrame(NewTextFrame(before), dir)
+		p.state.anyTextPushed = true
+	}
+	p.state.pendingKillAfter = prefix
+	p.state.pendingKillAfterDir = dir
+}
+
+func (p *LLMOutputFilterProcessor) startSuppressionAfterPending(frame TextFrame) {
+	prefix := p.state.pendingKillAfter
+	dir := p.state.pendingKillAfterDir
+	p.clearPendingKillAfter()
+
+	p.state.suppressing = true
+	p.state.suppressionReason = "kill-prefix"
+	p.state.suppressionPrefix = prefix
+	p.state.suppressedText = frame.Text
+
+	p.logf(
+		"LLMOutputFilter: kill-prefix %q in response %d (kept=%d chars, suppressed=%d chars)",
+		prefix,
+		p.responseID,
+		len(prefix),
+		len(p.state.suppressedText),
+	)
+
+	p.PushFrame(NewTextFrame(prefix), dir)
+	p.PushFrame(NewTextFrame("."), dir)
+	p.state.anyTextPushed = true
+}
+
+func (p *LLMOutputFilterProcessor) flushPendingKillAfter() {
+	if p.state.pendingKillAfter == "" {
+		return
+	}
+	prefix := p.state.pendingKillAfter
+	dir := p.state.pendingKillAfterDir
+	p.clearPendingKillAfter()
+	p.PushFrame(NewTextFrame(prefix), dir)
+	p.state.anyTextPushed = true
+}
+
+func (p *LLMOutputFilterProcessor) clearPendingKillAfter() {
+	p.state.pendingKillAfter = ""
+	p.state.pendingKillAfterDir = Downstream
 }
 
 func (p *LLMOutputFilterProcessor) startSuppressionFromPrefix(frame TextFrame, dir Direction, prefix string, pos int, includePrefix bool) {
@@ -162,7 +233,7 @@ func (p *LLMOutputFilterProcessor) findEarliestKillPrefix(text string) (prefix s
 	}
 	for _, candidate := range p.killAfterPrefixes {
 		idx := strings.Index(text, candidate)
-		if idx != -1 && idx+len(candidate) < len(text) && idx < earliest {
+		if idx != -1 && idx < earliest {
 			earliest = idx
 			prefix = candidate
 			pos = idx
