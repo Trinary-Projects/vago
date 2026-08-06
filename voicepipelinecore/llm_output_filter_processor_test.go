@@ -62,9 +62,34 @@ func TestLLMOutputFilter_KillAfterPrefixKeepsPrefixAndFlushes(t *testing.T) {
 	assertStringSlicesEqual(t, got, want)
 }
 
-func TestLLMOutputFilter_KillAfterPrefixDoesNotTriggerAtEndOfChunk(t *testing.T) {
+func TestLLMOutputFilter_KillAfterPrefixSuppressesAcrossChunks(t *testing.T) {
+	got := runLLMOutputFilterResponse(t, []string{"Really", "?", " some garbage", "more garbage"})
+	want := []string{"Really", "?", "."}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestLLMOutputFilter_KillAfterPrefixAtResponseEndPassesThrough(t *testing.T) {
 	got := runLLMOutputFilterResponse(t, []string{"Really", "?"})
 	want := []string{"Really", "?"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestLLMOutputFilter_EmptyChunkDoesNotResolvePendingKillAfter(t *testing.T) {
+	got := runLLMOutputFilterResponse(t, []string{"Really?", ""})
+	want := []string{"Really", "?"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestLLMOutputFilter_KillAfterPrefixChunkBoundaryRegression(t *testing.T) {
+	got := runLLMOutputFilterResponse(t, []string{
+		"Hello अवधुत! मैं दिशा बोल रही हूँ. आवाज़ ठीक आ रही है अब?",
+		" क्या मैं सही व्यक्ति से बात कर रही हूँ?",
+	})
+	want := []string{
+		"Hello अवधुत! मैं दिशा बोल रही हूँ. आवाज़ ठीक आ रही है अब",
+		"?",
+		".",
+	}
 	assertStringSlicesEqual(t, got, want)
 }
 
@@ -88,6 +113,29 @@ func TestLLMOutputFilter_SuppressionResetsBetweenResponses(t *testing.T) {
 
 	got := textFrameTexts(down)
 	want := []string{"Hello", " ", "again"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestLLMOutputFilter_InterruptClearsPendingKillAfter(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewLLMOutputFilterProcessor(fix.TaskCtx)
+	down, _ := runProcessorTest(t, fix, runConfig{
+		processor: p,
+		framesToSend: []Frame{
+			NewLLMResponseStartFrame(time.Now()),
+			NewTextFrame("Really?"),
+			SleepFrame{Duration: 50 * time.Millisecond},
+			NewInterruptFrame(),
+			SleepFrame{Duration: 50 * time.Millisecond},
+			NewLLMResponseStartFrame(time.Now()),
+			NewTextFrame("Hello"),
+			NewLLMResponseEndFrame(),
+		},
+		sendEndFrame: true,
+	})
+
+	got := textFrameTexts(down)
+	want := []string{"Really", "Hello"}
 	assertStringSlicesEqual(t, got, want)
 }
 

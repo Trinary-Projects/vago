@@ -722,7 +722,7 @@ func TestSetupGuardrailCheckGating(t *testing.T) {
 			t.Setenv("AWS_US_REGION", "")
 
 			pl := newGuardrailSetupPlan()
-			setupFollowUpRetrieval(pl, nil)
+			setupFollowUpRetrieval(pl)
 			if got := pl.GuardrailChecker != nil; got != tc.want {
 				t.Errorf("checker present = %v, want %v", got, tc.want)
 			}
@@ -745,7 +745,7 @@ func TestFollowUpRetrievalFeaturesShareWeaviateClient(t *testing.T) {
 	t.Setenv("AWS_US_REGION", "")
 
 	pl := newGuardrailSetupPlan()
-	setupFollowUpRetrieval(pl, nil)
+	setupFollowUpRetrieval(pl)
 	if pl.ProtocolEnricher == nil || pl.GuardrailChecker == nil {
 		t.Fatalf("features not built: protocol=%v guardrail=%v", pl.ProtocolEnricher, pl.GuardrailChecker)
 	}

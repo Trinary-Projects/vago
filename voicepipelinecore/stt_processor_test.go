@@ -20,6 +20,12 @@ import (
 // Tests that need to exercise actual STT transcription or TTS
 // synthesis flow are integration tests (out of scope here).
 
+type sttWireMessage struct {
+	connection  int32
+	messageType int
+	payload     string
+}
+
 // TestSTT_ForwardsEndFrame verifies EndFrame propagates downstream and
 // stops the STT processor.
 func TestSTT_ForwardsEndFrame(t *testing.T) {
@@ -183,6 +189,195 @@ func TestSTT_ProviderErrorRateLimitResetsAfterWindow(t *testing.T) {
 	}
 	if !p.shouldReportProviderError("same-error", startedAt.Add(sttProviderErrorReportWindow)) {
 		t.Fatal("first occurrence in the next fixed window was suppressed")
+	}
+}
+
+func TestSTT_SendsSonioxKeepaliveWhenAudioIsIdle(t *testing.T) {
+	messages := make(chan sttWireMessage, 10)
+	connected := make(chan int32, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var config map[string]any
+		if err := conn.ReadJSON(&config); err != nil {
+			return
+		}
+		connected <- 1
+		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messages <- sttWireMessage{connection: 1, messageType: messageType, payload: string(payload)}
+		}
+	}))
+	t.Cleanup(server.Close)
+	configureSTTWireTest(t, server.URL, 10*time.Millisecond, 5*time.Millisecond)
+
+	fix := newTestFixture(t)
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewSTTConnectFrame("test", time.Now()), Downstream)
+	waitForSTTConnection(t, connected, 1)
+
+	message := waitForSTTWireMessage(t, messages)
+	if message.messageType != websocket.TextMessage || message.payload != sttKeepaliveMessage {
+		t.Fatalf("idle STT message = %#v, want text keepalive %q", message, sttKeepaliveMessage)
+	}
+
+	stopSTTWireTest(t, fix, p)
+}
+
+func TestSTT_AudioResetsSonioxKeepaliveIdleTimer(t *testing.T) {
+	messages := make(chan sttWireMessage, 20)
+	connected := make(chan int32, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var config map[string]any
+		if err := conn.ReadJSON(&config); err != nil {
+			return
+		}
+		connected <- 1
+		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messages <- sttWireMessage{connection: 1, messageType: messageType, payload: string(payload)}
+		}
+	}))
+	t.Cleanup(server.Close)
+	configureSTTWireTest(t, server.URL, 5*time.Millisecond, 25*time.Millisecond)
+
+	fix := newTestFixture(t)
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewSTTConnectFrame("test", time.Now()), Downstream)
+	waitForSTTConnection(t, connected, 1)
+
+	for i := 0; i < 5; i++ {
+		p.QueueFrame(NewAudioFrame([]byte{byte(i), 0}), Downstream)
+		message := waitForSTTWireMessage(t, messages)
+		if message.messageType != websocket.BinaryMessage {
+			t.Fatalf("message while audio is active = %#v, want binary audio", message)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	message := waitForSTTWireMessage(t, messages)
+	if message.messageType != websocket.TextMessage || message.payload != sttKeepaliveMessage {
+		t.Fatalf("first message after audio became idle = %#v, want text keepalive %q", message, sttKeepaliveMessage)
+	}
+
+	stopSTTWireTest(t, fix, p)
+}
+
+func TestSTT_SonioxKeepaliveContinuesAfterReconnect(t *testing.T) {
+	messages := make(chan sttWireMessage, 20)
+	connected := make(chan int32, 2)
+	var connectionCount atomic.Int32
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		connection := connectionCount.Add(1)
+		var config map[string]any
+		if err := conn.ReadJSON(&config); err != nil {
+			return
+		}
+		connected <- connection
+		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messages <- sttWireMessage{connection: connection, messageType: messageType, payload: string(payload)}
+			if connection == 1 && messageType == websocket.TextMessage && string(payload) == sttKeepaliveMessage {
+				_ = conn.WriteJSON(map[string]any{
+					"tokens":        []any{},
+					"error_code":    408,
+					"error_message": "Request timeout.",
+				})
+				_ = conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+					time.Now().Add(time.Second),
+				)
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	configureSTTWireTest(t, server.URL, 10*time.Millisecond, 5*time.Millisecond)
+
+	fix := newTestFixture(t)
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewSTTConnectFrame("test", time.Now()), Downstream)
+	waitForSTTConnection(t, connected, 1)
+
+	first := waitForSTTWireMessage(t, messages)
+	if first.connection != 1 || first.messageType != websocket.TextMessage || first.payload != sttKeepaliveMessage {
+		t.Fatalf("first connection message = %#v, want Soniox keepalive", first)
+	}
+	waitForSTTConnection(t, connected, 2)
+	second := waitForSTTWireMessage(t, messages)
+	if second.connection != 2 || second.messageType != websocket.TextMessage || second.payload != sttKeepaliveMessage {
+		t.Fatalf("reconnected message = %#v, want Soniox keepalive", second)
+	}
+
+	stopSTTWireTest(t, fix, p)
+}
+
+func TestSTT_StopCancelsSonioxKeepalive(t *testing.T) {
+	messages := make(chan sttWireMessage, 10)
+	connected := make(chan int32, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var config map[string]any
+		if err := conn.ReadJSON(&config); err != nil {
+			return
+		}
+		connected <- 1
+		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messages <- sttWireMessage{connection: 1, messageType: messageType, payload: string(payload)}
+		}
+	}))
+	t.Cleanup(server.Close)
+	configureSTTWireTest(t, server.URL, 10*time.Millisecond, time.Second)
+
+	fix := newTestFixture(t)
+	p := NewSTTProcessor(fix.TaskCtx)
+	p.Start(fix.RootCtx)
+	p.QueueFrame(NewSTTConnectFrame("test", time.Now()), Downstream)
+	waitForSTTConnection(t, connected, 1)
+	stopSTTWireTest(t, fix, p)
+
+	select {
+	case message := <-messages:
+		t.Fatalf("STT wrote after Stop: %#v", message)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -359,5 +554,51 @@ func waitForAttempts(attempts *atomic.Int32, timeout time.Duration) bool {
 			return attempts.Load() > 0
 		case <-ticker.C:
 		}
+	}
+}
+
+func configureSTTWireTest(t *testing.T, serverURL string, interval, idleTimeout time.Duration) {
+	t.Helper()
+	oldURL := sttDialURL
+	oldInterval := sttKeepaliveInterval
+	oldIdleTimeout := sttKeepaliveIdleTimeout
+	sttDialURL = "ws" + strings.TrimPrefix(serverURL, "http")
+	sttKeepaliveInterval = interval
+	sttKeepaliveIdleTimeout = idleTimeout
+	t.Cleanup(func() {
+		sttDialURL = oldURL
+		sttKeepaliveInterval = oldInterval
+		sttKeepaliveIdleTimeout = oldIdleTimeout
+	})
+}
+
+func waitForSTTConnection(t *testing.T, connected <-chan int32, want int32) {
+	t.Helper()
+	select {
+	case got := <-connected:
+		if got != want {
+			t.Fatalf("STT websocket connection = %d, want %d", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for STT websocket connection %d", want)
+	}
+}
+
+func waitForSTTWireMessage(t *testing.T, messages <-chan sttWireMessage) sttWireMessage {
+	t.Helper()
+	select {
+	case message := <-messages:
+		return message
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for STT websocket message")
+		return sttWireMessage{}
+	}
+}
+
+func stopSTTWireTest(t *testing.T, fix *testFixture, p *STTProcessor) {
+	t.Helper()
+	p.Stop()
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("waitForWG: %v", err)
 	}
 }

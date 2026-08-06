@@ -119,7 +119,7 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
-	setupFollowUpRetrieval(pl, deps.Documents)
+	setupFollowUpRetrieval(pl)
 	return pl, nil
 }
 
@@ -135,7 +135,7 @@ func guardrailCheckEnabled() bool {
 //
 // A missing/incomplete Weaviate env is treated as "feature off" rather than a
 // call failure — the same posture as the other optional S3-backed features.
-func setupFollowUpRetrieval(pl *followUpPlan, renderer templateRenderer) {
+func setupFollowUpRetrieval(pl *followUpPlan) {
 	protocolEnabled := protocolRetrievalEnabled()
 	guardrailEnabled := guardrailCheckEnabled()
 	if !protocolEnabled && !guardrailEnabled {
@@ -153,7 +153,7 @@ func setupFollowUpRetrieval(pl *followUpPlan, renderer templateRenderer) {
 		return
 	}
 
-	protocolBox := setupProtocolRetrieval(pl, renderer, client)
+	protocolBox := setupProtocolRetrieval(pl, client)
 	guardrailBox := setupGuardrailCheck(pl, client)
 	if protocolBox == nil && guardrailBox == nil {
 		return
@@ -171,7 +171,7 @@ func setupFollowUpRetrieval(pl *followUpPlan, renderer templateRenderer) {
 
 // setupProtocolRetrieval wires blocking protocol retrieval for both follow-up
 // paths around the already-shared Weaviate client.
-func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer, client *weaviate.Client) *protocolRecordBox {
+func setupProtocolRetrieval(pl *followUpPlan, client *weaviate.Client) *protocolRecordBox {
 	if !protocolRetrievalEnabled() {
 		return nil
 	}
@@ -181,7 +181,7 @@ func setupProtocolRetrieval(pl *followUpPlan, renderer templateRenderer, client 
 		NewProtocolStore(),
 		box,
 		pl.Startup.Logger,
-		renderer,
+		newGonjaProtocolRenderer(),
 		pl.PromptMetadata,
 		pl.PromptVariables,
 		pl.Startup.UserID,

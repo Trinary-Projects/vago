@@ -35,6 +35,16 @@ var sttDialURL = "wss://stt-rt.soniox.com/transcribe-websocket"
 // can shorten the retry window without sleeping for seconds.
 var sttConnectRetryDelays = []time.Duration{time.Second, 2 * time.Second}
 
+// Pipecat's Soniox service checks every five seconds and sends Soniox's
+// protocol-level keepalive after audio has been idle for at least one second.
+// Keep these as vars so websocket tests can exercise the behavior quickly.
+var (
+	sttKeepaliveInterval    = 5 * time.Second
+	sttKeepaliveIdleTimeout = time.Second
+)
+
+const sttKeepaliveMessage = `{"type":"keepalive"}`
+
 const (
 	sttProviderErrorReportLimit  = 100
 	sttProviderErrorReportWindow = time.Minute
@@ -61,6 +71,7 @@ type sttProviderErrorWindow struct {
 type STTProcessor struct {
 	*BaseProcessor
 	taskCtx          *TaskContext
+	websocketMu      sync.RWMutex
 	websocketConn    *websocket.Conn
 	audioFrames      chan AudioFrame
 	connected        chan struct{} // closed when the websocket is established
@@ -119,8 +130,11 @@ func (s *STTProcessor) activate(reason string, at time.Time) {
 func (s *STTProcessor) Stop() {
 	s.BaseProcessor.Stop()
 	s.closeOnce.Do(func() {
-		if s.websocketConn != nil {
-			s.websocketConn.Close()
+		s.websocketMu.RLock()
+		conn := s.websocketConn
+		s.websocketMu.RUnlock()
+		if conn != nil {
+			conn.Close()
 		}
 	})
 }
@@ -164,7 +178,14 @@ func (s *STTProcessor) connect() error {
 		if err == nil {
 			err = conn.WriteJSON(sttConfigPayload())
 			if err == nil {
+				s.websocketMu.Lock()
+				if s.ctx.Err() != nil {
+					s.websocketMu.Unlock()
+					conn.Close()
+					return s.ctx.Err()
+				}
 				s.websocketConn = conn
+				s.websocketMu.Unlock()
 				s.taskCtx.Logger.Println("STT websocket connected")
 				s.logInitialConnectLatency(time.Now())
 				return nil
@@ -249,7 +270,12 @@ func (s *STTProcessor) read() {
 			s.taskCtx.Logger.Println("STT reader exiting")
 			return
 		}
-		_, msg, err := s.websocketConn.ReadMessage()
+		conn := s.currentWebsocketConn()
+		if conn == nil {
+			s.taskCtx.Logger.Println("STT reader exiting: websocket is not connected")
+			return
+		}
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if s.ctx.Err() != nil {
 				s.taskCtx.Logger.Println("STT reader exiting")
@@ -352,19 +378,50 @@ func (s *STTProcessor) runWriter() {
 	case <-s.ctx.Done():
 		return
 	}
+	ticker := time.NewTicker(sttKeepaliveInterval)
+	defer ticker.Stop()
+	lastAudioAt := time.Now()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case audio := <-s.audioFrames:
-			if err := s.websocketConn.WriteMessage(websocket.BinaryMessage, audio.Data); err != nil {
+			conn := s.currentWebsocketConn()
+			if conn == nil {
+				continue
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, audio.Data); err != nil {
 				if s.ctx.Err() != nil {
 					return
 				}
 				s.taskCtx.Logger.Println("STT write error, skipping frame:", err)
+				continue
 			}
+			lastAudioAt = time.Now()
+		case now := <-ticker.C:
+			if now.Sub(lastAudioAt) < sttKeepaliveIdleTimeout {
+				continue
+			}
+			conn := s.currentWebsocketConn()
+			if conn == nil {
+				continue
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(sttKeepaliveMessage)); err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				s.taskCtx.Logger.Println("STT keepalive write error:", err)
+				continue
+			}
+			lastAudioAt = now
 		}
 	}
+}
+
+func (s *STTProcessor) currentWebsocketConn() *websocket.Conn {
+	s.websocketMu.RLock()
+	defer s.websocketMu.RUnlock()
+	return s.websocketConn
 }
 
 func (s *STTProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
