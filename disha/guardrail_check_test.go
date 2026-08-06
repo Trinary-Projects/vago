@@ -288,7 +288,7 @@ func TestGuardrailContextCanceledErrorDoesNotCaptureSentry(t *testing.T) {
 	hub, transport := newGuardrailTestHub(t)
 	checker.SetSentryHub(hub)
 	checker.reportFailure(
-		context.Background(), errors.Join(errors.New("request failed"), context.Canceled), "fragment.", 1,
+		context.Background(), errors.Join(errors.New("request failed"), context.Canceled), "fragment.", 1, 0,
 	)
 	if len(transport.Events()) != 0 {
 		t.Fatalf("context.Canceled error emitted Sentry: %+v", transport.Events())

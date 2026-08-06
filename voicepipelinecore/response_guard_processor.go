@@ -122,9 +122,13 @@ func (p *ResponseGuardProcessor) ProcessFrame(ctx context.Context, frame Frame, 
 		p.mu.Lock()
 		p.buffer = ""
 		p.sentenceIndex = 0
+		hadSkipTurn := p.skipTurn
 		p.skipTurn = false
 		p.unguarded = false
 		p.mu.Unlock()
+		if hadSkipTurn && p.taskCtx != nil && p.taskCtx.Logger != nil {
+			p.taskCtx.Logger.Printf("[RESPONSE_GUARD] foreign interrupt cleared unguarded-turn allowance\n")
+		}
 		p.violated.Store(false)
 		p.PushFrame(f, dir)
 	case EndFrame:
@@ -160,8 +164,14 @@ func (p *ResponseGuardProcessor) startTurn() {
 	if p.skipTurn {
 		p.skipTurn = false
 		p.unguarded = true
+		if p.taskCtx != nil && p.taskCtx.Logger != nil {
+			p.taskCtx.Logger.Printf("[RESPONSE_GUARD] turn started unguarded (post-violation regeneration)\n")
+		}
 	} else {
 		p.unguarded = false
+		if p.taskCtx != nil && p.taskCtx.Logger != nil {
+			p.taskCtx.Logger.Printf("[RESPONSE_GUARD] turn started\n")
+		}
 	}
 }
 

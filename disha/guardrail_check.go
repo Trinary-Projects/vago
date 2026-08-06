@@ -99,6 +99,9 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 		c.checksFired = 0
 		c.fanoutReported = false
 		c.violationRecorded = false
+		if c.logger != nil {
+			c.logger.Printf("disha: guardrail turn started, record reset\n")
+		}
 
 		// Do not clear the box here. A violation before speech produces no
 		// partial chunk, and its unguarded regeneration fires no checks, so the
@@ -123,6 +126,9 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	c.record.Checks = checks
 	c.record.TurnText = guardrailTurnText(c.record.Checks)
 	c.box.put(*c.record)
+	if c.logger != nil {
+		c.logger.Printf("disha: guardrail check %d fired: %q\n", index, fragment)
+	}
 
 	reportFanout := c.checksFired > guardrailFanoutSentryThreshold && !c.fanoutReported
 	if reportFanout {
@@ -149,13 +155,13 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 
 	if err != nil {
 		if ctx.Err() != nil {
-			c.logDropped(index, fragment)
+			c.logDropped(index, fragment, startedAt)
 			return false
 		}
 		c.mu.Lock()
 		if ctx != c.turnCtx || ctx.Err() != nil {
 			c.mu.Unlock()
-			c.logDropped(index, fragment)
+			c.logDropped(index, fragment, startedAt)
 			return false
 		}
 		totalMs := guardrailElapsedMs(startedAt)
@@ -175,7 +181,7 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 		c.box.put(*c.record)
 		c.mu.Unlock()
 
-		c.reportFailure(ctx, err, fragment, index)
+		c.reportFailure(ctx, err, fragment, index, totalMs)
 		return false
 	}
 
@@ -184,7 +190,7 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	// advance, or call end. Once its turn is done the placeholder is the only
 	// durable truth: it stays cancelled, with no fabricated zero similarity.
 	if ctx.Err() != nil {
-		c.logDropped(index, fragment)
+		c.logDropped(index, fragment, startedAt)
 		return false
 	}
 
@@ -212,7 +218,7 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	c.mu.Lock()
 	if ctx != c.turnCtx || ctx.Err() != nil {
 		c.mu.Unlock()
-		c.logDropped(index, fragment)
+		c.logDropped(index, fragment, startedAt)
 		return false
 	}
 	totalMs := guardrailElapsedMs(startedAt)
@@ -237,12 +243,29 @@ func (c *guardrailChecker) Check(ctx context.Context, fragment string) bool {
 	if totalMs > c.record.slowestTotalMs {
 		c.record.slowestTotalMs = totalMs
 	}
+	similarityText := "none"
+	if similarity != nil {
+		similarityText = fmt.Sprintf("%.4f", *similarity)
+	}
+	topTitle := ""
+	if top != nil {
+		topTitle = top.Title
+	}
+	if c.logger != nil {
+		c.logger.Printf(
+			"disha: guardrail check %d completed in %.1fms (query %.1fms): similarity=%s band=%s violated=%v top=%q candidates=%d\n",
+			index, totalMs, vectorQueryMs, similarityText, band, violated, topTitle, len(candidates),
+		)
+	}
 
 	if violated {
 		if !c.violationRecorded {
 			c.violationRecorded = true
 			c.record.Interrupted = true
 			c.pendingCorrection = top.InstructionText
+			if c.logger != nil {
+				c.logger.Printf("disha: guardrail check %d violation recorded, correction pending (title=%q)\n", index, top.Title)
+			}
 		}
 		// Simultaneous violating sentences can race with core's own CAS. The
 		// correction recorded here and the sentence that wins that CAS may be
@@ -279,6 +302,12 @@ func (c *guardrailChecker) EnrichCorrection(_ context.Context, messages []voicep
 	c.mu.Unlock()
 	if correction == "" {
 		return messages
+	}
+	if c.logger != nil {
+		c.logger.Printf(
+			"disha: guardrail correction injected into regeneration (guardrail: %q)\n",
+			guardrailLogExcerpt(correction, 120),
+		)
 	}
 
 	out := make([]voicepipelinecore.Message, len(messages), len(messages)+1)
@@ -374,18 +403,32 @@ func guardrailElapsedMs(startedAt time.Time) float64 {
 	return float64(time.Since(startedAt).Microseconds()) / 1000.0
 }
 
-func (c *guardrailChecker) logDropped(index int, fragment string) {
+func guardrailLogExcerpt(text string, maxRunes int) string {
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes]) + "…"
+}
+
+func (c *guardrailChecker) logDropped(index int, fragment string, startedAt time.Time) {
 	if c.logger != nil {
-		c.logger.Printf("disha: guardrail check %d cancelled, dropped: %q\n", index, fragment)
+		c.logger.Printf(
+			"disha: guardrail check %d cancelled after %.1fms, dropped: %q\n",
+			index, guardrailElapsedMs(startedAt), fragment,
+		)
 	}
 }
 
-func (c *guardrailChecker) reportFailure(ctx context.Context, err error, fragment string, index int) {
+func (c *guardrailChecker) reportFailure(ctx context.Context, err error, fragment string, index int, elapsedMs float64) {
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		return
 	}
 	if c.logger != nil {
-		c.logger.Printf("disha: guardrail check failed conversation=%s index=%d: %v\n", c.conversationID, index, err)
+		c.logger.Printf(
+			"disha: guardrail check %d failed after %.1fms for %q: %v\n",
+			index, elapsedMs, fragment, err,
+		)
 	}
 	sentryutil.Capture(sentryutil.Event{
 		Hub: c.sentryHub(),

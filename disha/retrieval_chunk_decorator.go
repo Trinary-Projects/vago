@@ -2,6 +2,7 @@ package disha
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -80,8 +81,23 @@ func newRetrievalChunkDecorator(
 
 		if guardrailBox != nil {
 			record := guardrailBox.take()
-			if record != nil {
+			if record == nil {
+				if logger != nil {
+					logger.Printf("disha: guardrail no record for chunk %s (unguarded turn or no checks)\n", chunk.ID)
+				}
+			} else {
 				record.ChunkID = chunk.ID
+				maxSimilarity := "none"
+				if record.highestSimilarity != nil {
+					maxSimilarity = fmt.Sprintf("%.4f", *record.highestSimilarity)
+				}
+				if logger != nil {
+					logger.Printf(
+						"disha: guardrail record attached to chunk %s: status=%s interrupted=%v checks_fired=%d check_count=%d max_similarity=%s e2e_ms=%.1f\n",
+						chunk.ID, record.Status, record.Interrupted, record.ChecksFired, record.CheckCount,
+						maxSimilarity, record.slowestTotalMs,
+					)
+				}
 				guardrail := &GuardrailCheckMetrics{
 					E2EMs:           record.slowestTotalMs,
 					SimilarityScore: record.highestSimilarity,
@@ -103,6 +119,19 @@ func newRetrievalChunkDecorator(
 					uploader, logger, userID, conversationID, *record,
 				); err == nil {
 					guardrail.RawDataS3Key = key
+				}
+				if logger != nil {
+					if payload, err := json.Marshal(guardrail); err != nil {
+						logger.Printf(
+							"disha: guardrail chunk metrics for chunk %s (chunk_retrieval_metrics.guardrail) marshal failed: %v\n",
+							chunk.ID, err,
+						)
+					} else {
+						logger.Printf(
+							"disha: guardrail chunk metrics for chunk %s (chunk_retrieval_metrics.guardrail): %s\n",
+							chunk.ID, payload,
+						)
+					}
 				}
 
 				// Merge rather than assign: protocol retrieval and guardrail checks
@@ -194,6 +223,9 @@ func uploadGuardrailCheckRecord(
 			},
 		})
 		return "", err
+	}
+	if logger != nil {
+		logger.Printf("disha: guardrail record uploaded key=%s\n", key)
 	}
 	return key, nil
 }
