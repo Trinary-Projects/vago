@@ -8,7 +8,7 @@ import (
 const (
 	guardrailAnchorClass           = "GuardrailAnchor"
 	guardrailInstructionClass      = "GuardrailInstruction"
-	guardrailInterruptThreshold    = 0.85
+	guardrailInterruptThreshold    = 0.90
 	guardrailOfflineJudgeThreshold = 0.75
 	guardrailQueryLimit            = 10
 	guardrailFanoutSentryThreshold = 10
