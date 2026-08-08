@@ -4,11 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-ENV_FILE=".staging.env"
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "$ENV_FILE is required for staging deploys because deploy and runtime env are loaded from it." >&2
-  exit 1
-fi
+required_commands=(aws jq docker kubectl envsubst gcloud)
+for cmd in "${required_commands[@]}"; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  fi
+done
+
+umask 077
+ENV_FILE="$ROOT_DIR/.temp-deploy.env"
+
+"$ROOT_DIR/fetch-deploy-env.sh" staging "$ENV_FILE"
+echo "Resolved deploy environment retained at ${ENV_FILE} (mode 0600)."
 
 load_env_file() {
   local file="$1"
@@ -24,12 +32,6 @@ load_env_file() {
     key="${line%%=*}"
     key="${key//[[:space:]]/}"
     value="${line#*=}"
-    if [[ "$value" == \"*\" && "$value" == *\" && ${#value} -ge 2 ]]; then
-      value="${value:1:${#value}-2}"
-    elif [[ "$value" == \'*\' && "$value" == *\' && ${#value} -ge 2 ]]; then
-      value="${value:1:${#value}-2}"
-    fi
-
     if [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
       printf -v "$key" '%s' "$value"
       export "$key"
@@ -51,18 +53,19 @@ GKE_CLUSTER_NAME="${GKE_CLUSTER_NAME:-disha-voice-worker-staging}"
 GKE_CLUSTER_LOCATION="${GKE_CLUSTER_LOCATION:-us-east1}"
 KUBE_CONTEXT="gke_${GCP_PROJECT_ID}_${GKE_CLUSTER_LOCATION}_${GKE_CLUSTER_NAME}"
 
+if [[ "$GKE_DEPLOYMENT_NAME" != "disha-go-voice-worker-staging" ]]; then
+  echo "Refusing staging deploy: GKE_DEPLOYMENT_NAME must be disha-go-voice-worker-staging." >&2
+  exit 1
+fi
+if [[ "$GKE_NAMESPACE" == "prod" || "$GKE_CLUSTER_NAME" == *prod* || "$ARTIFACT_REPOSITORY_NAME" == *prod* ]]; then
+  echo "Refusing staging deploy: prod-looking deployment values remain after applying staging overrides." >&2
+  exit 1
+fi
+
 timestamp="$(date -u +%Y%m%d%H%M%S)"
 POD_TEMPLATE_VERSION="${POD_TEMPLATE_VERSION:-v${timestamp}}"
 IMAGE_REPOSITORY="us-east1-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY_NAME}/talk-go-worker"
 IMAGE="${IMAGE_REPOSITORY}:latest"
-
-required_commands=(docker kubectl envsubst gcloud)
-for cmd in "${required_commands[@]}"; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Missing required command: $cmd" >&2
-    exit 1
-  fi
-done
 
 # Ensure a kubeconfig entry for the target cluster exists / is fresh. This
 # creates the context named "$KUBE_CONTEXT" without changing the user's active
@@ -91,7 +94,7 @@ docker build --platform=linux/amd64 -t "$IMAGE" .
 echo "Pushing image..."
 docker push "$IMAGE"
 
-echo "Updating talk-go-worker-env secret from ${ENV_FILE}..."
+echo "Updating talk-go-worker-env secret from the temporary Parameter Store environment..."
 kubectl --context "$KUBE_CONTEXT" create secret generic talk-go-worker-env \
   --namespace "$GKE_NAMESPACE" \
   --from-env-file="$ENV_FILE" \
