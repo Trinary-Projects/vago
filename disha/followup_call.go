@@ -23,6 +23,7 @@ const (
 	followUpModelGroup              = "gemini-flash-3.1-lite"
 	followUpPhoneOverrideModelGroup = "gpt-4.1"
 	followUpGuidanceModelGroup      = "gpt-oss120-fast"
+	followUpGuidanceMaxTokens       = 4000
 
 	followUpPromptDefault            = "followup_call/system_prompt"
 	followUpPromptD1Inactive         = "disha_init_calls/d0_d1_inactive_user/call_main_sys"
@@ -565,6 +566,7 @@ func getFollowUpGuidance(ctx context.Context, taskCtx *voicepipelinecore.TaskCon
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: situation},
 	}}
+	maxTokens := followUpGuidanceMaxTokens
 	client, err := llmrouter.New(llmrouter.Config{
 		Group:          followUpGuidanceModelGroup,
 		Region:         "us",
@@ -572,6 +574,7 @@ func getFollowUpGuidance(ctx context.Context, taskCtx *voicepipelinecore.TaskCon
 		Logger:         pl.Startup.Logger,
 		LogSink:        newLLMLogSink(deps.API, pl.Startup.Logger, followUpGuidanceUsecase, pl.Startup.UserID, pl.Startup.ConversationID),
 		PromptMetadata: metadata,
+		MaxTokens:      &maxTokens,
 	})
 	if err != nil {
 		return "", err
