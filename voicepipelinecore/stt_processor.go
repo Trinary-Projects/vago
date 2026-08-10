@@ -154,15 +154,20 @@ func (s *STTProcessor) waitForActivation() bool {
 	}
 }
 
+// Keep every endpoint control explicit, even at Soniox's defaults, so future
+// endpoint tuning only requires changing values rather than the wire shape.
 func sttConfigPayload() map[string]interface{} {
 	return map[string]interface{}{
-		"api_key":                   os.Getenv("SONIOX_API_KEY"),
-		"model":                     "stt-rt-v4",
-		"audio_format":              "s16le",
-		"sample_rate":               16000,
-		"num_channels":              1,
-		"language_hints":            []string{"hi"},
-		"enable_endpoint_detection": true,
+		"api_key":                           os.Getenv("SONIOX_API_KEY"),
+		"model":                             "stt-rt-v5",
+		"audio_format":                      "s16le",
+		"sample_rate":                       16000,
+		"num_channels":                      1,
+		"language_hints":                    []string{"hi"},
+		"enable_endpoint_detection":         true,
+		"endpoint_latency_adjustment_level": 0,
+		"endpoint_sensitivity":              0.0,
+		"max_endpoint_delay_ms":             2000,
 	}
 }
 

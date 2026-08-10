@@ -26,6 +26,23 @@ type sttWireMessage struct {
 	payload     string
 }
 
+func TestSTTConfigUsesSonioxV5EndpointDetectionDefaults(t *testing.T) {
+	payload := sttConfigPayload()
+
+	want := map[string]any{
+		"model":                             "stt-rt-v5",
+		"enable_endpoint_detection":         true,
+		"endpoint_latency_adjustment_level": 0,
+		"endpoint_sensitivity":              0.0,
+		"max_endpoint_delay_ms":             2000,
+	}
+	for key, wantValue := range want {
+		if got := payload[key]; got != wantValue {
+			t.Errorf("config[%q] = %#v, want %#v", key, got, wantValue)
+		}
+	}
+}
+
 // TestSTT_ForwardsEndFrame verifies EndFrame propagates downstream and
 // stops the STT processor.
 func TestSTT_ForwardsEndFrame(t *testing.T) {
