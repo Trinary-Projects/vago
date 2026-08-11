@@ -60,11 +60,12 @@ type LiveKitRoom struct {
 	opusEncoder   *opus.Encoder
 	opusEncodeBuf []byte
 
-	audioTiming *audioTimingAggregator
-	perfDiag    bool
-	closed      atomic.Bool
-	closedCh    chan struct{}
-	greetOnce   sync.Once
+	audioTiming  *audioTimingAggregator
+	perfDiag     bool
+	closed       atomic.Bool
+	reconnecting atomic.Bool
+	closedCh     chan struct{}
+	greetOnce    sync.Once
 
 	tracksMu sync.Mutex
 	tracks   map[string]*lkpcm.PCMRemoteTrack
@@ -141,14 +142,11 @@ func startLiveKitRoomAttempt(roomURL, roomName, token string, taskCtx *TaskConte
 		r.markUserJoined(r.participantID(p))
 	}
 	cb.OnParticipantDisconnected = func(p *lksdk.RemoteParticipant) {
-		participantID := r.participantID(p)
-		r.markUserLeft(participantID)
-		r.log("[%s] LiveKit participant %q left, requesting EndFrame", r.roomName, participantID)
-		if r.taskCtx != nil {
-			r.taskCtx.UIEvents.ServerMessage("Participant left", time.Now())
-		}
-		r.endTask(EndReasonClientDisconnect)
+		r.handleParticipantDisconnected(r.participantID(p))
 	}
+	cb.OnDisconnectedWithReason = r.handleDisconnected
+	cb.OnReconnecting = r.handleReconnecting
+	cb.OnReconnected = r.handleReconnected
 	cb.OnDataPacket = func(data lksdk.DataPacket, params lksdk.DataReceiveParams) {
 		switch packet := data.(type) {
 		case *lksdk.UserDataPacket:
@@ -418,6 +416,79 @@ func (r *LiveKitRoom) closeRemoteTrack(trackID string) {
 		track.Close()
 		delete(r.tracks, trackID)
 	}
+}
+
+func (r *LiveKitRoom) handleParticipantDisconnected(participantID string) {
+	if r == nil || r.closed.Load() || participantID == "" {
+		return
+	}
+	// A full LiveKit reconnect temporarily removes remote participants before
+	// rebuilding room state. Treating that SDK-internal transition as a real
+	// user leave would end an otherwise recoverable call.
+	if r.reconnecting.Load() {
+		r.log("[%s] LiveKit participant %q temporarily disconnected during reconnect", r.roomName, participantID)
+		return
+	}
+	r.markUserLeft(participantID)
+	r.log("[%s] LiveKit participant %q left, requesting EndFrame", r.roomName, participantID)
+	if r.taskCtx != nil && r.taskCtx.UIEvents != nil {
+		r.taskCtx.UIEvents.ServerMessage("Participant left", time.Now())
+	}
+	r.endTask(EndReasonClientDisconnect)
+}
+
+func (r *LiveKitRoom) handleReconnecting() {
+	if r == nil || r.closed.Load() {
+		return
+	}
+	r.reconnecting.Store(true)
+	r.log("[%s] LiveKit room connection is reconnecting", r.roomName)
+	if r.taskCtx != nil && r.taskCtx.UIEvents != nil {
+		r.taskCtx.UIEvents.ServerMessage(map[string]any{
+			"type":           "transport_reconnecting",
+			"transport_type": "livekit",
+		}, time.Now())
+	}
+}
+
+func (r *LiveKitRoom) handleReconnected() {
+	if r == nil || r.closed.Load() {
+		return
+	}
+	r.reconnecting.Store(false)
+	r.log("[%s] LiveKit room connection reconnected", r.roomName)
+	if r.taskCtx != nil && r.taskCtx.UIEvents != nil {
+		r.taskCtx.UIEvents.ServerMessage(map[string]any{
+			"type":           "transport_reconnected",
+			"transport_type": "livekit",
+		}, time.Now())
+	}
+}
+
+func (r *LiveKitRoom) handleDisconnected(reason lksdk.DisconnectionReason) {
+	if r == nil || r.closed.Load() {
+		return
+	}
+	r.reconnecting.Store(false)
+	err := fmt.Errorf("LiveKit room disconnected: %s", reason)
+	r.log("[%s] %v; requesting EndFrame", r.roomName, err)
+	if r.taskCtx != nil && r.taskCtx.UIEvents != nil {
+		r.taskCtx.UIEvents.ServerMessage(map[string]any{
+			"type":           "transport_disconnected",
+			"transport_type": "livekit",
+			"reason":         string(reason),
+		}, time.Now())
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Hub:  r.taskCtx.SentryHub(),
+		Err:  err,
+		Tags: map[string]string{"component": "livekit", "operation": "terminal_disconnect"},
+		Details: map[string]any{
+			"room_name": r.roomName,
+			"reason":    string(reason),
+		},
+	})
+	r.endTask(EndReasonError)
 }
 
 func (r *LiveKitRoom) handleAppMessageBytes(raw []byte) {
