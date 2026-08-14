@@ -77,6 +77,7 @@ const (
 	groupGrokSales       = "grok-4.1-fast-sales"
 	groupGPT41           = "gpt-4.1" // the sales cross-group fallback target.
 	groupGemini31        = "gemini-flash-3.1-lite"
+	groupGemini35        = "gemini-flash-3.5-lite"
 	groupFollowUpDynamic = "followup-dynamic-gemma"
 	groupGPTOSS120Fast   = "gpt-oss120-fast"
 
@@ -181,6 +182,24 @@ var endpointConfigs = map[string]endpointConfig{
 		Key: "openrouter_gemini_flash_3_1_lite", Provider: providerOpenRouter,
 		Model: "google/gemini-3.1-flash-lite", Region: "us",
 		APIKeyEnv: "OPENROUTER_API_KEY", BaseURL: "https://openrouter.ai/api/v1",
+		Temperature: floatPtr(0.5),
+	},
+
+	// --- gemini-flash-3.5-lite group (Python LLMFailoverConfigName.gemini_flash_3_5_lite) ---
+	// Vertex model carries the Go "google/" prefix like the 3.1 Vertex
+	// config (Python stores it plain "gemini-3.5-flash-lite"); creds env is
+	// left to vertexCredsEnvForConfig's disha-ai3 default
+	// (VERTEX_DISHA_AI2_CREDS_FILE), matching Python's target.
+	"vertex_gemini_flash_3_5_lite": {
+		Key: "vertex_gemini_flash_3_5_lite", Provider: providerVertex,
+		Model: "google/gemini-3.5-flash-lite", Region: "us",
+		VertexProject: "disha-ai3", VertexLocation: "global", VertexCredsEnv: "VERTEX_DISHA_AI2_CREDS_FILE",
+		Temperature: floatPtr(0.5),
+	},
+	"google_ai_studio_gemini_flash_3_5_lite": {
+		Key: "google_ai_studio_gemini_flash_3_5_lite", Provider: providerGoogleAIStudio,
+		Model: "gemini-3.5-flash-lite", Region: "us",
+		APIKeyEnv: "GEMINI_API_KEY_DISHAAI2", BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
 		Temperature: floatPtr(0.5),
 	},
 
@@ -365,6 +384,14 @@ var modelGroups = map[string]modelGroup{
 		Fallback: "openrouter_gemini_flash_3_1_lite",
 		// Python's LLMSwitchingService falls back to FALLBACK_MODEL_GROUP
 		// (gpt-4.1) for any group with no available endpoints.
+		FallbackGroup: groupGPT41,
+	},
+	groupGemini35: {
+		Configs: []string{
+			"vertex_gemini_flash_3_5_lite",
+			"google_ai_studio_gemini_flash_3_5_lite",
+		},
+		Fallback:      "google_ai_studio_gemini_flash_3_5_lite",
 		FallbackGroup: groupGPT41,
 	},
 	groupFollowUpDynamic: {
