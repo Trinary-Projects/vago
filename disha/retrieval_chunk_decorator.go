@@ -2,6 +2,7 @@ package disha
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -28,7 +29,10 @@ import (
 // ConversationChunkManager.redis_dict_to_model reads named keys via explicit
 // data.get(...), so keys it does not know are ignored rather than raising.
 
-const protocolRetrievalUploadTimeout = 5 * time.Second
+const (
+	protocolRetrievalUploadTimeout = 5 * time.Second
+	guardrailCheckUploadTimeout    = 5 * time.Second
+)
 
 // newRetrievalChunkDecorator returns a chunk decorator that attaches the
 // pending retrieval record to the assistant turn it produced.
@@ -38,7 +42,8 @@ const protocolRetrievalUploadTimeout = 5 * time.Second
 // OnToolResultCommitted also writes an assistant-role chunk (the tool_calls
 // half of the pair), and it must not consume the record.
 func newRetrievalChunkDecorator(
-	box *protocolRecordBox,
+	protocolBox *protocolRecordBox,
+	guardrailBox *guardrailRecordBox,
 	uploader JSONUploader,
 	logger *log.Logger,
 	userID, conversationID, botType string,
@@ -47,36 +52,96 @@ func newRetrievalChunkDecorator(
 		if chunk == nil || chunk.Role != "assistant" || chunk.IsDebugLog || chunk.AdditionalData != nil {
 			return
 		}
-		record := box.take()
-		if record == nil {
-			// Greet-first turn, or a turn whose retrieval was skipped before
-			// any record existed.
-			return
+
+		if protocolBox != nil {
+			record := protocolBox.take()
+			if record != nil {
+				protocol := &ProtocolRetrievalMetrics{
+					RetrievalLatencyMs:   record.LatencyMs,
+					VectorQueryLatencyMs: record.QueryLatencyMs,
+					TopSimilarityScore:   record.TopSimilarity,
+					InjectedCount:        len(record.Injected),
+					QueryText:            record.QueryText,
+					Status:               record.Status,
+					Error:                record.Err,
+				}
+
+				if key, err := uploadProtocolRetrievalRecord(
+					uploader, logger, chunk.ID, userID, conversationID, botType, *record,
+				); err == nil {
+					protocol.ProtocolsS3Key = key
+				}
+
+				if chunk.ChunkRetrievalMetrics == nil {
+					chunk.ChunkRetrievalMetrics = &ChunkRetrievalMetrics{}
+				}
+				chunk.ChunkRetrievalMetrics.Protocol = protocol
+			}
 		}
 
-		protocol := &ProtocolRetrievalMetrics{
-			RetrievalLatencyMs:   record.LatencyMs,
-			VectorQueryLatencyMs: record.QueryLatencyMs,
-			TopSimilarityScore:   record.TopSimilarity,
-			InjectedCount:        len(record.Injected),
-			QueryText:            record.QueryText,
-			Status:               record.Status,
-			Error:                record.Err,
-		}
+		if guardrailBox != nil {
+			record := guardrailBox.take()
+			if record == nil {
+				if logger != nil {
+					logger.Printf("disha: guardrail no record for chunk %s (unguarded turn or no checks)\n", chunk.ID)
+				}
+			} else {
+				record.ChunkID = chunk.ID
+				maxSimilarity := "none"
+				if record.highestSimilarity != nil {
+					maxSimilarity = fmt.Sprintf("%.4f", *record.highestSimilarity)
+				}
+				if logger != nil {
+					logger.Printf(
+						"disha: guardrail record attached to chunk %s: status=%s interrupted=%v checks_fired=%d check_count=%d max_similarity=%s e2e_ms=%.1f\n",
+						chunk.ID, record.Status, record.Interrupted, record.ChecksFired, record.CheckCount,
+						maxSimilarity, record.slowestTotalMs,
+					)
+				}
+				guardrail := &GuardrailCheckMetrics{
+					E2EMs:           record.slowestTotalMs,
+					SimilarityScore: record.highestSimilarity,
+					Interrupted:     record.Interrupted,
+					CheckCount:      record.CheckCount,
+					ChecksFired:     record.ChecksFired,
+					QueryText:       record.TurnText,
+					Status:          record.Status,
+					Error:           record.Error,
+				}
+				if record.ChecksFired != record.CheckCount && logger != nil {
+					logger.Printf(
+						"disha: guardrail checks truncated chunk=%s checks_fired=%d check_count=%d\n",
+						chunk.ID, record.ChecksFired, record.CheckCount,
+					)
+				}
 
-		if key, err := uploadProtocolRetrievalRecord(
-			uploader, logger, chunk.ID, userID, conversationID, botType, *record,
-		); err == nil {
-			protocol.ProtocolsS3Key = key
-		}
+				if key, err := uploadGuardrailCheckRecord(
+					uploader, logger, userID, conversationID, *record,
+				); err == nil {
+					guardrail.RawDataS3Key = key
+				}
+				if logger != nil {
+					if payload, err := json.Marshal(guardrail); err != nil {
+						logger.Printf(
+							"disha: guardrail chunk metrics for chunk %s (chunk_retrieval_metrics.guardrail) marshal failed: %v\n",
+							chunk.ID, err,
+						)
+					} else {
+						logger.Printf(
+							"disha: guardrail chunk metrics for chunk %s (chunk_retrieval_metrics.guardrail): %s\n",
+							chunk.ID, payload,
+						)
+					}
+				}
 
-		// Merge rather than assign: the planned guardrail step will populate a
-		// sibling field on the same umbrella, and the two run at different
-		// points in the turn.
-		if chunk.ChunkRetrievalMetrics == nil {
-			chunk.ChunkRetrievalMetrics = &ChunkRetrievalMetrics{}
+				// Merge rather than assign: protocol retrieval and guardrail checks
+				// can both populate the same turn, in either order.
+				if chunk.ChunkRetrievalMetrics == nil {
+					chunk.ChunkRetrievalMetrics = &ChunkRetrievalMetrics{}
+				}
+				chunk.ChunkRetrievalMetrics.Guardrail = guardrail
+			}
 		}
-		chunk.ChunkRetrievalMetrics.Protocol = protocol
 	}
 }
 
@@ -119,6 +184,48 @@ func uploadProtocolRetrievalRecord(
 			},
 		})
 		return "", err
+	}
+	return key, nil
+}
+
+// uploadGuardrailCheckRecord writes the self-describing sentence record to the
+// US bucket synchronously before the caller's Redis write. A nil uploader
+// leaves compact metrics on the chunk without publishing a dangling key.
+func uploadGuardrailCheckRecord(
+	uploader JSONUploader,
+	logger *log.Logger,
+	userID, conversationID string,
+	record guardrailCheckRecord,
+) (string, error) {
+	if uploader == nil {
+		return "", fmt.Errorf("disha: no US bucket uploader for guardrail check")
+	}
+	key := fmt.Sprintf("%s/%s/%s.json", guardrailS3KeyPrefix, conversationID, record.ChunkID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), guardrailCheckUploadTimeout)
+	defer cancel()
+
+	if err := uploader.UploadJSON(ctx, key, record); err != nil {
+		if logger != nil {
+			logger.Printf("disha: guardrail check record upload failed chunk=%s: %v\n", record.ChunkID, err)
+		}
+		sentryutil.Capture(sentryutil.Event{
+			Err: err,
+			Tags: map[string]string{
+				"component": "disha_followup",
+				"operation": "guardrail_check_upload",
+			},
+			Details: map[string]any{
+				"conversation_id": conversationID,
+				"user_id":         userID,
+				"chunk_id":        record.ChunkID,
+				"object_key":      key,
+			},
+		})
+		return "", err
+	}
+	if logger != nil {
+		logger.Printf("disha: guardrail record uploaded key=%s\n", key)
 	}
 	return key, nil
 }

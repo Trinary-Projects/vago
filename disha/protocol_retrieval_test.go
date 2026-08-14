@@ -1152,6 +1152,7 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(protocolRetrievalEnabledEnv, tc.flag)
+			t.Setenv(guardrailCheckEnabledEnv, "")
 			t.Setenv("WEAVIATE_URL", "http://weaviate.staging.svc.cluster.local:8080")
 			t.Setenv("WEAVIATE_API_KEY", "key")
 			t.Setenv("AWS_US_BUCKET_NAME", "")
@@ -1168,7 +1169,7 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 				PromptVariables: DocumentVariables{},
 				Callbacks:       &CallEventCallbacks{},
 			}
-			setupProtocolRetrieval(pl)
+			setupFollowUpRetrieval(pl)
 
 			if got := pl.ProtocolEnricher != nil; got != tc.want {
 				t.Errorf("enricher present = %v, want %v", got, tc.want)
@@ -1188,6 +1189,7 @@ func TestSetupProtocolRetrievalGating(t *testing.T) {
 // An unconfigured Weaviate means "feature off", not a failed call.
 func TestSetupProtocolRetrievalMissingWeaviateConfig(t *testing.T) {
 	t.Setenv(protocolRetrievalEnabledEnv, "1")
+	t.Setenv(guardrailCheckEnabledEnv, "")
 	t.Setenv("WEAVIATE_URL", "")
 	t.Setenv("WEAVIATE_API_KEY", "")
 
@@ -1196,7 +1198,7 @@ func TestSetupProtocolRetrievalMissingWeaviateConfig(t *testing.T) {
 		Dynamic:   true,
 		Callbacks: &CallEventCallbacks{},
 	}
-	setupProtocolRetrieval(pl)
+	setupFollowUpRetrieval(pl)
 
 	if pl.ProtocolEnricher != nil {
 		t.Error("enricher should not be built without Weaviate config")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -59,6 +60,12 @@ type followUpPlan struct {
 	// and Weaviate is configured; nil leaves the pipeline byte-identical to
 	// before.
 	ProtocolEnricher *protocolEnricher
+
+	// GuardrailChecker vector-checks completed response sentences and supplies
+	// the correction message for the one allowed regeneration. Non-nil only
+	// when enabled and Weaviate is configured; nil leaves the pipeline
+	// byte-identical.
+	GuardrailChecker *guardrailChecker
 }
 
 func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps) (*followUpPlan, error) {
@@ -113,38 +120,62 @@ func (b FollowUpBot) plan(ctx context.Context, conversationID string, deps Deps)
 	if deps.PhoneticDict != nil {
 		pl.PhoneticDict = deps.PhoneticDict.Dictionary(ctx)
 	}
-	setupProtocolRetrieval(pl)
+	setupFollowUpRetrieval(pl)
 	return pl, nil
 }
 
-// setupProtocolRetrieval wires blocking protocol retrieval for follow-up
-// calls — both the dynamic check-in path and the agenda-based path. Sales and
-// onboarding are untouched: they never call this, so their pipelines are
-// unchanged.
+// guardrailCheckEnabled reports whether sentence-level guardrail checking is
+// switched on. One explicit env var, no fallback chain.
+func guardrailCheckEnabled() bool {
+	return strings.TrimSpace(os.Getenv(guardrailCheckEnabledEnv)) == "1"
+}
+
+// setupFollowUpRetrieval builds one Weaviate client for whichever follow-up
+// retrieval features are enabled. Sharing the client lets guardrail checks
+// reuse protocol retrieval's warmed HTTP connection when both are on.
 //
 // A missing/incomplete Weaviate env is treated as "feature off" rather than a
 // call failure — the same posture as the other optional S3-backed features.
-func setupProtocolRetrieval(pl *followUpPlan) {
-	if !protocolRetrievalEnabled() {
-		return
-	}
-	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
-	if err != nil {
-		pl.Startup.Logger.Printf("disha: protocol retrieval disabled: %v\n", err)
-		sentryutil.Capture(sentryutil.Event{
-			Err: err,
-			Tags: map[string]string{
-				"component": "disha_followup",
-				"operation": "protocol_retrieval_config",
-			},
-			Details: map[string]any{
-				"conversation_id": pl.Startup.ConversationID,
-				"user_id":         pl.Startup.UserID,
-			},
-		})
+func setupFollowUpRetrieval(pl *followUpPlan) {
+	protocolEnabled := protocolRetrievalEnabled()
+	guardrailEnabled := guardrailCheckEnabled()
+	if !protocolEnabled && !guardrailEnabled {
 		return
 	}
 
+	client, err := weaviate.NewClientFromEnv(pl.Startup.Logger)
+	if err != nil {
+		if protocolEnabled {
+			reportFollowUpWeaviateConfigFailure(pl, err, "protocol_retrieval_config", "protocol retrieval")
+		}
+		if guardrailEnabled {
+			reportFollowUpWeaviateConfigFailure(pl, err, "guardrail_check_config", "guardrail check")
+		}
+		return
+	}
+
+	protocolBox := setupProtocolRetrieval(pl, client)
+	guardrailBox := setupGuardrailCheck(pl, client)
+	if protocolBox == nil && guardrailBox == nil {
+		return
+	}
+	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
+		protocolBox,
+		guardrailBox,
+		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
+		pl.Startup.Logger,
+		pl.Startup.UserID,
+		pl.Startup.ConversationID,
+		FollowUpBotType,
+	))
+}
+
+// setupProtocolRetrieval wires blocking protocol retrieval for both follow-up
+// paths around the already-shared Weaviate client.
+func setupProtocolRetrieval(pl *followUpPlan, client *weaviate.Client) *protocolRecordBox {
+	if !protocolRetrievalEnabled() {
+		return nil
+	}
 	box := &protocolRecordBox{}
 	pl.ProtocolEnricher = newProtocolEnricher(
 		client,
@@ -157,15 +188,65 @@ func setupProtocolRetrieval(pl *followUpPlan) {
 		pl.Startup.UserID,
 		pl.Startup.ConversationID,
 	)
-	pl.Callbacks.SetChunkDecorator(newRetrievalChunkDecorator(
+	pl.Startup.Logger.Printf("disha: protocol retrieval enabled (dynamic=%v)\n", pl.Dynamic)
+	return box
+}
+
+func setupGuardrailCheck(pl *followUpPlan, client *weaviate.Client) *guardrailRecordBox {
+	if !guardrailCheckEnabled() {
+		return nil
+	}
+	box := &guardrailRecordBox{}
+	pl.GuardrailChecker = newGuardrailChecker(
+		client,
 		box,
-		NewUSBucketJSONUploaderFromEnv(pl.Startup.Logger),
 		pl.Startup.Logger,
 		pl.Startup.UserID,
 		pl.Startup.ConversationID,
-		FollowUpBotType,
-	))
-	pl.Startup.Logger.Printf("disha: protocol retrieval enabled (dynamic=%v)\n", pl.Dynamic)
+	)
+	pl.Startup.Logger.Printf("disha: guardrail check enabled (dynamic=%v)\n", pl.Dynamic)
+	return box
+}
+
+func reportFollowUpWeaviateConfigFailure(pl *followUpPlan, err error, operation, feature string) {
+	pl.Startup.Logger.Printf("disha: %s disabled: %v\n", feature, err)
+	sentryutil.Capture(sentryutil.Event{
+		Err: err,
+		Tags: map[string]string{
+			"component": "disha_followup",
+			"operation": operation,
+		},
+		Details: map[string]any{
+			"conversation_id": pl.Startup.ConversationID,
+			"user_id":         pl.Startup.UserID,
+		},
+	})
+}
+
+// composeEnrichers drops nils and chains the remaining enrichers from left to
+// right. Protocol retrieval is supplied first and the correction last, so the
+// correction is the final message in the LLM snapshot.
+func composeEnrichers(enrichers ...voicepipelinecore.MessagesEnricher) voicepipelinecore.MessagesEnricher {
+	active := make([]voicepipelinecore.MessagesEnricher, 0, len(enrichers))
+	for _, enricher := range enrichers {
+		if enricher != nil {
+			active = append(active, enricher)
+		}
+	}
+	switch len(active) {
+	case 0:
+		return nil
+	case 1:
+		return active[0]
+	default:
+		return func(ctx context.Context, messages []voicepipelinecore.Message) []voicepipelinecore.Message {
+			out := messages
+			for _, enricher := range active {
+				out = enricher(ctx, out)
+			}
+			return out
+		}
+	}
 }
 
 func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Deps) (*voicepipelinecore.PipelineTask, error) {
@@ -229,21 +310,37 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		userIdle,
 		contextAggregators.User(),
 	}
-	// Protocol retrieval sits upstream of the LLM so its latency lands in its
-	// own MetricContextEnrich rather than inside llm_ttfb_ms. Absent on every
-	// non-dynamic call, leaving the processor list identical to before.
+	// Retrieval/correction enrichment sits upstream of the LLM so its latency
+	// lands in MetricContextEnrich rather than inside llm_ttfb_ms.
+	var protocolEnrich voicepipelinecore.MessagesEnricher
 	if pl.ProtocolEnricher != nil {
 		pl.ProtocolEnricher.SetInfrastructure(routerPromptMetadataSetter(llmClient), taskCtx.UIEvents)
 		pl.ProtocolEnricher.SetSentryHub(taskCtx.SentryHub())
-		processors = append(processors,
-			voicepipelinecore.NewContextEnricherProcessor(taskCtx, pl.ProtocolEnricher.Enrich))
+		protocolEnrich = pl.ProtocolEnricher.Enrich
 		enricher := pl.ProtocolEnricher
 		go enricher.warmUp(taskCtx.Ctx)
 	}
+	var guardrailCorrection voicepipelinecore.MessagesEnricher
+	if pl.GuardrailChecker != nil {
+		pl.GuardrailChecker.SetSentryHub(taskCtx.SentryHub())
+		pl.GuardrailChecker.SetUI(taskCtx.UIEvents)
+		guardrailCorrection = pl.GuardrailChecker.EnrichCorrection
+	}
+	if enrich := composeEnrichers(protocolEnrich, guardrailCorrection); enrich != nil {
+		processors = append(processors, voicepipelinecore.NewContextEnricherProcessor(taskCtx, enrich))
+	}
+	// Guardrail-only calls intentionally do not warm the connection: protocol's
+	// warm-up owns that behavior, so the first check pays the cold handshake.
 	processors = append(processors,
 		llm,
 		llmResponseTimeout,
 		llmOutputFilter,
+	)
+	if pl.GuardrailChecker != nil {
+		processors = append(processors,
+			voicepipelinecore.NewResponseGuardProcessor(taskCtx, pl.GuardrailChecker.Check))
+	}
+	processors = append(processors,
 		tts,
 		playback,
 		contextAggregators.Assistant(),
