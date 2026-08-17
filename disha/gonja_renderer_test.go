@@ -1,15 +1,139 @@
 package disha
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 func newTestGonjaRenderer() *GonjaJinjaRenderer {
 	return NewGonjaJinjaRenderer(log.New(io.Discard, "", 0))
+}
+
+// llmLogDump is the shape of each file under llm_log_dumps_final/. Only the
+// fields needed to re-render the system prompt are decoded.
+type llmLogDump struct {
+	LogID               string         `json:"log_id"`
+	UsecaseType         string         `json:"usecase_type"`
+	SystemPromptName    string         `json:"system_prompt_name"`
+	SystemPromptVersion int            `json:"system_prompt_version"`
+	Variables           map[string]any `json:"variables"`
+	OriginalPromptText  string         `json:"original_prompt_text"`
+	SystemPromptText    string         `json:"system_prompt_text"`
+}
+
+// TestGonjaRenderMatchesLoggedSystemPrompt renders each real LLM-log dump's
+// original (un-rendered) system prompt through the gonja renderer using the
+// logged variables and asserts the output byte-matches the system_prompt_text
+// that the live Python Jinja renderer produced. This is the parity check
+// between the two renderers on production prompts.
+//
+// The dumps live at the repo root (../llm_log_dumps_final relative to this
+// package). If the directory is absent the test skips, so CI without the
+// fixtures still passes.
+func TestGonjaRenderMatchesLoggedSystemPrompt(t *testing.T) {
+	const dumpDir = "../llm_log_dumps_final"
+	if _, err := os.Stat(dumpDir); os.IsNotExist(err) {
+		t.Skipf("dump dir %s not present; skipping", dumpDir)
+	}
+
+	files, err := filepath.Glob(filepath.Join(dumpDir, "*.json"))
+	if err != nil {
+		t.Fatalf("glob dumps: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no dump files found in %s", dumpDir)
+	}
+
+	r := newTestGonjaRenderer()
+	for _, file := range files {
+		file := file
+		t.Run(filepath.Base(file), func(t *testing.T) {
+			raw, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			var dump llmLogDump
+			// UseNumber so JSON numbers decode to json.Number (preserving the
+			// int/float literal, e.g. "1" vs "158.0") rather than float64, which
+			// gonja would render as "1.0". This matches Python's json/int decode.
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
+			if err := dec.Decode(&dump); err != nil {
+				t.Fatalf("unmarshal %s: %v", file, err)
+			}
+
+			res, err := r.Render(context.Background(), GonjaRenderRequest{
+				DocumentName:    dump.SystemPromptName,
+				DocumentVersion: dump.SystemPromptVersion,
+				Text:            dump.OriginalPromptText,
+				Variables:       dump.Variables,
+			})
+			if err != nil {
+				t.Fatalf("render %s (%s v%d): %v", file, dump.SystemPromptName, dump.SystemPromptVersion, err)
+			}
+
+			// Ignore trailing-newline-only diffs. gonja strips one trailing
+			// newline (Jinja keep_trailing_newline=False), and Python's renderer
+			// returns static prompts (empty variables) verbatim, keeping it — so
+			// for those the logged text carries a trailing newline gonja drops.
+			// Trailing newlines are not semantically meaningful in a prompt.
+			if res.Output != dump.SystemPromptText &&
+				strings.TrimRight(res.Output, "\n") != strings.TrimRight(dump.SystemPromptText, "\n") {
+				at, gotCtx, wantCtx := firstDiff(res.Output, dump.SystemPromptText)
+				// A diff is "explained" when it is caused by an undefined or nil
+				// variable: undefined names (e.g. onboarding's `analysis`,
+				// deliberately excluded from logged prompt metadata) and nil vars
+				// (gonja empty vs Jinja "None", an accepted divergence) render
+				// differently by design. A diff with NEITHER list set is an
+				// unexplained parity bug and the concerning case.
+				explained := len(res.Undefined) > 0 || len(res.NilVars) > 0
+				t.Errorf("gonja output differs from logged system prompt for %s v%d\n"+
+					"  file:       %s\n"+
+					"  explained:  %t (by undefined/nil vars)\n"+
+					"  undefined:  %v\n"+
+					"  nil vars:   %v\n"+
+					"  first diff at byte %d (gonja len=%d, logged len=%d)\n"+
+					"  gonja  ...%q...\n"+
+					"  logged ...%q...",
+					dump.SystemPromptName, dump.SystemPromptVersion, filepath.Base(file),
+					explained, res.Undefined, res.NilVars, at, len(res.Output), len(dump.SystemPromptText),
+					gotCtx, wantCtx)
+			}
+		})
+	}
+}
+
+// firstDiff returns the index of the first differing byte between got and want
+// plus a short window of context around that index from each string.
+func firstDiff(got, want string) (int, string, string) {
+	n := len(got)
+	if len(want) < n {
+		n = len(want)
+	}
+	i := 0
+	for i < n && got[i] == want[i] {
+		i++
+	}
+	window := func(s string) string {
+		lo := i - 40
+		if lo < 0 {
+			lo = 0
+		}
+		hi := i + 40
+		if hi > len(s) {
+			hi = len(s)
+		}
+		return s[lo:hi]
+	}
+	return i, window(got), window(want)
 }
 
 // TestGonjaRenderOutput covers the rendered text: substitution, no HTML
