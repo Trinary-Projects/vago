@@ -95,17 +95,19 @@ func TestGonjaRenderMatchesLoggedSystemPrompt(t *testing.T) {
 				// differently by design. A diff with NEITHER list set is an
 				// unexplained parity bug and the concerning case.
 				explained := len(res.Undefined) > 0 || len(res.NilVars) > 0
-				t.Errorf("gonja output differs from logged system prompt for %s v%d\n"+
-					"  file:       %s\n"+
-					"  explained:  %t (by undefined/nil vars)\n"+
-					"  undefined:  %v\n"+
-					"  nil vars:   %v\n"+
-					"  first diff at byte %d (gonja len=%d, logged len=%d)\n"+
-					"  gonja  ...%q...\n"+
-					"  logged ...%q...",
-					dump.SystemPromptName, dump.SystemPromptVersion, filepath.Base(file),
-					explained, res.Undefined, res.NilVars, at, len(res.Output), len(dump.SystemPromptText),
-					gotCtx, wantCtx)
+				if !explained {
+					t.Errorf("gonja output differs from logged system prompt for %s v%d\n"+
+						"  file:       %s\n"+
+						"  explained:  %t (by undefined/nil vars)\n"+
+						"  undefined:  %v\n"+
+						"  nil vars:   %v\n"+
+						"  first diff at byte %d (gonja len=%d, logged len=%d)\n"+
+						"  gonja  ...%q...\n"+
+						"  logged ...%q...",
+						dump.SystemPromptName, dump.SystemPromptVersion, filepath.Base(file),
+						explained, res.Undefined, res.NilVars, at, len(res.Output), len(dump.SystemPromptText),
+						gotCtx, wantCtx)
+				}
 			}
 		})
 	}
