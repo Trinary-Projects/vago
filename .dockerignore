@@ -8,3 +8,4 @@ Dockerfile
 k8s/
 deploy.sh
 reports/
+llm_log_dumps_final/
