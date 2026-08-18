@@ -118,7 +118,7 @@ func (s *DocumentStore) GetDocumentWithConfig(ctx context.Context, name string, 
 		if rendered.UndefinedError != "" {
 			s.logger.Printf("disha: document %q (version=%d) has undefined jinja variables after strict validation: %s missing=%v\n", name, doc.Version, rendered.UndefinedError, rendered.UnresolvedVariables)
 		} else if len(rendered.UnresolvedVariables) > 0 {
-			s.logger.Printf("disha: document %q (version=%d) has compile-time missing jinja variables: %v\n", name, doc.Version, rendered.UnresolvedVariables)
+			s.logger.Printf("disha: document %q (version=%d) has unresolved/compile-time-missing jinja variables: %v\n", name, doc.Version, rendered.UnresolvedVariables)
 		}
 		if rendered.StrictValidationError != "" {
 			s.logger.Printf("disha: document %q (version=%d) strict jinja validation warning: %s\n", name, doc.Version, rendered.StrictValidationError)
