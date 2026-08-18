@@ -112,6 +112,22 @@ func (s *DocumentStore) GetDocumentWithConfig(ctx context.Context, name string, 
 		Variables:       variables,
 	})
 	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			sentryutil.Capture(sentryutil.Event{
+				Message: fmt.Sprintf("Failed to render document %q v%d", name, doc.Version),
+				Tags: map[string]string{
+					"component":        "disha_document_store",
+					"operation":        "render_jinja",
+					"document_name":    name,
+					"document_version": fmt.Sprintf("%d", doc.Version),
+				},
+				Details: map[string]any{
+					"document_name":    name,
+					"document_version": doc.Version,
+					"error":            err.Error(),
+				},
+			})
+		}
 		return "", 0, nil, err
 	}
 	if s.logger != nil {
