@@ -314,11 +314,13 @@ func TestGonjaRendererClose(t *testing.T) {
 	}
 }
 
-// TestGonjaTemplateVariableNames documents the lexer preflight, including the
-// known false positives vs Python's jinja2.meta.find_undeclared_variables.
-// These assertions describe CURRENT behavior so regressions are visible; the
-// cases marked "FALSE POSITIVE" are where Gonja's token-level scan diverges
-// from Python and would over-report a variable as undefined.
+// TestGonjaTemplateVariableNames documents the lexer preflight. It reports only
+// names that must be SUPPLIED EXTERNALLY: template-local names (for/set targets,
+// the `loop` object, test names after `is`/`is not`) are excluded, matching
+// Python's jinja2.meta.find_undeclared_variables — so they never fire a
+// redundant missing-variable Sentry. The one deliberate over-report that
+// remains is branch-agnostic: a variable used only inside an untaken `{% if %}`
+// branch is still reported, because every branch's inputs must be supplied.
 func TestGonjaTemplateVariableNames(t *testing.T) {
 	tests := []struct {
 		name string
@@ -351,29 +353,59 @@ func TestGonjaTemplateVariableNames(t *testing.T) {
 			want: []string{"count", "status"},
 		},
 		{
-			// FALSE POSITIVE: `item` is a loop-local; Python excludes it.
-			name: "for loop target over-reported",
+			// `item` is a loop-local (header + body use); only `items` is external.
+			name: "for loop target excluded",
 			text: "{% for item in items %}{{ item }}{% endfor %}",
-			want: []string{"item", "items"},
+			want: []string{"items"},
 		},
 		{
-			// FALSE POSITIVE: `x` is set-assigned; Python excludes it. The
-			// assignment target is only skipped when written `x=` with no space.
-			name: "set target over-reported with spaced assign",
+			// tuple loop targets are locals too; only the iterable is external.
+			name: "for loop tuple targets excluded",
+			text: "{% for k, v in mapping %}{{ k }}{{ v }}{% endfor %}",
+			want: []string{"mapping"},
+		},
+		{
+			// `x` is set-assigned (spaced `=` too); only the RHS `greeting` is external.
+			name: "set target excluded with spaced assign",
 			text: "{% set x = greeting %}{{ x }}",
-			want: []string{"greeting", "x"},
+			want: []string{"greeting"},
 		},
 		{
-			// FALSE POSITIVE: `defined` is the test name after `is not`.
-			name: "is-not test name over-reported",
+			// `defined` is the test name after `is not`; only `y` is external.
+			name: "is-not test name excluded",
 			text: "{{ y is not defined }}",
-			want: []string{"defined", "y"},
+			want: []string{"y"},
 		},
 		{
-			// FALSE POSITIVE: `loop` is Jinja's special loop object.
-			name: "loop special over-reported",
+			// a test that takes an argument still reports the argument.
+			name: "test argument still reported",
+			text: "{{ n is divisibleby divisor }}",
+			want: []string{"divisor", "n"},
+		},
+		{
+			// `loop` is Jinja's special loop object; only `xs` is external.
+			name: "loop special excluded",
 			text: "{% for i in xs %}{{ loop.index }}{% endfor %}",
-			want: []string{"i", "loop", "xs"},
+			want: []string{"xs"},
+		},
+		{
+			// inline for-loop condition: `if` is a hard keyword, not a var.
+			name: "for loop inline if condition excluded",
+			text: "{% for x in xs if flag %}{{ x }}{% endfor %}",
+			want: []string{"flag", "xs"},
+		},
+		{
+			// `elif`/`else` are hard keywords even when not the tag name.
+			name: "elif else keywords excluded",
+			text: "{% if a %}{% elif b %}{% else %}{{ c }}{% endif %}",
+			want: []string{"a", "b", "c"},
+		},
+		{
+			// The remaining deliberate over-report: a var used only inside an
+			// untaken branch is still reported, because branch inputs must exist.
+			name: "if-branch variable still reported (over-report kept)",
+			text: "{% if flag %}{{ only_used_when_flag }}{% endif %}",
+			want: []string{"flag", "only_used_when_flag"},
 		},
 	}
 

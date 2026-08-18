@@ -175,8 +175,10 @@ func cloneDocumentConfig(in map[string]any) map[string]any {
 // Divergence vs. Python's original two-warning scheme: gonja detects these
 // statically at top-level-name granularity, branch-agnostically, so it cannot
 // restrict to render-site / taken-branch access the way Python's StrictUndefined
-// render and per-output finalize hook did. This over-reports (dead branches,
-// loop/set/test names) but never misses a genuinely-unresolved variable.
+// render and per-output finalize hook did. It excludes template-local names
+// (for/set targets, `loop`, is/is-not test names — see gonjaTemplateVariableNames)
+// but still over-reports the branch-agnostic case (a var used only in an untaken
+// {% if %} branch), and never misses a genuinely-unresolved variable.
 func reportMissingJinjaVariables(name string, version int, rendered TemplateRenderResult, variables DocumentVariables) {
 	if rendered.UndefinedError == "" && len(rendered.UnresolvedVariables) == 0 {
 		return

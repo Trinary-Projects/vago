@@ -137,10 +137,36 @@ func mergeSortedNames(undefined, nilVars []string) []string {
 
 // gonjaTemplateVariableNames is a reporting-only preflight over gonja's lexer.
 // It returns the sorted set of top-level context names referenced by the
-// template. It does not affect rendering. gonja has no
-// jinja2.meta.find_undeclared_variables equivalent, so the token stream is
-// scanned directly: names inside {{ ... }} / {% ... %} that are not keywords,
-// filter/test names, attribute lookups, or keyword-argument names.
+// template that must be SUPPLIED EXTERNALLY. It does not affect rendering.
+// gonja has no jinja2.meta.find_undeclared_variables equivalent, so the token
+// stream is scanned directly: names inside {{ ... }} / {% ... %} that are not
+// keywords, filter/test names, attribute lookups, or keyword-argument names.
+//
+// Template-local names — which are defined by the template itself and can never
+// be passed in — are collected and subtracted, so they are never reported as
+// unresolved (which would fire a redundant missing-variable Sentry on every
+// render). These are: `for` loop targets (`{% for item in items %}` → `item`),
+// `set` assignment targets (`{% set x = ... %}` → `x`), the special `loop`
+// object, and test names after `is` / `is not` (`{{ y is not defined %}` →
+// `defined`). This matches Python's find_undeclared_variables for these forms.
+//
+// It deliberately still OVER-reports the branch-agnostic case: a variable used
+// only inside an untaken `{% if %}` branch is reported, because the scan cannot
+// know which branch runs and every branch's inputs must be supplied.
+//
+// Known remaining over-reports vs find_undeclared_variables, all for advanced
+// tags that are unlikely in prompt/protocol templates and where over-reporting
+// is the SAFE direction (an extra Sentry, never a hidden missing var):
+//   - `{% with foo = bar %}` reports the target `foo` (bar is correct).
+//   - `{% macro m(a) %}` reports the macro name `m` and args `a`.
+//   - `{% filter fname %}` reports the filter name `fname`.
+//   - `{% block name %}` reports the block name.
+//   - `{% for x in xs recursive %}` reports `recursive` (a contextual word Jinja
+//     also allows as an identifier, so it is not blanket-excluded).
+//
+// Note: gonja does NOT support Jinja's inline conditional expression
+// `{{ a if cond else b }}` at all — it is a hard COMPILE error, so such a
+// template fails to render entirely rather than mis-reporting a variable.
 func gonjaTemplateVariableNames(text string) ([]string, error) {
 	lexer := gonjatokens.NewLexer(text)
 	go lexer.Run()
@@ -150,8 +176,12 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 	}
 
 	variables := make(map[string]struct{})
+	locals := make(map[string]struct{}) // template-defined names (for/set targets)
 	inExpression := false
 	expectBlockName := false
+	inForTargets := false   // between `for` and `in`: names are loop locals
+	inSetTargets := false   // between `set` and `=`: names are assignment targets
+	expectTestName := false // after `is` / `is not`: the next name is a test name
 	var previous *gonjatokens.Token
 
 	for index, token := range tokens {
@@ -160,16 +190,26 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 			return nil, errors.New(token.Val)
 		case gonjatokens.VariableBegin:
 			inExpression = true
+			expectBlockName = false
+			inForTargets = false
+			inSetTargets = false
+			expectTestName = false
 			previous = nil
 			continue
 		case gonjatokens.BlockBegin:
 			inExpression = true
 			expectBlockName = true
+			inForTargets = false
+			inSetTargets = false
+			expectTestName = false
 			previous = nil
 			continue
 		case gonjatokens.VariableEnd, gonjatokens.BlockEnd:
 			inExpression = false
 			expectBlockName = false
+			inForTargets = false
+			inSetTargets = false
+			expectTestName = false
 			previous = nil
 			continue
 		case gonjatokens.Whitespace:
@@ -182,26 +222,77 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 		// The first Name after {% is the tag name (if/for/set/...), not a var.
 		if token.Type == gonjatokens.Name && expectBlockName {
 			expectBlockName = false
+			switch strings.ToLower(token.Val) {
+			case "for":
+				inForTargets = true
+			case "set":
+				inSetTargets = true
+			}
 			previous = token
 			continue
 		}
+
+		// `for` header: loop targets up to `in` are locals, not external vars.
+		// `in` closes the target list; names after it (the iterable) are real.
+		if inForTargets {
+			if token.Type == gonjatokens.Name {
+				if strings.EqualFold(token.Val, "in") {
+					inForTargets = false
+				} else {
+					locals[token.Val] = struct{}{}
+				}
+			}
+			previous = token
+			continue
+		}
+
+		// `set` header: assignment targets up to `=` are locals. The `=` closes
+		// the target list; the RHS names after it are real variables.
+		if inSetTargets {
+			if token.Type == gonjatokens.Assign {
+				inSetTargets = false
+			} else if token.Type == gonjatokens.Name {
+				locals[token.Val] = struct{}{}
+			}
+			previous = token
+			continue
+		}
+
 		if token.Type != gonjatokens.Name {
 			previous = token
 			continue
 		}
 
 		name := token.Val
-		if isGonjaExpressionKeyword(strings.ToLower(name)) {
+		lower := strings.ToLower(name)
+
+		// `is` / `is not` introduce a test name (e.g. `defined`, `divisibleby`),
+		// which is not a context var. `not` here is part of `is not`, not the
+		// unary operator, so keep waiting for the test name.
+		if expectTestName {
+			if lower != "not" {
+				expectTestName = false
+			}
+			previous = token
+			continue
+		}
+		if lower == "is" {
+			expectTestName = true
+			previous = token
+			continue
+		}
+		if isGonjaExpressionKeyword(lower) {
+			previous = token
+			continue
+		}
+		// Jinja's special `loop` object exists only inside a for-body and can
+		// never be passed in externally.
+		if lower == "loop" {
 			previous = token
 			continue
 		}
 		// Attribute (`.name`) or filter/test (`| name`) — not a context var.
 		if previous != nil && (previous.Type == gonjatokens.Dot || previous.Type == gonjatokens.Pipe) {
-			previous = token
-			continue
-		}
-		// Test name after `is` — not a context var.
-		if previous != nil && previous.Type == gonjatokens.Name && strings.EqualFold(previous.Val, "is") {
 			previous = token
 			continue
 		}
@@ -216,15 +307,28 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 
 	names := make([]string, 0, len(variables))
 	for name := range variables {
+		// Body uses of a for/set target (`{{ item }}`, `{{ x }}`) are locals too.
+		if _, isLocal := locals[name]; isLocal {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names, nil
 }
 
+// isGonjaExpressionKeyword reports whether a bare name is a Jinja hard keyword
+// that can never be a context variable. It lists the expression operators/
+// literals plus if/elif/else, which appear inline in for-loop conditions
+// (`{% for x in xs if cond %}`) and as tag names. Jinja forbids all of these as
+// variable identifiers, so excluding them cannot hide a genuinely-missing var.
+// Contextual words that Jinja DOES allow as identifiers (e.g. `recursive`,
+// `block`, `with`, `filter`) are deliberately NOT here — excluding them could
+// cause a false negative; they are handled positionally or accepted as
+// over-reports (see gonjaTemplateVariableNames).
 func isGonjaExpressionKeyword(name string) bool {
 	switch name {
-	case "and", "false", "in", "is", "none", "not", "or", "true":
+	case "and", "elif", "else", "false", "if", "in", "is", "none", "not", "or", "true":
 		return true
 	default:
 		return false
