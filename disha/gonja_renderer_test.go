@@ -70,7 +70,7 @@ func TestGonjaRenderMatchesLoggedSystemPrompt(t *testing.T) {
 				t.Fatalf("unmarshal %s: %v", file, err)
 			}
 
-			res, err := r.Render(context.Background(), GonjaRenderRequest{
+			res, err := r.Render(context.Background(), TemplateRenderRequest{
 				DocumentName:    dump.SystemPromptName,
 				DocumentVersion: dump.SystemPromptVersion,
 				Text:            dump.OriginalPromptText,
@@ -88,24 +88,23 @@ func TestGonjaRenderMatchesLoggedSystemPrompt(t *testing.T) {
 			if res.Output != dump.SystemPromptText &&
 				strings.TrimRight(res.Output, "\n") != strings.TrimRight(dump.SystemPromptText, "\n") {
 				at, gotCtx, wantCtx := firstDiff(res.Output, dump.SystemPromptText)
-				// A diff is "explained" when it is caused by an undefined or nil
-				// variable: undefined names (e.g. onboarding's `analysis`,
-				// deliberately excluded from logged prompt metadata) and nil vars
-				// (gonja empty vs Jinja "None", an accepted divergence) render
-				// differently by design. A diff with NEITHER list set is an
+				// A diff is "explained" when it is caused by an unresolved
+				// variable: a missing name (e.g. onboarding's `analysis`,
+				// deliberately excluded from logged prompt metadata) or a nil var
+				// (gonja empty vs Jinja "None", an accepted divergence) renders
+				// differently by design. A diff with an empty unresolved set is an
 				// unexplained parity bug and the concerning case.
-				explained := len(res.Undefined) > 0 || len(res.NilVars) > 0
+				explained := len(res.UnresolvedVariables) > 0
 				if !explained {
 					t.Errorf("gonja output differs from logged system prompt for %s v%d\n"+
-						"  file:       %s\n"+
-						"  explained:  %t (by undefined/nil vars)\n"+
-						"  undefined:  %v\n"+
-						"  nil vars:   %v\n"+
+						"  file:        %s\n"+
+						"  explained:   %t (by unresolved vars)\n"+
+						"  unresolved:  %v\n"+
 						"  first diff at byte %d (gonja len=%d, logged len=%d)\n"+
 						"  gonja  ...%q...\n"+
 						"  logged ...%q...",
 						dump.SystemPromptName, dump.SystemPromptVersion, filepath.Base(file),
-						explained, res.Undefined, res.NilVars, at, len(res.Output), len(dump.SystemPromptText),
+						explained, res.UnresolvedVariables, at, len(res.Output), len(dump.SystemPromptText),
 						gotCtx, wantCtx)
 				}
 			}
@@ -188,7 +187,7 @@ func TestGonjaRenderOutput(t *testing.T) {
 	r := newTestGonjaRenderer()
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := r.Render(context.Background(), GonjaRenderRequest{
+			res, err := r.Render(context.Background(), TemplateRenderRequest{
 				DocumentName: tc.name,
 				Text:         tc.text,
 				Variables:    tc.variables,
@@ -203,8 +202,9 @@ func TestGonjaRenderOutput(t *testing.T) {
 	}
 }
 
-// TestGonjaRenderUndefinedAndNil covers the two reporting lists that mirror the
-// Python renderer's undefined-variable and rendered-None detection.
+// TestGonjaRenderUndefinedAndNil covers variable detection. The cases keep the
+// original undefined/nil split for clarity; the renderer now merges both into
+// one UnresolvedVariables set, so the assertion compares against their union.
 func TestGonjaRenderUndefinedAndNil(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -246,7 +246,7 @@ func TestGonjaRenderUndefinedAndNil(t *testing.T) {
 	r := newTestGonjaRenderer()
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := r.Render(context.Background(), GonjaRenderRequest{
+			res, err := r.Render(context.Background(), TemplateRenderRequest{
 				DocumentName: tc.name,
 				Text:         tc.text,
 				Variables:    tc.variables,
@@ -254,37 +254,35 @@ func TestGonjaRenderUndefinedAndNil(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Render: %v", err)
 			}
-			if !reflect.DeepEqual(res.Undefined, tc.wantUndefined) {
-				t.Errorf("Undefined = %v, want %v", res.Undefined, tc.wantUndefined)
-			}
-			if !reflect.DeepEqual(res.NilVars, tc.wantNil) {
-				t.Errorf("NilVars = %v, want %v", res.NilVars, tc.wantNil)
+			wantUnresolved := mergeSortedNames(tc.wantUndefined, tc.wantNil)
+			if !reflect.DeepEqual(res.UnresolvedVariables, wantUnresolved) {
+				t.Errorf("UnresolvedVariables = %v, want %v", res.UnresolvedVariables, wantUnresolved)
 			}
 		})
 	}
 }
 
 // TestGonjaRenderNoVariables: passing no variables is the same as every
-// reference being undefined, so the reference blanks in the output and is
-// reported undefined rather than left literal.
+// reference being unresolved, so the reference blanks in the output and is
+// reported unresolved rather than left literal.
 func TestGonjaRenderNoVariables(t *testing.T) {
 	r := newTestGonjaRenderer()
 	const raw = "keep {{ untouched }} literally"
-	res, err := r.Render(context.Background(), GonjaRenderRequest{Text: raw})
+	res, err := r.Render(context.Background(), TemplateRenderRequest{Text: raw})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if want := "keep  literally"; res.Output != want {
 		t.Fatalf("Output = %q, want %q", res.Output, want)
 	}
-	if !reflect.DeepEqual(res.Undefined, []string{"untouched"}) {
-		t.Fatalf("Undefined = %v, want [untouched]", res.Undefined)
+	if !reflect.DeepEqual(res.UnresolvedVariables, []string{"untouched"}) {
+		t.Fatalf("UnresolvedVariables = %v, want [untouched]", res.UnresolvedVariables)
 	}
 }
 
 func TestGonjaRenderNilReceiver(t *testing.T) {
 	var r *GonjaJinjaRenderer
-	if _, err := r.Render(context.Background(), GonjaRenderRequest{Text: "hi"}); err == nil {
+	if _, err := r.Render(context.Background(), TemplateRenderRequest{Text: "hi"}); err == nil {
 		t.Fatal("expected error from nil receiver")
 	}
 }
@@ -293,7 +291,7 @@ func TestGonjaRenderContextCancelled(t *testing.T) {
 	r := newTestGonjaRenderer()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := r.Render(ctx, GonjaRenderRequest{Text: "{{ a }}", Variables: map[string]any{"a": "x"}}); err == nil {
+	if _, err := r.Render(ctx, TemplateRenderRequest{Text: "{{ a }}", Variables: map[string]any{"a": "x"}}); err == nil {
 		t.Fatal("expected context cancellation error")
 	}
 }
@@ -301,7 +299,7 @@ func TestGonjaRenderContextCancelled(t *testing.T) {
 func TestGonjaRenderCompileError(t *testing.T) {
 	r := newTestGonjaRenderer()
 	// Unterminated block should fail to compile.
-	_, err := r.Render(context.Background(), GonjaRenderRequest{
+	_, err := r.Render(context.Background(), TemplateRenderRequest{
 		Text:      "{% if x %}oops",
 		Variables: map[string]any{"x": true},
 	})
