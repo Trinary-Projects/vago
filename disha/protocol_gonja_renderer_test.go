@@ -235,9 +235,9 @@ func TestGonjaProtocolRendererErrors(t *testing.T) {
 
 func TestProtocolTemplateVariableNames(t *testing.T) {
 	template := `{{ profile.name | default(fallback) }}{% if status is defined and status %}{{ amount }}{% endif %}`
-	got, err := protocolTemplateVariableNames(template)
+	got, err := gonjaTemplateVariableNames(template)
 	if err != nil {
-		t.Fatalf("protocolTemplateVariableNames: %v", err)
+		t.Fatalf("gonjaTemplateVariableNames: %v", err)
 	}
 	want := []string{"amount", "fallback", "profile", "status"}
 	if !reflect.DeepEqual(got, want) {
@@ -306,7 +306,7 @@ func TestGonjaProtocolRendererLiveCorpusParity(t *testing.T) {
 	cases := 0
 	templated := 0
 	for _, protocol := range protocols {
-		names, err := protocolTemplateVariableNames(protocol.InstructionText)
+		names, err := gonjaTemplateVariableNames(protocol.InstructionText)
 		if err != nil {
 			t.Fatalf("inspect %s (%s): %v", protocol.Title, protocol.ID.ID, err)
 		}

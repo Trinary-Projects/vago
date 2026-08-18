@@ -19,26 +19,11 @@ import (
 
 const defaultJinjaRenderTimeout = 10 * time.Second
 
-type DocumentVariables map[string]any
-
-type TemplateRenderRequest struct {
-	DocumentName    string
-	DocumentVersion int
-	Text            string
-	Variables       DocumentVariables
-}
-
-type TemplateRenderResult struct {
-	Output                 string
-	CompileTimeMissingVars []string
-	UndefinedError         string
-	StrictValidationError  string
-}
-
-type TemplateRenderer interface {
-	Render(ctx context.Context, req TemplateRenderRequest) (TemplateRenderResult, error)
-	Close() error
-}
+// DocumentVariables, TemplateRenderRequest, TemplateRenderResult, and the
+// TemplateRenderer interface are defined in gonja_renderer.go, the production
+// renderer. PythonJinjaRenderer below implements the same interface and is kept
+// only as a parity test oracle (see protocol_gonja_renderer_test.go); nothing
+// in production wires it.
 
 type PythonJinjaRenderer struct {
 	logger  *log.Logger
@@ -188,10 +173,10 @@ func (r *PythonJinjaRenderer) renderOnceLocked(ctx context.Context, req Template
 			return TemplateRenderResult{}, fmt.Errorf("disha: render document %q version=%d failed at %s: %s", req.DocumentName, req.DocumentVersion, out.resp.Stage, out.resp.Error)
 		}
 		return TemplateRenderResult{
-			Output:                 out.resp.Output,
-			CompileTimeMissingVars: out.resp.CompileTimeMissingVars,
-			UndefinedError:         out.resp.UndefinedError,
-			StrictValidationError:  out.resp.StrictValidationError,
+			Output:                out.resp.Output,
+			UnresolvedVariables:   out.resp.CompileTimeMissingVars,
+			UndefinedError:        out.resp.UndefinedError,
+			StrictValidationError: out.resp.StrictValidationError,
 		}, nil
 	case <-ctx.Done():
 		r.stopLocked()

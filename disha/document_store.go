@@ -56,7 +56,7 @@ type documentCacheEntry struct {
 //   - ENVIRONMENT in {"staging", "dev"} → key suffix "latest"
 //   - anything else                     → key suffix "production"
 func NewDocumentStore(redis RedisClient, logger *log.Logger) *DocumentStore {
-	return newDocumentStore(redis, logger, NewPythonJinjaRenderer(logger))
+	return newDocumentStore(redis, logger, NewGonjaJinjaRenderer(logger))
 }
 
 func newDocumentStore(redis RedisClient, logger *log.Logger, renderer TemplateRenderer) *DocumentStore {
@@ -112,13 +112,29 @@ func (s *DocumentStore) GetDocumentWithConfig(ctx context.Context, name string, 
 		Variables:       variables,
 	})
 	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			sentryutil.Capture(sentryutil.Event{
+				Message: fmt.Sprintf("Failed to render document %q v%d", name, doc.Version),
+				Tags: map[string]string{
+					"component":        "disha_document_store",
+					"operation":        "render_jinja",
+					"document_name":    name,
+					"document_version": fmt.Sprintf("%d", doc.Version),
+				},
+				Details: map[string]any{
+					"document_name":    name,
+					"document_version": doc.Version,
+					"error":            err.Error(),
+				},
+			})
+		}
 		return "", 0, nil, err
 	}
 	if s.logger != nil {
 		if rendered.UndefinedError != "" {
-			s.logger.Printf("disha: document %q (version=%d) has undefined jinja variables after strict validation: %s missing=%v\n", name, doc.Version, rendered.UndefinedError, rendered.CompileTimeMissingVars)
-		} else if len(rendered.CompileTimeMissingVars) > 0 {
-			s.logger.Printf("disha: document %q (version=%d) has compile-time missing jinja variables: %v\n", name, doc.Version, rendered.CompileTimeMissingVars)
+			s.logger.Printf("disha: document %q (version=%d) has undefined jinja variables after strict validation: %s missing=%v\n", name, doc.Version, rendered.UndefinedError, rendered.UnresolvedVariables)
+		} else if len(rendered.UnresolvedVariables) > 0 {
+			s.logger.Printf("disha: document %q (version=%d) has unresolved/compile-time-missing jinja variables: %v\n", name, doc.Version, rendered.UnresolvedVariables)
 		}
 		if rendered.StrictValidationError != "" {
 			s.logger.Printf("disha: document %q (version=%d) strict jinja validation warning: %s\n", name, doc.Version, rendered.StrictValidationError)
@@ -165,8 +181,22 @@ func cloneDocumentConfig(in map[string]any) map[string]any {
 	return out
 }
 
+// reportMissingJinjaVariables raises a single Sentry warning naming every
+// referenced variable with no usable value. It serves BOTH renderers through
+// the shared TemplateRenderResult: the gonja renderer (production) fills
+// UnresolvedVariables with the merged missing (key absent) + nil (key present,
+// value nil) set, and the Python oracle (jinja_renderer.go, used only by the
+// parity test) fills it with its compile-time missing set.
+//
+// Divergence vs. Python's original two-warning scheme: gonja detects these
+// statically at top-level-name granularity, branch-agnostically, so it cannot
+// restrict to render-site / taken-branch access the way Python's StrictUndefined
+// render and per-output finalize hook did. It excludes template-local names
+// (for/set targets, `loop`, is/is-not test names — see gonjaTemplateVariableNames)
+// but still over-reports the branch-agnostic case (a var used only in an untaken
+// {% if %} branch), and never misses a genuinely-unresolved variable.
 func reportMissingJinjaVariables(name string, version int, rendered TemplateRenderResult, variables DocumentVariables) {
-	if rendered.UndefinedError == "" && len(rendered.CompileTimeMissingVars) == 0 {
+	if rendered.UndefinedError == "" && len(rendered.UnresolvedVariables) == 0 {
 		return
 	}
 	supplied := make([]string, 0, len(variables))
@@ -183,12 +213,12 @@ func reportMissingJinjaVariables(name string, version int, rendered TemplateRend
 			"document_version": fmt.Sprintf("%d", version),
 		},
 		Details: map[string]any{
-			"document_name":                  name,
-			"document_version":               version,
-			"runtime_missing_variable":       rendered.UndefinedError,
-			"compile_time_missing_variables": rendered.CompileTimeMissingVars,
-			"strict_validation_error":        rendered.StrictValidationError,
-			"supplied_variables":             supplied,
+			"document_name":                     name,
+			"document_version":                  version,
+			"runtime_missing_variable":          rendered.UndefinedError,
+			"compile_time_unresolved_variables": rendered.UnresolvedVariables,
+			"strict_validation_error":           rendered.StrictValidationError,
+			"supplied_variables":                supplied,
 		},
 	})
 }
