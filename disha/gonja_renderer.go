@@ -86,18 +86,25 @@ func gonjaRenderText(ctx context.Context, label string, version int, text string
 		variables = DocumentVariables{}
 	}
 
-	referenced, err := gonjaTemplateVariableNames(text)
+	referenced, err := gonjaTemplateVariableRefs(text)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("disha: inspect template %q version=%d: %w", label, version, err)
 	}
 
-	// referenced is sorted, so both sublists stay sorted without extra work.
-	for _, name := range referenced {
+	names := make([]string, 0, len(referenced))
+	for name := range referenced {
+		names = append(names, name)
+	}
+	sort.Strings(names) // keep undefined/nilVars sorted for mergeSortedNames
+
+	for _, name := range names {
 		value, ok := variables[name]
 		switch {
 		case !ok:
 			undefined = append(undefined, name)
-		case value == nil:
+		case value == nil && referenced[name].IsOutput:
+			// A nil matters only where it renders directly ({{ x }}); a nil used
+			// solely in a block ({% if x is not none %}) is a legitimate input.
 			nilVars = append(nilVars, name)
 		}
 	}
@@ -135,9 +142,31 @@ func mergeSortedNames(undefined, nilVars []string) []string {
 	return merged
 }
 
-// gonjaTemplateVariableNames is a reporting-only preflight over gonja's lexer.
-// It returns the sorted set of top-level context names referenced by the
-// template that must be SUPPLIED EXTERNALLY. It does not affect rendering.
+// TemplateVarRef holds preflight facts about a referenced variable. It is a
+// struct so more properties can be added later without changing the map shape.
+type TemplateVarRef struct {
+	IsOutput bool // referenced at an output site ({{ ... }})
+}
+
+// gonjaTemplateVariableNames returns the sorted names referenced by the template,
+// derived from gonjaTemplateVariableRefs.
+func gonjaTemplateVariableNames(text string) ([]string, error) {
+	refs, err := gonjaTemplateVariableRefs(text)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(refs))
+	for name := range refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// gonjaTemplateVariableRefs is a reporting-only preflight over gonja's lexer.
+// It returns the top-level context names referenced by the template that must be
+// SUPPLIED EXTERNALLY, each mapped to its TemplateVarRef. It does not affect
+// rendering.
 // gonja has no jinja2.meta.find_undeclared_variables equivalent, so the token
 // stream is scanned directly: names inside {{ ... }} / {% ... %} that are not
 // keywords, filter/test names, attribute lookups, or keyword-argument names.
@@ -167,7 +196,7 @@ func mergeSortedNames(undefined, nilVars []string) []string {
 // Note: gonja does NOT support Jinja's inline conditional expression
 // `{{ a if cond else b }}` at all — it is a hard COMPILE error, so such a
 // template fails to render entirely rather than mis-reporting a variable.
-func gonjaTemplateVariableNames(text string) ([]string, error) {
+func gonjaTemplateVariableRefs(text string) (map[string]TemplateVarRef, error) {
 	lexer := gonjatokens.NewLexer(text)
 	go lexer.Run()
 	tokens := make([]*gonjatokens.Token, 0)
@@ -176,8 +205,10 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 	}
 
 	variables := make(map[string]struct{})
-	locals := make(map[string]struct{}) // template-defined names (for/set targets)
+	outputVars := make(map[string]struct{}) // subset referenced inside {{ ... }}
+	locals := make(map[string]struct{})     // template-defined names (for/set targets)
 	inExpression := false
+	inOutputSite := false // true inside {{ ... }}, false inside {% ... %}
 	expectBlockName := false
 	inForTargets := false   // between `for` and `in`: names are loop locals
 	inSetTargets := false   // between `set` and `=`: names are assignment targets
@@ -190,6 +221,7 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 			return nil, errors.New(token.Val)
 		case gonjatokens.VariableBegin:
 			inExpression = true
+			inOutputSite = true
 			expectBlockName = false
 			inForTargets = false
 			inSetTargets = false
@@ -198,6 +230,7 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 			continue
 		case gonjatokens.BlockBegin:
 			inExpression = true
+			inOutputSite = false
 			expectBlockName = true
 			inForTargets = false
 			inSetTargets = false
@@ -302,19 +335,22 @@ func gonjaTemplateVariableNames(text string) ([]string, error) {
 			continue
 		}
 		variables[name] = struct{}{}
+		if inOutputSite {
+			outputVars[name] = struct{}{}
+		}
 		previous = token
 	}
 
-	names := make([]string, 0, len(variables))
+	refs := make(map[string]TemplateVarRef, len(variables))
 	for name := range variables {
 		// Body uses of a for/set target (`{{ item }}`, `{{ x }}`) are locals too.
 		if _, isLocal := locals[name]; isLocal {
 			continue
 		}
-		names = append(names, name)
+		_, isOutput := outputVars[name]
+		refs[name] = TemplateVarRef{IsOutput: isOutput}
 	}
-	sort.Strings(names)
-	return names, nil
+	return refs, nil
 }
 
 // isGonjaExpressionKeyword reports whether a bare name is a Jinja hard keyword

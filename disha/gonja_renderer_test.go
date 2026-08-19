@@ -241,6 +241,24 @@ func TestGonjaRenderUndefinedAndNil(t *testing.T) {
 			wantUndefined: []string{"zeta"},
 			wantNil:       []string{"alpha", "mid"},
 		},
+		{
+			// A nil used only inside a block ({% if x %}) is a legitimate input,
+			// not an unresolved output, so it is NOT reported.
+			name:          "nil used only in a block is not reported",
+			text:          "{% if b %}x{% endif %}",
+			variables:     map[string]any{"b": nil},
+			wantUndefined: nil,
+			wantNil:       nil,
+		},
+		{
+			// Same name nil at both an output site and a block: reported once,
+			// because it renders directly at {{ a }}.
+			name:          "nil at output site is reported even when also in a block",
+			text:          "{{ a }}{% if a %}x{% endif %}",
+			variables:     map[string]any{"a": nil},
+			wantUndefined: nil,
+			wantNil:       []string{"a"},
+		},
 	}
 
 	r := newTestGonjaRenderer()
