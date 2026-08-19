@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 	followUpPromptInvestorDemo       = "misc/investor_demo"
 	followUpDynamicMainPrompt        = "disha_init_calls/dynamic_checkin_call/main_sys"
 	followUpGetGuidancePrompt        = "disha_init_calls/dynamic_checkin_call/tools/get_guidance"
+	followUpGetGuidanceUserPrompt    = "disha_init_calls/dynamic_checkin_call/tools/get_guidance_user"
 	followUpPhonePromptOverridePhone = "+916261229421"
 )
 
@@ -462,12 +464,15 @@ func getFollowUpGuidance(ctx context.Context, taskCtx *voicepipelinecore.TaskCon
 	if err != nil {
 		return "", err
 	}
+	userPrompt, userVersion, err := deps.Documents.GetDocument(ctx, followUpGetGuidanceUserPrompt, 0, systemVariables)
+	if err != nil {
+		return "", err
+	}
 	metadata := buildPromptTraceMetadata("system", followUpGetGuidancePrompt, systemVersion, systemVariables)
-	metadata["user_prompt_name"] = "raw_situation"
-	metadata["user_prompt_variables"] = DocumentVariables{"situation": situation}
+	maps.Copy(metadata, buildPromptTraceMetadata("user", followUpGetGuidanceUserPrompt, userVersion, systemVariables))
 	req := voicepipelinecore.LLMRequest{Messages: []voicepipelinecore.Message{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: situation},
+		{Role: "user", Content: userPrompt},
 	}}
 	maxTokens := followUpGuidanceMaxTokens
 	client, err := llmrouter.New(llmrouter.Config{
