@@ -134,8 +134,7 @@ func TestSelectionSkipsBlacklisted(t *testing.T) {
 
 func TestSelectionGrokFallsBackToGeminiGroup(t *testing.T) {
 	fr := newFakeRedis()
-	// No grok-sales health at all; the gemini-3.1-lite fallback group has
-	// one healthy endpoint.
+	// No grok-sales health at all; gemini-3.1-lite group has one healthy endpoint.
 	fr.setHealth("google_ai_studio_gemini_flash_3_1_lite", false, 250)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupGrokSales, "us")
@@ -156,9 +155,6 @@ func TestSelectionFallbackKeyWhenNoHealth(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a last-resort selection")
 	}
-	// grok falls back one level to the gemini-3.1-lite group, which with no
-	// health returns its own hardcoded fallback config (fallback groups are
-	// not chained further to gpt-4.1 within a single selection).
 	if sel.ConfigKey != modelGroups[groupGemini31].Fallback {
 		t.Errorf("selected %q, want gemini-3.1-lite fallback %q", sel.ConfigKey, modelGroups[groupGemini31].Fallback)
 	}
