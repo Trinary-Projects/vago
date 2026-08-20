@@ -118,13 +118,6 @@ var endpointConfigs = map[string]endpointConfig{
 		APIKeyEnv: "GROK_4_1_FNR_WESTCENTRALUS_API_KEY", EndpointEnv: "GROK_4_1_FNR_WESTCENTRALUS_ENDPOINT",
 	},
 
-	// --- Vertex grok (OpenAI-compatible endpoint, OAuth Bearer token) ---
-	"vertex_dishaai_grok_4_1_fast_non_reasoning": {
-		Key: "vertex_dishaai_grok_4_1_fast_non_reasoning", Provider: providerVertex,
-		Model: "xai/grok-4.1-fast-non-reasoning", Region: "us",
-		VertexProject: "gen-lang-client-0439239631", VertexLocation: "global",
-	},
-
 	// --- gpt-4.1 fallback group (Azure + OpenAI) ---
 	"azure_gpt_4_1_us_east": {
 		Key: "azure_gpt_4_1_us_east", Provider: providerAzure, Model: gpt41Model, Region: "us",
@@ -331,9 +324,9 @@ var hedgedPairs = map[string]hedgedPair{
 }
 
 // modelGroups is the Go port of MODEL_GROUPS for the Disha call bots.
-// The Vertex grok config is a first-class member of the sales group, so
-// it participates in normal health-based selection (mirrors Python,
-// where it is the most stable endpoint).
+// The grok groups fall back within their Azure-hosted regions and then to
+// the gemini-flash-3.1-lite group (which itself falls back to gpt-4.1);
+// the Vertex grok endpoint was removed as it is being retired from Vertex.
 var modelGroups = map[string]modelGroup{
 	// Identical membership to grok-4.1-fast-sales in Python's
 	// MODEL_GROUPS — both exist as separate keys so their health polls
@@ -345,10 +338,9 @@ var modelGroups = map[string]modelGroup{
 			"grok_4_1_fnr_westus",
 			"grok_4_1_fnr_westus2",
 			"grok_4_1_fnr_westcentralus",
-			"vertex_dishaai_grok_4_1_fast_non_reasoning",
 		},
-		Fallback:      "vertex_dishaai_grok_4_1_fast_non_reasoning",
-		FallbackGroup: groupGPT41,
+		Fallback:      "grok_4_1_fnr_westcentralus",
+		FallbackGroup: groupGemini31,
 	},
 	groupGrokSales: {
 		Configs: []string{
@@ -357,10 +349,9 @@ var modelGroups = map[string]modelGroup{
 			"grok_4_1_fnr_westus",
 			"grok_4_1_fnr_westus2",
 			"grok_4_1_fnr_westcentralus",
-			"vertex_dishaai_grok_4_1_fast_non_reasoning",
 		},
-		Fallback:      "vertex_dishaai_grok_4_1_fast_non_reasoning",
-		FallbackGroup: groupGPT41,
+		Fallback:      "grok_4_1_fnr_westcentralus",
+		FallbackGroup: groupGemini31,
 	},
 	groupGPT41: {
 		Configs: []string{

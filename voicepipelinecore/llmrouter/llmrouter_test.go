@@ -104,7 +104,7 @@ func TestSelectionPicksFastest(t *testing.T) {
 	fr := newFakeRedis()
 	fr.setHealth("grok_4_1_fnr_eastus", false, 500)
 	fr.setHealth("grok_4_1_fnr_westus", false, 300)
-	fr.setHealth("vertex_dishaai_grok_4_1_fast_non_reasoning", false, 400)
+	fr.setHealth("grok_4_1_fnr_westcentralus", false, 400)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupGrokSales, "us")
 	if !ok {
@@ -121,31 +121,31 @@ func TestSelectionPicksFastest(t *testing.T) {
 func TestSelectionSkipsBlacklisted(t *testing.T) {
 	fr := newFakeRedis()
 	fr.setHealth("grok_4_1_fnr_westus", true, 100) // fastest but blacklisted
-	fr.setHealth("vertex_dishaai_grok_4_1_fast_non_reasoning", false, 400)
+	fr.setHealth("grok_4_1_fnr_westcentralus", false, 400)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupGrokSales, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if sel.ConfigKey != "vertex_dishaai_grok_4_1_fast_non_reasoning" {
-		t.Errorf("selected %q, want the vertex config (blacklisted faster one skipped)", sel.ConfigKey)
+	if sel.ConfigKey != "grok_4_1_fnr_westcentralus" {
+		t.Errorf("selected %q, want grok_4_1_fnr_westcentralus (blacklisted faster one skipped)", sel.ConfigKey)
 	}
 }
 
-func TestSelectionFallsBackToGPT41Group(t *testing.T) {
+func TestSelectionGrokFallsBackToGeminiGroup(t *testing.T) {
 	fr := newFakeRedis()
-	// No grok-sales health at all; gpt-4.1 group has one healthy endpoint.
-	fr.setHealth("azure_gpt_4_1_us_west", false, 250)
+	// No grok-sales health at all; gemini-3.1-lite group has one healthy endpoint.
+	fr.setHealth("google_ai_studio_gemini_flash_3_1_lite", false, 250)
 
 	sel, ok := getFastestForGroup(ctx(), fr, groupGrokSales, "us")
 	if !ok {
 		t.Fatal("expected a selection")
 	}
-	if !sel.UsingFallback || sel.SelectedGroup != groupGPT41 {
-		t.Errorf("expected fallback to gpt-4.1 group, got %+v", sel)
+	if !sel.UsingFallback || sel.SelectedGroup != groupGemini31 {
+		t.Errorf("expected fallback to gemini-3.1-lite group, got %+v", sel)
 	}
-	if sel.ConfigKey != "azure_gpt_4_1_us_west" {
-		t.Errorf("selected %q, want azure_gpt_4_1_us_west", sel.ConfigKey)
+	if sel.ConfigKey != "google_ai_studio_gemini_flash_3_1_lite" {
+		t.Errorf("selected %q, want google_ai_studio_gemini_flash_3_1_lite", sel.ConfigKey)
 	}
 }
 
@@ -155,8 +155,8 @@ func TestSelectionFallbackKeyWhenNoHealth(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a last-resort selection")
 	}
-	if sel.ConfigKey != modelGroups[groupGPT41].Fallback {
-		t.Errorf("selected %q, want gpt-4.1 fallback %q", sel.ConfigKey, modelGroups[groupGPT41].Fallback)
+	if sel.ConfigKey != modelGroups[groupGemini31].Fallback {
+		t.Errorf("selected %q, want gemini-3.1-lite fallback %q", sel.ConfigKey, modelGroups[groupGemini31].Fallback)
 	}
 	if !sel.UsingFallback {
 		t.Error("expected using_fallback for last-resort")
@@ -426,12 +426,9 @@ func TestBuildRequestGrok(t *testing.T) {
 }
 
 func TestExtraBodyFor(t *testing.T) {
-	// Azure-hosted grok + vertex grok (the sales group) carry nothing.
+	// Azure-hosted grok (the sales group) carries nothing.
 	if eb := extraBodyFor(endpointConfigs["grok_4_1_fnr_eastus"]); eb != nil {
 		t.Errorf("azure grok extra body = %v, want nil", eb)
-	}
-	if eb := extraBodyFor(endpointConfigs["vertex_dishaai_grok_4_1_fast_non_reasoning"]); eb != nil {
-		t.Errorf("vertex grok extra body = %v, want nil", eb)
 	}
 	// gpt-4.1 (azure/openai) carry nothing.
 	if eb := extraBodyFor(endpointConfigs["openai_gpt_4_1"]); eb != nil {
