@@ -173,7 +173,7 @@ func TestDocumentStoreReportsMissingDocumentToSentry(t *testing.T) {
 	if event.Tags["component"] != "disha_document_store" {
 		t.Fatalf("component tag = %q", event.Tags["component"])
 	}
-	if event.Tags["operation"] != "fetch_missing" {
+	if event.Tags["operation"] != "fetch_document" {
 		t.Fatalf("operation tag = %q", event.Tags["operation"])
 	}
 	if event.Tags["document_name"] != "missing/prompt" {

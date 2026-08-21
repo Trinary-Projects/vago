@@ -182,10 +182,12 @@ func cloneDocumentConfig(in map[string]any) map[string]any {
 }
 
 // reportDocumentFetchFailure sends one Sentry event when a document cannot
-// be loaded from Redis. Callers still receive the original error so the
-// call can fail open. Context cancellation is a shutdown signal, not a
-// missing document, so it is not reported.
-func reportDocumentFetchFailure(name string, version int, env, redisKey, operation string, err error) {
+// be loaded from Redis. resolve is the single caller, so it reports once for
+// any fetch failure (redis GET error, missing key, or malformed payload).
+// Callers still receive the original error so the call can fail open. Context
+// cancellation is a shutdown signal, not a missing document, so it is not
+// reported.
+func reportDocumentFetchFailure(name string, version int, env, redisKey string, err error) {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return
 	}
@@ -193,7 +195,7 @@ func reportDocumentFetchFailure(name string, version int, env, redisKey, operati
 		Err: err,
 		Tags: map[string]string{
 			"component":        "disha_document_store",
-			"operation":        operation,
+			"operation":        "fetch_document",
 			"document_name":    name,
 			"document_version": fmt.Sprintf("%d", version),
 			"document_env":     env,
@@ -257,6 +259,7 @@ func (s *DocumentStore) resolve(ctx context.Context, name string, version int) (
 	}
 	doc, err := s.fetchFromRedis(ctx, name, version)
 	if err != nil {
+		reportDocumentFetchFailure(name, version, s.env, s.redisKey(name, version), err)
 		return DocumentVersion{}, err
 	}
 	s.storeCache(cacheKey, doc)
@@ -267,20 +270,14 @@ func (s *DocumentStore) fetchFromRedis(ctx context.Context, name string, version
 	key := s.redisKey(name, version)
 	raw, ok, err := s.redis.GetCache(ctx, key)
 	if err != nil {
-		wrapped := fmt.Errorf("disha: document %q redis GET failed: %w", name, err)
-		reportDocumentFetchFailure(name, version, s.env, key, "fetch_redis", wrapped)
-		return DocumentVersion{}, wrapped
+		return DocumentVersion{}, fmt.Errorf("disha: document %q redis GET failed: %w", name, err)
 	}
 	if !ok {
-		wrapped := fmt.Errorf("disha: document %q (version=%d) not in redis key %s", name, version, key)
-		reportDocumentFetchFailure(name, version, s.env, key, "fetch_missing", wrapped)
-		return DocumentVersion{}, wrapped
+		return DocumentVersion{}, fmt.Errorf("disha: document %q (version=%d) not in redis key %s", name, version, key)
 	}
 	var doc DocumentVersion
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		wrapped := fmt.Errorf("disha: document %q payload malformed: %w", name, err)
-		reportDocumentFetchFailure(name, version, s.env, key, "fetch_decode", wrapped)
-		return DocumentVersion{}, wrapped
+		return DocumentVersion{}, fmt.Errorf("disha: document %q payload malformed: %w", name, err)
 	}
 	if s.logger != nil {
 		s.logger.Printf("disha: document loaded name=%s version=%d key=%s\n", name, doc.Version, key)
