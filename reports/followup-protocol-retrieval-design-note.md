@@ -12,9 +12,10 @@ outside vago (§13).
 
 ## 1. What we're adding
 
-Before every LLM generation on a **follow-up call**, send the trailing
-`Disha: … / User: …` exchange to `weaviate-us` as raw text, get back matching
-protocols, and keep a small rolling set of them in the LLM's message array.
+Before every LLM generation on a **follow-up call**, send the latest user turn
+to `weaviate-us` as raw text when it contains at least four words, get back
+matching protocols, and keep a small rolling set of them in the LLM's message
+array. The preceding Disha turn is deliberately excluded from protocol ranking.
 Per-turn retrieval telemetry rides along with the assistant conversation chunk,
 and the injected protocol text is echoed into the LLM log's variable section.
 
@@ -128,8 +129,10 @@ sentence-transformers/msmarco-bert-base-dot-v5` into the moduleConfig next to
 `endpointURL`; that field is inert when `endpointURL` is set — msmarco is 768-dim,
 so the observed 1024 dims prove TEI served it.)
 
-`--probe`, six `Disha: …\nUser: …` queries in the §5.1 shape, deduped by
-instruction id:
+The original 2026-07-29 `--probe` run used six `Disha: …\nUser: …` queries,
+deduped by instruction id. Those scores are retained as historical calibration;
+TEC-5144 changed the live query to the user-only shape in §5.1, and the current
+probe harness now matches that shape:
 
 | Query (user line) | Top protocol | Correct? | Top sim |
 |---|---|---|---|
@@ -275,35 +278,18 @@ Runs inside `enrich`, once per LLM call.
 
 ### 5.1 Build the query text
 
-Walk `req.Messages` from the tail:
+Walk `req.Messages` from the tail and join consecutive `role=="user"` messages
+with a space into one latest user turn. (`recordUserMessage` already concatenates
+adjacent user turns, but replayed history and injected nudges can produce more
+than one.) Out-of-band user-role messages—resume nudges, onboarding instructions,
+and an injected protocol block—are excluded from the turn.
 
-1. **Trailing user block** — consecutive `role=="user"` messages joined with a
-   space into one user turn. (`recordUserMessage` already concatenates adjacent
-   user turns, but replayed history and injected nudges can produce more than one.)
-2. **Preceding Disha block** — keep walking back, *skipping*:
-   - `role=="tool"` messages,
-   - `role=="assistant"` messages with `len(ToolCalls) > 0` or blank `Content` —
-     the Go representation of the testbench's `[Tool call]` prefix,
-   - `role=="assistant"` messages of **≤ 6 words** ("हम्म", "ok ok") — merged
-     through, not treated as the Disha block.
-
-   The first surviving assistant message is the Disha block.
-3. Render exactly:
-
-   ```
-   Disha: <disha's turn>
-   User: <user's latest turn>
-   ```
-
-   No Disha block (fresh call) → the `User:` line alone. **No trailing user block
-   at all** (greet-first, or an injected nudge that didn't come from the user) →
-   skip the round entirely and inject only.
-
-Skipping is Disha-side only. Short user backchannels are *not* skipped; every user
-turn triggers a fresh retrieval.
-
-Any protocol block already present in `req.Messages` from a previous call is
-excluded from this walk, so it can never become the Disha block.
+After trimming, return the user text verbatim when `strings.Fields` finds at
+least **4 words**. Fewer than four words skips the vector query and live-query
+anchor seeding, but still ages and re-injects the resident protocol set because
+its TTL counts user turns. No trailing user turn, or only an out-of-band user
+message, skips without ageing. The preceding assistant turn, tool calls, and
+tool results never enter the protocol query.
 
 ### 5.2 Retrieve-vs-inject gate
 
@@ -419,7 +405,7 @@ only.
 
 ```graphql
 { Get { ProtocolAnchor(
-    nearText: { concepts: ["Disha: …\nUser: …"] }
+    nearText: { concepts: ["<latest user turn>"] }
     where: { path: ["answeredBy","ProtocolInstruction","isStaging"],
              operator: Equal, valueBoolean: true }
     limit: 10
@@ -596,7 +582,7 @@ durable copy — and it is the calibration dataset of §3:
 ```json
 { "chunk_id": "...", "conversation_id": "...", "user_id": "...",
   "bot_type": "follow_up", "call_flow_key": "...", "retrieved_at": "...",
-  "query_text": "Disha: ...\nUser: ...",
+  "query_text": "<latest user turn>",
   "threshold": {"metric": "cosine_similarity", "value": 0.8},
   "latency_ms": {"vector_query": 0, "total": 0},
   "candidate_protocols": [{"instruction_id":"...","anchor_id":"...","anchor_text":"...",
@@ -794,8 +780,8 @@ the API key from the k8s Secret via `kubectl` and never prints it. Modes:
   exercise the design: several anchors per instruction (the dedupe-by-instruction
   path), `turnsThresholdCount` of 2/4/5, one instruction with it **omitted** (the
   default-3 fallback), and Hinglish anchors. Raw text only — no `Document: ` prefix.
-- `--probe` — runs `nearText` for six `Disha: …\nUser: …` queries in exactly the
-  shape §5.1 produces, dedupes by instruction id the same way vago will, and prints
+- `--probe` — runs `nearText` for six user-only queries of at least four words in
+  exactly the shape §5.1 produces, dedupes by instruction id the same way vago will, and prints
   the per-query similarity table plus min/median/max of the top hit and how many
   queries would qualify at the threshold. This is the calibration harness.
 
@@ -828,11 +814,11 @@ Neither affects staging work; both must be resolved before prod exposure.
 
 `disha/protocol_retrieval_test.go`
 
-- Query builder: multi-message user block merged; tool-call assistant messages
-  skipped; `role=="tool"` skipped; ≤6-word assistant stub merged through to the
-  real Disha turn; exactly-7-word stub *is* the Disha turn (boundary); no Disha
-  block → `User:`-only; no user block → round skipped; a previously injected
-  protocol block is never mistaken for the Disha block.
+- Query builder: only the latest user turn is returned; multi-message user block
+  merged before the word gate; exactly four words is eligible; three words is
+  skipped; assistant/tool context never enters the query; no user block → round
+  skipped; out-of-band user messages and previously injected protocol blocks are
+  never mistaken for user speech.
 - Threshold: hit at exactly the cutoff qualifies; just under does not (table-driven
   on the constant, not a hardcoded 0.70, so re-tuning doesn't churn the test).
 - Dedupe: two anchors → one instruction occupies one slot, best score kept.
@@ -909,6 +895,9 @@ Neither affects staging work; both must be resolved before prod exposure.
 ---
 
 ## 15. Live verification (2026-07-29)
+
+This verification predates TEC-5144 and used the retired combined
+`Disha: … / User: …` query shape; §5.1 is the current behavior.
 
 Run through a temporary test against the real staging Weaviate + TEI (deleted
 after use), driving the actual `queryProtocols` → dedupe → threshold →

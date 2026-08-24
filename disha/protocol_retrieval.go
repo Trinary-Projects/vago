@@ -21,12 +21,12 @@ import (
 // Blocking protocol retrieval for follow-up calls (both the dynamic check-in
 // path and the agenda-based path).
 //
-// Before every LLM generation the trailing "Disha: … / User: …" exchange is
-// sent to the US Weaviate instance as RAW text (the ProtocolAnchor collection
-// vectorizes server-side through the in-cluster TEI, which applies the model's
-// "Document: " prefix itself — prefixing here would double-prefix and silently
-// degrade ranking). Matching protocols are held in a small rolling set and
-// re-injected into the message array on every turn.
+// Before every LLM generation the latest user turn is sent to the US Weaviate
+// instance as RAW text when it contains at least four words (the ProtocolAnchor
+// collection vectorizes server-side through the in-cluster TEI, which applies
+// the model's "Document: " prefix itself — prefixing here would double-prefix
+// and silently degrade ranking). Matching protocols are held in a small rolling
+// set and re-injected into the message array on every turn.
 //
 // Design note: reports/followup-protocol-retrieval-design-note.md
 
@@ -102,10 +102,9 @@ const (
 	// candidates are kept for threshold calibration.
 	protocolQueryLimit = 10
 
-	// protocolShortAssistantWords is the "short stub" cut-off. An assistant
-	// turn of this many words or fewer ("हम्म", "ok ok") is merged through
-	// when looking for the Disha block rather than becoming it.
-	protocolShortAssistantWords = 6
+	// protocolMinimumUserWords avoids ranking protocols from short replies whose
+	// meaning depends heavily on the preceding assistant turn.
+	protocolMinimumUserWords = 4
 
 	protocolRetrievalEnabledEnv = "FOLLOWUP_PROTOCOL_RETRIEVAL_ENABLED"
 
@@ -421,13 +420,19 @@ func (s *ProtocolStore) snapshot() []residentProtocol {
 
 // --------------------------------------------------- query text construction
 
-// buildProtocolQueryText renders the retrieval query from the conversation
-// snapshot: the trailing user block plus the preceding Disha block.
+// buildProtocolQueryText renders the retrieval query from the latest user turn.
+// A turn may contain consecutive user messages, so the trailing user block is
+// joined before applying the word-count gate.
 //
 // Returns "" when there is no trailing user turn (greet-first, or an injected
-// nudge that didn't come from the user) — the caller then skips retrieval and
-// only re-injects the resident set.
+// nudge that didn't come from the user), or when it contains fewer than four
+// words. The caller then skips retrieval; a real short turn still ages the
+// resident set, while a missing turn does not.
 func buildProtocolQueryText(messages []voicepipelinecore.Message) string {
+	return protocolQueryText(latestProtocolUserTurn(messages))
+}
+
+func latestProtocolUserTurn(messages []voicepipelinecore.Message) string {
 	index := len(messages) - 1
 
 	// Trailing user block: consecutive user messages merged into one turn.
@@ -447,39 +452,14 @@ func buildProtocolQueryText(messages []voicepipelinecore.Message) string {
 			userParts = append([]string{text}, userParts...)
 		}
 	}
-	userText := strings.TrimSpace(strings.Join(userParts, " "))
-	if userText == "" {
+	return strings.TrimSpace(strings.Join(userParts, " "))
+}
+
+func protocolQueryText(userText string) string {
+	if len(strings.Fields(userText)) < protocolMinimumUserWords {
 		return ""
 	}
-
-	// Preceding Disha block, skipping tool turns and short stubs.
-	dishaText := ""
-	for ; index >= 0; index-- {
-		message := messages[index]
-		if message.Role != "assistant" {
-			// Tool results (and anything else) never end the search.
-			continue
-		}
-		// A tool-call turn carries no spoken text.
-		if len(message.ToolCalls) > 0 {
-			continue
-		}
-		text := strings.TrimSpace(message.Content)
-		if text == "" {
-			continue
-		}
-		// Short acknowledgements are merged through, not treated as the block.
-		if len(strings.Fields(text)) <= protocolShortAssistantWords {
-			continue
-		}
-		dishaText = text
-		break
-	}
-
-	if dishaText == "" {
-		return "User: " + userText
-	}
-	return "Disha: " + dishaText + "\nUser: " + userText
+	return userText
 }
 
 // ------------------------------------------------------- weaviate decoding
@@ -831,12 +811,19 @@ func (e *protocolEnricher) Enrich(ctx context.Context, messages []voicepipelinec
 	startedAt := time.Now()
 	messages = stripProtocolBlock(messages)
 
-	query := buildProtocolQueryText(messages)
+	userTurn := latestProtocolUserTurn(messages)
+	query := protocolQueryText(userTurn)
+	assistantHasSpoken := hasAssistantTurn(messages)
 	retrieved := false
 	record := protocolRetrievalRecord{Status: "skipped"}
-	if query != "" && hasAssistantTurn(messages) && e.shouldRetrieve(query) {
+	if query != "" && assistantHasSpoken && e.shouldRetrieve(query) {
 		retrieved = true
 		record = e.retrieve(ctx, query)
+	} else if query == "" && userTurn != "" && assistantHasSpoken {
+		// The short utterance still consumed a conversation turn even though it
+		// was not reliable enough to rank protocols. Keep TTLs measured in user
+		// turns by ageing the resident set without issuing a vector query.
+		e.logEvents(e.store.apply(nil))
 	}
 
 	injected := e.store.snapshot()
@@ -865,11 +852,10 @@ func (e *protocolEnricher) Enrich(ctx context.Context, messages []voicepipelinec
 // re-run re-injects without re-querying and without ageing the resident set:
 // residency is measured in user turns, not LLM calls.
 //
-// Known limitation, accepted deliberately: two genuinely different turns can
-// render an identical query once short assistant stubs are skipped ("haan" /
-// bot "hmm" / "haan"), and that collision suppresses the second turn's
-// retrieval and ageing. A monotonic turn id from upstream would be exact, but
-// this is simpler and the collision is rare.
+// Known limitation, accepted deliberately: two genuinely different turns with
+// identical user text produce the same query, and that collision suppresses the
+// second turn's retrieval and ageing. A monotonic turn id from upstream would
+// be exact, but this is simpler and the collision is rare.
 func (e *protocolEnricher) shouldRetrieve(query string) bool {
 	hash := protocolQueryHash(query)
 	e.mu.Lock()

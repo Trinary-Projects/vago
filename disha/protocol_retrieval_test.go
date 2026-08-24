@@ -45,55 +45,50 @@ func TestBuildProtocolQueryText(t *testing.T) {
 		want     string
 	}{
 		{
-			name:     "simple pair",
-			messages: []voicepipelinecore.Message{msg("system", "sys"), msg("assistant", longDisha), msg("user", "acidity hai")},
-			want:     "Disha: " + longDisha + "\nUser: acidity hai",
+			name:     "only the latest user turn is queried",
+			messages: []voicepipelinecore.Message{msg("system", "sys"), msg("assistant", longDisha), msg("user", "mujhe bahut acidity ho rahi")},
+			want:     "mujhe bahut acidity ho rahi",
 		},
 		{
-			name: "multiple trailing user messages merge into one turn",
+			name:     "exactly four words is eligible",
+			messages: []voicepipelinecore.Message{msg("assistant", longDisha), msg("user", "acidity bahut zyada hai")},
+			want:     "acidity bahut zyada hai",
+		},
+		{
+			name:     "three words skips the round",
+			messages: []voicepipelinecore.Message{msg("assistant", longDisha), msg("user", "acidity zyada hai")},
+			want:     "",
+		},
+		{
+			name: "multiple trailing user messages merge before the word gate",
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
-				msg("user", "haan"), msg("user", "acidity hai"),
+				msg("user", "haan"), msg("user", "acidity zyada ho rahi"),
 			},
-			want: "Disha: " + longDisha + "\nUser: haan acidity hai",
+			want: "haan acidity zyada ho rahi",
 		},
 		{
-			name: "tool-call turn and tool result are skipped",
+			name: "assistant and tool context never enters the query",
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
 				toolCallMsg(), {Role: "tool", Content: "guidance", ToolCallID: "call-1"},
-				msg("user", "acidity hai"),
+				msg("user", "aaj workout mein kya karna hai"),
 			},
-			want: "Disha: " + longDisha + "\nUser: acidity hai",
+			want: "aaj workout mein kya karna hai",
 		},
 		{
-			name: "short assistant stub is merged through",
+			name: "only the newest user turn is used",
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
-				msg("user", "haan"), msg("assistant", "हम्म"), msg("user", "acidity hai"),
+				msg("user", "mera pehle wala user turn"), msg("assistant", "हम्म"),
+				msg("user", "ab workout plan bhej do"),
 			},
-			want: "Disha: " + longDisha + "\nUser: acidity hai",
+			want: "ab workout plan bhej do",
 		},
 		{
-			name: "exactly six words is still a stub",
-			messages: []voicepipelinecore.Message{
-				msg("system", "sys"), msg("assistant", longDisha),
-				msg("assistant", "one two three four five six"), msg("user", "acidity hai"),
-			},
-			want: "Disha: " + longDisha + "\nUser: acidity hai",
-		},
-		{
-			name: "seven words is the Disha block",
-			messages: []voicepipelinecore.Message{
-				msg("system", "sys"), msg("assistant", longDisha),
-				msg("assistant", "one two three four five six seven"), msg("user", "acidity hai"),
-			},
-			want: "Disha: one two three four five six seven\nUser: acidity hai",
-		},
-		{
-			name:     "no Disha block yields the user line alone",
-			messages: []voicepipelinecore.Message{msg("system", "sys"), msg("user", "hello?")},
-			want:     "User: hello?",
+			name:     "query builder does not require an assistant turn",
+			messages: []voicepipelinecore.Message{msg("system", "sys"), msg("user", "mujhe workout plan bhej do")},
+			want:     "mujhe workout plan bhej do",
 		},
 		{
 			name:     "no trailing user turn skips the round",
@@ -118,16 +113,16 @@ func TestBuildProtocolQueryText(t *testing.T) {
 					"Now you have to resume this conversation by saying hi and acknowledge the things "+
 					"that have been discussed very briefly and inform the next agenda.</system_message>"),
 			},
-			want: "Disha: " + longDisha + "\nUser: हाँ, हाँ, हाँ, समझ गया मैं।",
+			want: "हाँ, हाँ, हाँ, समझ गया मैं।",
 		},
 		{
 			name: "onboarding-style wrapper is skipped too",
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
-				msg("user", "real speech"),
+				msg("user", "real speech with context"),
 				msg("user", "<system_instruction>do something</system_instruction>"),
 			},
-			want: "Disha: " + longDisha + "\nUser: real speech",
+			want: "real speech with context",
 		},
 		{
 			name: "a resume nudge with no real user turn behind it skips the round",
@@ -142,9 +137,9 @@ func TestBuildProtocolQueryText(t *testing.T) {
 			messages: []voicepipelinecore.Message{
 				msg("system", "sys"), msg("assistant", longDisha),
 				msg("user", renderProtocolBlock([]residentProtocol{{Text: "some protocol body"}})),
-				msg("user", "acidity hai"),
+				msg("user", "mujhe bahut acidity ho rahi"),
 			},
-			want: "Disha: " + longDisha + "\nUser: acidity hai",
+			want: "mujhe bahut acidity ho rahi",
 		},
 	}
 
@@ -588,13 +583,13 @@ func TestQueryProtocolsUsesEnvironmentFlag(t *testing.T) {
 func TestQueryProtocolsSendsRawText(t *testing.T) {
 	var query string
 	client := newStubWeaviate(t, fmt.Sprintf(anchorResponseTemplate, ""), &query)
-	if _, err := queryProtocols(context.Background(), client, "Disha: a\nUser: b"); err != nil {
+	if _, err := queryProtocols(context.Background(), client, "mujhe workout plan bhej do"); err != nil {
 		t.Fatalf("queryProtocols: %v", err)
 	}
 	if strings.Contains(query, "Document: ") {
 		t.Fatalf("query text must not be prefixed:\n%s", query)
 	}
-	if !strings.Contains(query, `concepts: ["Disha: a\nUser: b"]`) {
+	if !strings.Contains(query, `concepts: ["mujhe workout plan bhej do"]`) {
 		t.Fatalf("raw query text not sent:\n%s", query)
 	}
 }
@@ -684,7 +679,7 @@ func TestEnricherInjectsAndRecords(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A body", 0.1, 3))
 	enricher, box, setter := newTestEnricher(t, newStubWeaviate(t, body, nil))
 
-	out := enricher.Enrich(context.Background(), conversation("acidity hai"))
+	out := enricher.Enrich(context.Background(), conversation("mujhe bahut acidity ho rahi"))
 
 	if len(out) != 4 {
 		t.Fatalf("expected one injected message, got %d: %+v", len(out), out)
@@ -711,6 +706,9 @@ func TestEnricherInjectsAndRecords(t *testing.T) {
 	}
 	if record.Status != "ok" || len(record.Injected) != 1 || record.TopSimilarity == nil {
 		t.Fatalf("unexpected record: %+v", record)
+	}
+	if record.QueryText != "mujhe bahut acidity ho rahi" {
+		t.Errorf("query text = %q, want only the latest user turn", record.QueryText)
 	}
 
 	metadata, calls := setter.snapshot()
@@ -743,7 +741,7 @@ func TestEnricherRendersInstructionVariables(t *testing.T) {
 	renderer := enricher.renderer.(*stubRenderer)
 	enricher.baseVariables = DocumentVariables{"diet_plan_today": "dal chawal at 1pm"}
 
-	out := enricher.Enrich(context.Background(), conversation("khaana kab khaun"))
+	out := enricher.Enrich(context.Background(), conversation("main khaana kab khaun"))
 
 	block := findProtocolBlock(t, out)
 	if !strings.Contains(block, "Today's plan: dal chawal at 1pm") {
@@ -863,7 +861,7 @@ func TestEnricherDoesNotReRenderResidentProtocol(t *testing.T) {
 
 	// Three rounds, same protocol qualifying every time. Distinct query text per
 	// round so the hash gate does not suppress the later retrievals.
-	for _, speech := range []string{"khaana kab", "aur uske baad kya", "theek hai samajh gaya"} {
+	for _, speech := range []string{"main khaana kab khaun", "aur uske baad kya", "theek hai samajh gaya"} {
 		out := enricher.Enrich(context.Background(), conversation(speech))
 		if block := findProtocolBlock(t, out); !strings.Contains(block, "Plan: dal chawal") {
 			t.Fatalf("resident text lost after refresh:\n%s", block)
@@ -909,7 +907,7 @@ func TestEnricherRenderSharesRetrievalBudget(t *testing.T) {
 	enricher.renderer.(*stubRenderer).block = true
 
 	startedAt := time.Now()
-	enricher.Enrich(context.Background(), conversation("khaana kab khaun"))
+	enricher.Enrich(context.Background(), conversation("main khaana kab khaun"))
 	elapsed := time.Since(startedAt)
 
 	// Three hanging renders under one shared budget: comfortably under two
@@ -961,6 +959,38 @@ func TestEnricherSkipsGreetTurn(t *testing.T) {
 	}
 }
 
+// Short user turns are too dependent on the preceding assistant question to
+// rank protocols reliably. They skip the query but still age and re-inject the
+// resident set because TTLs are measured in user turns.
+func TestEnricherSkipsShortUserTurn(t *testing.T) {
+	var queries atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries.Add(1)
+		_, _ = w.Write([]byte(fmt.Sprintf(anchorResponseTemplate, "")))
+	}))
+	t.Cleanup(server.Close)
+	client, _ := weaviate.New(weaviate.Config{BaseURL: server.URL, APIKey: "k"})
+	enricher, box, _ := newTestEnricher(t, client)
+	enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 3)})
+	before := enricher.store.snapshot()[0].RemainingTurns
+
+	messages := conversation("acidity zyada hai")
+	out := enricher.Enrich(context.Background(), messages)
+
+	if got := queries.Load(); got != 0 {
+		t.Errorf("short user turn issued %d retrieval queries, want 0", got)
+	}
+	if len(out) != len(messages)+1 {
+		t.Fatalf("resident protocol was not re-injected: %+v", out)
+	}
+	if after := enricher.store.snapshot()[0].RemainingTurns; after != before-1 {
+		t.Errorf("short skipped turn did not age resident protocol: %d -> %d", before, after)
+	}
+	if box.take() != nil {
+		t.Error("short skipped turn must not claim an assistant chunk")
+	}
+}
+
 // A tool-result re-run reaches Enrich a second time in the same turn. It must
 // re-inject without re-querying, and must not overwrite the round that did run.
 func TestEnricherToolReRunInjectsWithoutRetrieving(t *testing.T) {
@@ -974,7 +1004,7 @@ func TestEnricherToolReRunInjectsWithoutRetrieving(t *testing.T) {
 	client, _ := weaviate.New(weaviate.Config{BaseURL: server.URL, APIKey: "k"})
 	enricher, box, _ := newTestEnricher(t, client)
 
-	messages := conversation("acidity hai")
+	messages := conversation("mujhe bahut acidity ho rahi")
 	enricher.Enrich(context.Background(), messages)
 
 	// Same user turn, now with a tool pair appended (the get_guidance re-run).
@@ -1009,7 +1039,7 @@ func TestEnricherReRunDoesNotAgeResidentSet(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A", 0.1, 3))
 	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
 
-	messages := conversation("acidity hai")
+	messages := conversation("mujhe bahut acidity ho rahi")
 	enricher.Enrich(context.Background(), messages)
 	before := enricher.store.snapshot()[0].RemainingTurns
 
@@ -1061,7 +1091,7 @@ func TestEnricherFailsOpen(t *testing.T) {
 			// Seed a resident protocol so we can prove it survives the failure.
 			enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 5)})
 
-			messages := conversation("acidity hai")
+			messages := conversation("mujhe bahut acidity ho rahi")
 			out := enricher.Enrich(context.Background(), messages)
 
 			if len(out) != len(messages)+1 {
@@ -1089,7 +1119,7 @@ func TestEnricherNoQualifyingHitsInjectsNothing(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A", belowGate, 3))
 	enricher, box, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
 
-	messages := conversation("theek tha didi")
+	messages := conversation("theek tha didi bas")
 	out := enricher.Enrich(context.Background(), messages)
 
 	if len(out) != len(messages) {
@@ -1112,7 +1142,7 @@ func TestEnricherInjectsExactlyOneBlockAcrossTurns(t *testing.T) {
 	body := fmt.Sprintf(anchorResponseTemplate, anchorHit("a1", "instr-A", "protocol A body", 0.1, 9))
 	enricher, _, _ := newTestEnricher(t, newStubWeaviate(t, body, nil))
 
-	messages := conversation("turn one")
+	messages := conversation("this is user turn one")
 	for turn := 0; turn < 3; turn++ {
 		out := enricher.Enrich(context.Background(), messages)
 		blocks := 0
@@ -1356,14 +1386,14 @@ func TestEnricherFailedRetrievalStillAgesTheStore(t *testing.T) {
 			enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 3)})
 			before := enricher.store.snapshot()[0].RemainingTurns
 
-			out := enricher.Enrich(context.Background(), conversation("first user turn"))
+			out := enricher.Enrich(context.Background(), conversation("this is first user turn"))
 			after := enricher.store.snapshot()[0].RemainingTurns
 
 			if after != before-1 {
 				t.Errorf("remaining turns %d -> %d, want the failed turn to still age it", before, after)
 			}
 			// Fail open: the protocol is kept and still injected.
-			if len(out) != len(conversation("first user turn"))+1 {
+			if len(out) != len(conversation("this is first user turn"))+1 {
 				t.Errorf("resident protocol should still be injected on failure")
 			}
 		})
@@ -1382,7 +1412,7 @@ func TestEnricherRepeatedFailuresEventuallyExpire(t *testing.T) {
 	enricher.store.apply([]protocolCandidate{candidate("kept", 0.9, 3)})
 	for turn := 1; turn <= 3; turn++ {
 		// Distinct text per turn so the re-run gate treats each as a new turn.
-		enricher.Enrich(context.Background(), conversation(fmt.Sprintf("user turn %d", turn)))
+		enricher.Enrich(context.Background(), conversation(fmt.Sprintf("this is user turn %d", turn)))
 	}
 	if got := len(enricher.store.snapshot()); got != 0 {
 		t.Errorf("resident = %d after three failed turns, want it expired", got)
