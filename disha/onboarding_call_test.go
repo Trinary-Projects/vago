@@ -286,7 +286,7 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 	// Committed turns must persist current_agenda from the live stage.
 	events := pl.Callbacks.Events()
 	turnAt := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
-	events.OnUserTurnCommitted("mujhe neend nahi aati", turnAt, pl.PromptKey, false)
+	events.OnUserTurnCommitted("mujhe neend nahi aati", turnAt, pl.PromptKey)
 	events.OnAssistantTurnCommitted("samajh gayi", turnAt.Add(time.Second), voicepipelinecore.TurnMetrics{}, pl.PromptKey)
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-ob", conversationID))
@@ -314,7 +314,7 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 
 	// The agenda provider tracks the live stage, not a snapshot.
 	pl.State.AdvanceStage(&pl.Config.CommonStages[0])
-	events.OnUserTurnCommitted("aage badhte hain", turnAt.Add(2*time.Second), pl.PromptKey, false)
+	events.OnUserTurnCommitted("aage badhte hain", turnAt.Add(2*time.Second), pl.PromptKey)
 	chunkItems, err = redisServer.List(conversationChunksKey("user-ob", conversationID))
 	if err != nil {
 		t.Fatalf("List chunks after advance: %v", err)

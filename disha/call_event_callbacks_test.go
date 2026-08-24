@@ -104,7 +104,7 @@ func TestCallEventCallbacksConversationStateUploadOnCommittedTurns(t *testing.T)
 
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
-	events.OnUserTurnCommitted("hello doctor", at, "", false)
+	events.OnUserTurnCommitted("hello doctor", at, "")
 	events.OnAssistantTurnCommitted("hi, let's begin", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "")
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
@@ -157,7 +157,7 @@ func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
 
 	events := callbacks.Events()
 	at := time.Date(2026, 8, 24, 16, 19, 46, 0, time.UTC)
-	events.OnUserTurnCommitted("first", at, "prompt-v1", false)
+	events.OnUserTurnCommitted("first", at, "prompt-v1")
 
 	initialItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -173,7 +173,7 @@ func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
 
 	state.AdvanceStage(cfg.ResolveStage("closing_and_assurance", nil))
 	callbacks.AppendDebugLogChunk("stage changed", at.Add(time.Second), "", nil)
-	events.OnUserTurnCommitted("first second", at.Add(2*time.Second), "prompt-v2", true)
+	events.OnUserTurnCommitted("first second", at.Add(2*time.Second), "prompt-v2")
 
 	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -216,7 +216,7 @@ func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
 	}
 
 	events.OnAssistantTurnCommitted("assistant boundary", at.Add(3*time.Second), voicepipelinecore.TurnMetrics{}, "prompt-v2")
-	events.OnUserTurnCommitted("third", at.Add(4*time.Second), "prompt-v2", false)
+	events.OnUserTurnCommitted("third", at.Add(4*time.Second), "prompt-v2")
 	items, err = redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
 		t.Fatalf("List chunks after assistant boundary: %v", err)
@@ -312,7 +312,7 @@ func TestCallEventCallbacksConversationStateUploadErrorStillWritesChunk(t *testi
 
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
-	events.OnUserTurnCommitted("hello doctor", at, "", false)
+	events.OnUserTurnCommitted("hello doctor", at, "")
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -379,7 +379,7 @@ func TestCallEventCallbacksConversationStateUploadHappensBeforeRedisWrite(t *tes
 	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(state, uploader, "user-1", "conv-1", nil))
 
 	events := callbacks.Events()
-	events.OnUserTurnCommitted("hello doctor", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "", false)
+	events.OnUserTurnCommitted("hello doctor", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "")
 
 	// miniredis returns an error for a List on a key that does not exist
 	// yet; either that or an empty slice proves no chunk had been written
@@ -411,7 +411,7 @@ func TestCallEventCallbacksConversationStateUploadNilForNonOnboardingBots(t *tes
 	// Deliberately not calling SetChunkDecorator.
 
 	events := callbacks.Events()
-	events.OnUserTurnCommitted("hello", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "", false)
+	events.OnUserTurnCommitted("hello", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "")
 	events.OnAssistantTurnCommitted("hi", time.Date(2026, 7, 8, 10, 0, 1, 0, time.UTC), voicepipelinecore.TurnMetrics{}, "")
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))

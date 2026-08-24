@@ -162,11 +162,11 @@ func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
 
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
 
-func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string, replacePrevious bool) {
+func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string) {
 	if c == nil {
 		return
 	}
-	if replacePrevious {
+	if c.lastUserChunk != nil {
 		c.replaceLastUserChunk(text, at, promptKey)
 		return
 	}

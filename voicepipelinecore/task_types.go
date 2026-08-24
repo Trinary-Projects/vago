@@ -92,11 +92,10 @@ type CallEvents struct {
 	OnBotFirstSpeech  func(time.Time)
 	OnFirstUserAudio  func(time.Time)
 	// OnUserTurnCommitted receives the exact user message stored in the LLM
-	// context. replacePrevious is true when this turn was concatenated onto the
-	// preceding user message because no assistant/tool context was committed in
-	// between; persistence integrations should update that prior logical turn
-	// instead of appending another one.
-	OnUserTurnCommitted      func(text string, at time.Time, promptKey string, replacePrevious bool)
+	// context. Consecutive user commits therefore carry the fully concatenated
+	// text; persistence integrations can replace their still-open user turn
+	// until an assistant/tool context boundary is committed.
+	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the

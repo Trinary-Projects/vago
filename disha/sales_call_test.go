@@ -288,7 +288,7 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 	}
 	events := pl.Callbacks.Events()
 	turnAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
-	events.OnUserTurnCommitted("new user", turnAt, pl.PromptKey, false)
+	events.OnUserTurnCommitted("new user", turnAt, pl.PromptKey)
 	events.OnAssistantTurnCommitted("new assistant", turnAt.Add(time.Second), voicepipelinecore.TurnMetrics{
 		LLMTTFBMs:            11.1,
 		TTSTTFBMs:            22.2,
