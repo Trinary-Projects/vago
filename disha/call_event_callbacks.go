@@ -25,6 +25,13 @@ type CallEventCallbacks struct {
 	userID         string
 	botType        string
 
+	// lastUserChunk is the immediately persisted logical user turn. The call
+	// event dispatcher serializes committed-turn callbacks, while debug chunks
+	// may be appended independently and intentionally do not clear this state.
+	// When the core context concatenates another user turn, we replace this
+	// Redis item by ID so the eventual Postgres row matches the LLM context.
+	lastUserChunk *ConversationChunk
+
 	// llmCallCompleted receives each finished LLM generation (Python's
 	// OnboardingPipelineManager.on_llm_call_complete delegating to the
 	// stage-transition tracker). Nil for bots without a stage tracker;
@@ -155,11 +162,19 @@ func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
 
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
 
-func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string) {
-	c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
+func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string, replacePrevious bool) {
+	if c == nil {
+		return
+	}
+	if replacePrevious {
+		c.replaceLastUserChunk(text, at, promptKey)
+		return
+	}
+	c.lastUserChunk = c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
 }
 
 func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) {
+	c.lastUserChunk = nil
 	c.appendConversationChunk(text, "assistant", at, metrics, promptKey)
 	if c.assistantTurnCommitted != nil {
 		c.assistantTurnCommitted(text, at)
@@ -167,6 +182,7 @@ func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time,
 }
 
 func (c *CallEventCallbacks) OnToolResultCommitted(assistantToolCall voicepipelinecore.Message, toolResult voicepipelinecore.Message, at time.Time) {
+	c.lastUserChunk = nil
 	c.appendConversationChunkWithAdditionalData(
 		assistantToolCall.Content,
 		assistantToolCall.Role,
@@ -203,12 +219,12 @@ func (c *CallEventCallbacks) updateConversation(req UpdateConversationRequest) {
 	}
 }
 
-func (c *CallEventCallbacks) appendConversationChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) {
-	c.appendConversationChunkWithAdditionalData(text, role, at, metrics, promptKey, nil)
+func (c *CallEventCallbacks) appendConversationChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) *ConversationChunk {
+	return c.appendConversationChunkWithAdditionalData(text, role, at, metrics, promptKey, nil)
 }
 
-func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any) {
-	c.appendChunk(text, role, at, metrics, promptKey, additionalData, false)
+func (c *CallEventCallbacks) appendConversationChunkWithAdditionalData(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any) *ConversationChunk {
+	return c.appendChunk(text, role, at, metrics, promptKey, additionalData, false)
 }
 
 // AppendDebugLogChunk persists an is_debug_log=true assistant chunk,
@@ -223,15 +239,60 @@ func (c *CallEventCallbacks) AppendDebugLogChunk(text string, at time.Time, prom
 	c.appendChunk(text, "assistant", at, voicepipelinecore.TurnMetrics{}, promptKey, additionalData, true)
 }
 
-func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool) {
+func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool) *ConversationChunk {
 	if c == nil || c.redis == nil {
+		return nil
+	}
+	chunk := c.buildChunk(uuid.NewString(), at.Format(time.RFC3339Nano), text, role, metrics, promptKey, additionalData, isDebugLog)
+	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
+	defer cancel()
+	if err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, chunk); err != nil {
+		if c.logger != nil {
+			c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
+		}
+		return nil
+	}
+	return &chunk
+}
+
+func (c *CallEventCallbacks) replaceLastUserChunk(text string, at time.Time, promptKey string) {
+	if c.redis == nil {
 		return
 	}
+	if c.lastUserChunk == nil {
+		// The original append may have failed. Persist the complete merged text
+		// as a fresh chunk rather than losing the logical turn entirely.
+		c.lastUserChunk = c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
+		return
+	}
+
+	previous := c.lastUserChunk
+	replacement := c.buildChunk(
+		previous.ID,
+		previous.Created,
+		text,
+		"user",
+		voicepipelinecore.TurnMetrics{},
+		promptKey,
+		nil,
+		false,
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
+	defer cancel()
+	if err := c.redis.ReplaceChunk(ctx, c.userID, c.conversationID, previous.ID, replacement); err != nil {
+		if c.logger != nil {
+			c.logger.Printf("disha: chunk replace failed conversation=%s role=user chunk=%s: %v\n", c.conversationID, previous.ID, err)
+		}
+		return
+	}
+	c.lastUserChunk = &replacement
+}
+
+func (c *CallEventCallbacks) buildChunk(chunkID, created, text, role string, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool) ConversationChunk {
 	var promptKeyPtr *string
 	if promptKey != "" {
 		promptKeyPtr = &promptKey
 	}
-	chunkID := uuid.NewString()
 	chunk := ConversationChunk{
 		ID:                               chunkID,
 		Text:                             text,
@@ -243,7 +304,7 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 		TTSTTFBMs:                        assistantMetricSeconds(role, metrics.TTSTTFBMs),
 		V2VLatencyMs:                     assistantMetricSeconds(role, metrics.E2ELatencyMs),
 		TextAggregationMs:                assistantMetricSeconds(role, metrics.TTSTextAggregationMs),
-		Created:                          at.Format(time.RFC3339Nano),
+		Created:                          created,
 		IsDebugLog:                       isDebugLog,
 		AdditionalData:                   additionalData,
 		MainAgentSystemPromptLangfuseKey: promptKeyPtr,
@@ -251,11 +312,7 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 	if c.chunkDecorator != nil {
 		c.chunkDecorator(&chunk)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
-	defer cancel()
-	if err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, chunk); err != nil && c.logger != nil {
-		c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
-	}
+	return chunk
 }
 
 func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndReason, stats voicepipelinecore.CallStats, logDataS3Key string) {

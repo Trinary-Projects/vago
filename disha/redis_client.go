@@ -19,7 +19,10 @@ const (
 	conversationChunkKeyPrefix = "conversation_chunks"
 )
 
-var ErrConversationDataNotFound = errors.New("disha: conversation_data not found in Redis")
+var (
+	ErrConversationDataNotFound  = errors.New("disha: conversation_data not found in Redis")
+	ErrConversationChunkNotFound = errors.New("disha: conversation chunk not found in Redis")
+)
 
 // RedisClient is the narrow Redis surface required by the Disha
 // integration.
@@ -30,6 +33,7 @@ type RedisClient interface {
 	SetCache(ctx context.Context, key string, value any, expiration time.Duration) error
 	AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) error
+	ReplaceChunk(ctx context.Context, userID, conversationID, chunkID string, chunk ConversationChunk) error
 	Close() error
 }
 
@@ -255,6 +259,79 @@ func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID st
 	}
 	if c.logger != nil {
 		c.logger.Printf("Appended chunk %s to Redis conversation %s\n", chunk.ID, conversationID)
+	}
+	return nil
+}
+
+// ReplaceChunk updates one unsynced conversation chunk in place. The
+// optimistic transaction keeps the lookup-by-ID and LSET atomic even when a
+// debug chunk is appended concurrently. Retrying is safe because the chunk ID
+// and replacement payload are stable.
+func (c *redisClient) ReplaceChunk(ctx context.Context, userID, conversationID, chunkID string, chunk ConversationChunk) error {
+	key := conversationChunksKey(userID, conversationID)
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		wrapped := fmt.Errorf("disha: replacement chunk marshal failed: %w", err)
+		sentryutil.Capture(sentryutil.Event{
+			Err:  wrapped,
+			Tags: map[string]string{"component": "disha_redis", "operation": "MARSHAL"},
+			Details: map[string]any{
+				"key":      key,
+				"chunk_id": chunkID,
+			},
+		})
+		return wrapped
+	}
+
+	err = withRedisTimeoutRetry(ctx, func() error {
+		const maxTransactionAttempts = 3
+		for attempt := 1; attempt <= maxTransactionAttempts; attempt++ {
+			txErr := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
+				items, rangeErr := tx.LRange(ctx, key, 0, -1).Result()
+				if rangeErr != nil {
+					return rangeErr
+				}
+
+				index := -1
+				for i := len(items) - 1; i >= 0; i-- {
+					var candidate struct {
+						ID string `json:"id"`
+					}
+					if json.Unmarshal([]byte(items[i]), &candidate) == nil && candidate.ID == chunkID {
+						index = i
+						break
+					}
+				}
+				if index < 0 {
+					return fmt.Errorf("%w: %s", ErrConversationChunkNotFound, chunkID)
+				}
+
+				_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+					pipe.LSet(ctx, key, int64(index), payload)
+					return nil
+				})
+				return pipeErr
+			}, key)
+			if !errors.Is(txErr, redis.TxFailedErr) {
+				return txErr
+			}
+		}
+		return redis.TxFailedErr
+	})
+	if err != nil {
+		wrapped := fmt.Errorf("disha: redis replace chunk %s in %s failed: %w", chunkID, key, err)
+		sentryutil.Capture(sentryutil.Event{
+			Err:  wrapped,
+			Tags: map[string]string{"component": "disha_redis", "operation": "LSET"},
+			Details: map[string]any{
+				"key":      key,
+				"chunk_id": chunkID,
+			},
+		})
+		return wrapped
+	}
+	if c.logger != nil {
+		c.logger.Printf("Replaced chunk %s in Redis conversation %s\n", chunkID, conversationID)
 	}
 	return nil
 }

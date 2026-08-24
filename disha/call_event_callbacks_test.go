@@ -104,7 +104,7 @@ func TestCallEventCallbacksConversationStateUploadOnCommittedTurns(t *testing.T)
 
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
-	events.OnUserTurnCommitted("hello doctor", at, "")
+	events.OnUserTurnCommitted("hello doctor", at, "", false)
 	events.OnAssistantTurnCommitted("hi, let's begin", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "")
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
@@ -139,6 +139,97 @@ func TestCallEventCallbacksConversationStateUploadOnCommittedTurns(t *testing.T)
 			t.Fatalf("upload %d key = %q, want %q", i, call.objectKey, wantKey)
 		}
 		assertConversationStatePayloadShape(t, call.value, "user-1", "conv-1")
+	}
+}
+
+func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        OnboardingCallBotType,
+	}, redisClient, nil, nil)
+
+	cfg := parseStudentTestConfig(t)
+	state := NewConversationState(cfg, "student_test")
+	uploader := &fakeJSONUploader{}
+	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(state, uploader, "user-1", "conv-1", nil))
+
+	events := callbacks.Events()
+	at := time.Date(2026, 8, 24, 16, 19, 46, 0, time.UTC)
+	events.OnUserTurnCommitted("first", at, "prompt-v1", false)
+
+	initialItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List initial chunks: %v", err)
+	}
+	if len(initialItems) != 1 {
+		t.Fatalf("initial chunk count = %d, want 1", len(initialItems))
+	}
+	var initial ConversationChunk
+	if err := json.Unmarshal([]byte(initialItems[0]), &initial); err != nil {
+		t.Fatalf("Unmarshal initial chunk: %v", err)
+	}
+
+	state.AdvanceStage(cfg.ResolveStage("closing_and_assurance", nil))
+	callbacks.AppendDebugLogChunk("stage changed", at.Add(time.Second), "", nil)
+	events.OnUserTurnCommitted("first second", at.Add(2*time.Second), "prompt-v2", true)
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List replaced chunks: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("chunk count after replacement = %d, want 2 (one user + one debug)", len(items))
+	}
+	var userChunk, debugChunk ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &userChunk); err != nil {
+		t.Fatalf("Unmarshal user chunk: %v", err)
+	}
+	if err := json.Unmarshal([]byte(items[1]), &debugChunk); err != nil {
+		t.Fatalf("Unmarshal debug chunk: %v", err)
+	}
+	if userChunk.ID != initial.ID || userChunk.Created != initial.Created {
+		t.Fatalf("replacement identity changed: initial=%+v replaced=%+v", initial, userChunk)
+	}
+	if userChunk.Text != "first second" {
+		t.Fatalf("replacement text = %q, want combined text", userChunk.Text)
+	}
+	if userChunk.MainAgentSystemPromptLangfuseKey == nil || *userChunk.MainAgentSystemPromptLangfuseKey != "prompt-v2" {
+		t.Fatalf("replacement prompt key = %v, want prompt-v2", userChunk.MainAgentSystemPromptLangfuseKey)
+	}
+	if userChunk.CurrentAgenda == nil || *userChunk.CurrentAgenda != "closing_and_assurance" {
+		t.Fatalf("replacement agenda = %v, want closing_and_assurance", userChunk.CurrentAgenda)
+	}
+	if !debugChunk.IsDebugLog || debugChunk.Text != "stage changed" {
+		t.Fatalf("debug chunk changed: %+v", debugChunk)
+	}
+	if uploader.callCount() != 3 {
+		t.Fatalf("upload count = %d, want initial user + debug + replacement", uploader.callCount())
+	}
+	wantStateKey := fmt.Sprintf("conversation_state/conv-1/%s.json", initial.ID)
+	if uploader.calls[0].objectKey != wantStateKey || uploader.calls[2].objectKey != wantStateKey {
+		t.Fatalf("replacement state uploads = %q and %q, want same key %q", uploader.calls[0].objectKey, uploader.calls[2].objectKey, wantStateKey)
+	}
+	if uploader.calls[2].value["agenda"] != "closing_and_assurance" {
+		t.Fatalf("replacement state agenda = %v, want closing_and_assurance", uploader.calls[2].value["agenda"])
+	}
+
+	events.OnAssistantTurnCommitted("assistant boundary", at.Add(3*time.Second), voicepipelinecore.TurnMetrics{}, "prompt-v2")
+	events.OnUserTurnCommitted("third", at.Add(4*time.Second), "prompt-v2", false)
+	items, err = redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List chunks after assistant boundary: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("chunk count after assistant boundary = %d, want 4", len(items))
+	}
+	var finalUser ConversationChunk
+	if err := json.Unmarshal([]byte(items[3]), &finalUser); err != nil {
+		t.Fatalf("Unmarshal final user chunk: %v", err)
+	}
+	if finalUser.ID == initial.ID || finalUser.Text != "third" {
+		t.Fatalf("post-assistant user chunk = %+v, want separate third turn", finalUser)
 	}
 }
 
@@ -221,7 +312,7 @@ func TestCallEventCallbacksConversationStateUploadErrorStillWritesChunk(t *testi
 
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
-	events.OnUserTurnCommitted("hello doctor", at, "")
+	events.OnUserTurnCommitted("hello doctor", at, "", false)
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -288,7 +379,7 @@ func TestCallEventCallbacksConversationStateUploadHappensBeforeRedisWrite(t *tes
 	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(state, uploader, "user-1", "conv-1", nil))
 
 	events := callbacks.Events()
-	events.OnUserTurnCommitted("hello doctor", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "")
+	events.OnUserTurnCommitted("hello doctor", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "", false)
 
 	// miniredis returns an error for a List on a key that does not exist
 	// yet; either that or an empty slice proves no chunk had been written
@@ -320,7 +411,7 @@ func TestCallEventCallbacksConversationStateUploadNilForNonOnboardingBots(t *tes
 	// Deliberately not calling SetChunkDecorator.
 
 	events := callbacks.Events()
-	events.OnUserTurnCommitted("hello", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "")
+	events.OnUserTurnCommitted("hello", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "", false)
 	events.OnAssistantTurnCommitted("hi", time.Date(2026, 7, 8, 10, 0, 1, 0, time.UTC), voicepipelinecore.TurnMetrics{}, "")
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))

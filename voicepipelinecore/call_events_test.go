@@ -44,8 +44,11 @@ func TestCallEventsDispatchCommittedTurnsInOrder(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	var got []string
 	l := newCallEventDispatcher(logger, CallEvents{
-		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string, replacePrevious bool) {
 			got = append(got, "user:"+text+":"+promptKey)
+			if replacePrevious {
+				t.Fatal("first user turn unexpectedly replaced a prior turn")
+			}
 		},
 		OnAssistantTurnCommitted: func(text string, at time.Time, metrics TurnMetrics, promptKey string) {
 			got = append(got, "assistant:"+text+":"+promptKey)
@@ -55,7 +58,7 @@ func TestCallEventsDispatchCommittedTurnsInOrder(t *testing.T) {
 		},
 	})
 
-	l.fireUserTurnCommitted("one", time.Now(), "prompt-v1")
+	l.fireUserTurnCommitted("one", time.Now(), "prompt-v1", false)
 	l.fireAssistantTurnCommitted("two", time.Now(), TurnMetrics{LLMTTFBMs: 12}, "prompt-v1")
 	l.stopAndDrain()
 
@@ -74,7 +77,7 @@ func TestCallEventsRecoversAndContinuesAfterCallbackPanic(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	var count int
 	l := newCallEventDispatcher(logger, CallEvents{
-		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string, replacePrevious bool) {
 			count++
 			if count == 1 {
 				panic("first callback panic")
@@ -82,8 +85,8 @@ func TestCallEventsRecoversAndContinuesAfterCallbackPanic(t *testing.T) {
 		},
 	})
 
-	l.fireUserTurnCommitted("first", time.Now(), "")
-	l.fireUserTurnCommitted("second", time.Now(), "")
+	l.fireUserTurnCommitted("first", time.Now(), "", false)
+	l.fireUserTurnCommitted("second", time.Now(), "", true)
 	l.stopAndDrain()
 
 	if count != 2 {

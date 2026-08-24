@@ -147,6 +147,10 @@ func (s scriptedCacheRedis) AppendChunk(context.Context, string, string, Convers
 	return errors.New("unused")
 }
 
+func (s scriptedCacheRedis) ReplaceChunk(context.Context, string, string, string, ConversationChunk) error {
+	return errors.New("unused")
+}
+
 func (s scriptedCacheRedis) Close() error { return nil }
 
 func TestDocumentStoreReportsMissingDocumentToSentry(t *testing.T) {

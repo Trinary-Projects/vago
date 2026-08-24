@@ -86,12 +86,17 @@ type CallStats struct {
 // context updates. The first five are one-shot timeline events; committed-turn
 // and tool-result events can fire many times.
 type CallEvents struct {
-	OnBotJoined              func(time.Time)
-	OnUserJoined             func(time.Time)
-	OnUserFirstSpeech        func(time.Time)
-	OnBotFirstSpeech         func(time.Time)
-	OnFirstUserAudio         func(time.Time)
-	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
+	OnBotJoined       func(time.Time)
+	OnUserJoined      func(time.Time)
+	OnUserFirstSpeech func(time.Time)
+	OnBotFirstSpeech  func(time.Time)
+	OnFirstUserAudio  func(time.Time)
+	// OnUserTurnCommitted receives the exact user message stored in the LLM
+	// context. replacePrevious is true when this turn was concatenated onto the
+	// preceding user message because no assistant/tool context was committed in
+	// between; persistence integrations should update that prior logical turn
+	// instead of appending another one.
+	OnUserTurnCommitted      func(text string, at time.Time, promptKey string, replacePrevious bool)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the

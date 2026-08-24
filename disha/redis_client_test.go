@@ -118,6 +118,68 @@ func TestRedisClientAppendChunk(t *testing.T) {
 	}
 }
 
+func TestRedisClientReplaceChunkByID(t *testing.T) {
+	server, client := newRedisTestClient(t)
+	ctx := context.Background()
+	userChunk := ConversationChunk{
+		ID:             "user-chunk",
+		Text:           "first",
+		Role:           "user",
+		BotType:        "onboarding_call",
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		Created:        "2026-08-24T16:19:46Z",
+	}
+	debugChunk := ConversationChunk{
+		ID:             "debug-chunk",
+		Text:           "stage changed",
+		Role:           "assistant",
+		BotType:        "onboarding_call",
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		Created:        "2026-08-24T16:19:47Z",
+		IsDebugLog:     true,
+	}
+	if err := client.AppendChunk(ctx, "user-1", "conv-1", userChunk); err != nil {
+		t.Fatalf("AppendChunk user: %v", err)
+	}
+	if err := client.AppendChunk(ctx, "user-1", "conv-1", debugChunk); err != nil {
+		t.Fatalf("AppendChunk debug: %v", err)
+	}
+
+	replacement := userChunk
+	replacement.Text = "first second"
+	if err := client.ReplaceChunk(ctx, "user-1", "conv-1", userChunk.ID, replacement); err != nil {
+		t.Fatalf("ReplaceChunk: %v", err)
+	}
+
+	items, err := server.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("list length = %d, want 2", len(items))
+	}
+	var gotUser, gotDebug ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &gotUser); err != nil {
+		t.Fatalf("Unmarshal user chunk: %v", err)
+	}
+	if err := json.Unmarshal([]byte(items[1]), &gotDebug); err != nil {
+		t.Fatalf("Unmarshal debug chunk: %v", err)
+	}
+	if gotUser.ID != userChunk.ID || gotUser.Text != "first second" || gotUser.Created != userChunk.Created {
+		t.Fatalf("replaced user chunk = %+v", gotUser)
+	}
+	if gotDebug.ID != debugChunk.ID || gotDebug.Text != debugChunk.Text {
+		t.Fatalf("debug chunk changed: %+v", gotDebug)
+	}
+
+	err = client.ReplaceChunk(ctx, "user-1", "conv-1", "missing", replacement)
+	if !errors.Is(err, ErrConversationChunkNotFound) {
+		t.Fatalf("missing replacement error = %v, want ErrConversationChunkNotFound", err)
+	}
+}
+
 func TestRedisOptionsNormalizeAddr(t *testing.T) {
 	if got := redisOptions("localhost", "", 0).Addr; got != "localhost:6379" {
 		t.Fatalf("Addr = %q, want localhost:6379", got)

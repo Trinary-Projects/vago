@@ -592,10 +592,12 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	fix := newTestFixture(t)
 	var users []string
 	var userPromptKeys []string
+	var replacements []bool
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string, replacePrevious bool) {
 			users = append(users, text)
 			userPromptKeys = append(userPromptKeys, promptKey)
+			replacements = append(replacements, replacePrevious)
 		},
 	})
 	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "sales_call/main_sys-3day_v2_v17")
@@ -608,6 +610,42 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	}
 	if len(userPromptKeys) != 1 || userPromptKeys[0] != "sales_call/main_sys-3day_v2_v17" {
 		t.Fatalf("user prompt keys = %v, want sales prompt key", userPromptKeys)
+	}
+	if len(replacements) != 1 || replacements[0] {
+		t.Fatalf("replacement flags = %v, want [false]", replacements)
+	}
+}
+
+func TestUserContextAggregator_ConsecutiveCommittedTurnsReplacePriorPersistence(t *testing.T) {
+	fix := newTestFixture(t)
+	type committedTurn struct {
+		text            string
+		replacePrevious bool
+	}
+	var turns []committedTurn
+	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+		OnUserTurnCommitted: func(text string, _ time.Time, _ string, replacePrevious bool) {
+			turns = append(turns, committedTurn{text: text, replacePrevious: replacePrevious})
+		},
+	})
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	a.addUserMessage("first")
+	a.addUserMessage("second")
+	fix.TaskCtx.callEvents.stopAndDrain()
+
+	if len(turns) != 2 {
+		t.Fatalf("committed turns = %+v, want 2", turns)
+	}
+	if turns[0].text != "first" || turns[0].replacePrevious {
+		t.Fatalf("first committed turn = %+v, want append first", turns[0])
+	}
+	if turns[1].text != "first second" || !turns[1].replacePrevious {
+		t.Fatalf("second committed turn = %+v, want replacement with combined text", turns[1])
+	}
+	messages := a.messagesForTest()
+	if len(messages) != 2 || messages[1].Role != "user" || messages[1].Content != "first second" {
+		t.Fatalf("LLM context = %+v, want one combined user message", messages)
 	}
 }
 

@@ -27,7 +27,7 @@ type callEventDispatcher struct {
 	onUserFirstSpeech        func(time.Time)
 	onBotFirstSpeech         func(time.Time)
 	onFirstUserAudio         func(time.Time)
-	onUserTurnCommitted      func(text string, at time.Time, promptKey string)
+	onUserTurnCommitted      func(text string, at time.Time, promptKey string, replacePrevious bool)
 	onAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	onToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	onLLMCallCompleted       func(text string, interrupted bool)
@@ -110,11 +110,11 @@ func (l *callEventDispatcher) fireFirstUserAudio(at time.Time) {
 	})
 }
 
-func (l *callEventDispatcher) fireUserTurnCommitted(text string, at time.Time, promptKey string) {
+func (l *callEventDispatcher) fireUserTurnCommitted(text string, at time.Time, promptKey string, replacePrevious bool) {
 	if l == nil || l.onUserTurnCommitted == nil {
 		return
 	}
-	l.dispatch("OnUserTurnCommitted", func() { l.onUserTurnCommitted(text, at, promptKey) })
+	l.dispatch("OnUserTurnCommitted", func() { l.onUserTurnCommitted(text, at, promptKey, replacePrevious) })
 }
 
 func (l *callEventDispatcher) fireAssistantTurnCommitted(text string, at time.Time, metrics TurnMetrics, promptKey string) {
