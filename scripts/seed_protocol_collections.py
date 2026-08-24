@@ -194,14 +194,15 @@ FIXTURES: list[dict] = [
 ]
 
 # Probe queries in the exact shape vago will send (see the design note's
-# query-text builder): "Disha: <turn>\nUser: <turn>", raw and unprefixed.
+# query-text builder): the latest user turn only, raw and unprefixed. Production
+# skips turns with fewer than four words, so every probe meets that boundary.
 PROBE_QUERIES: list[str] = [
-    "Disha: aapka weight kaisa chal raha hai, kuch kam hua?\nUser: nahi didi, mujhe bahut acidity ho rahi hai raat me",
-    "Disha: is hafte diet plan follow kar paaye?\nUser: nahi didi, bahar ka kha liya do teen baar",
-    "Disha: pichle mahine se weight me kya change aaya?\nUser: kuch nahi hua, balki badh gaya hai",
-    "Disha: aapki BP ki dawai chal rahi hai na?\nUser: didi main soch raha tha ki dawai band kar du",
-    "Disha: main aapse aaj ka routine discuss karna chahti thi\nUser: didi main abhi drive kar raha hoon, baad me baat karein",
-    "Disha: aapka din kaisa tha?\nUser: theek tha didi",
+    "nahi didi, mujhe bahut acidity ho rahi hai raat me",
+    "nahi didi, bahar ka kha liya do teen baar",
+    "kuch nahi hua, balki badh gaya hai",
+    "didi main soch raha tha ki dawai band kar du",
+    "didi main abhi drive kar raha hoon, baad me baat karein",
+    "theek tha didi bas",
 ]
 
 

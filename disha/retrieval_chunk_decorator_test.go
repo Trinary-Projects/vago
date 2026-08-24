@@ -39,7 +39,7 @@ func (u *stubJSONUploader) uploaded() ([]string, any) {
 func testProtocolRetrievalRecord() protocolRetrievalRecord {
 	top := 0.88
 	return protocolRetrievalRecord{
-		QueryText: "Disha: a\nUser: b",
+		QueryText: "mujhe workout plan bhej do",
 		Candidates: []protocolCandidate{{InstructionID: "instr-A", Similarity: 0.88, Qualified: true,
 			TurnThreshold: 3, DocumentPath: "p/v/1"}},
 		Injected: []residentProtocol{{InstructionID: "instr-A", Title: "t", DocumentPath: "p/v/1",
@@ -86,7 +86,7 @@ func TestChunkDecoratorAttachesToSpokenAssistantChunk(t *testing.T) {
 	// disha-backend reads query_text off the chunk to fill
 	// conversationchunkretrievallog and to seed ProtocolLiveQueryAnchor, so it
 	// must survive onto the chunk without an S3 read.
-	if metrics.QueryText != "Disha: a\nUser: b" {
+	if metrics.QueryText != "mujhe workout plan bhej do" {
 		t.Fatalf("query text = %q, want it carried inline", metrics.QueryText)
 	}
 
@@ -326,9 +326,9 @@ func TestChunkMetricsAreSelfSufficientForBackendSync(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	for _, want := range []string{
-		`"query_text":"Disha: a\nUser: b"`, // seeds ProtocolLiveQueryAnchor
-		`"retrieval_latency_ms":31.5`,      // becomes protocol_retrieval_e2e_ms
-		`"protocols_s3_key":`,              // drill-down to the candidate list
+		`"query_text":"mujhe workout plan bhej do"`, // seeds ProtocolLiveQueryAnchor
+		`"retrieval_latency_ms":31.5`,               // becomes protocol_retrieval_e2e_ms
+		`"protocols_s3_key":`,                       // drill-down to the candidate list
 		`"status":"ok"`,
 	} {
 		if !strings.Contains(string(encoded), want) {
