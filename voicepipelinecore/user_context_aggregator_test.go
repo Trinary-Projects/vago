@@ -611,12 +611,15 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	}
 }
 
-func TestUserContextAggregator_ConsecutiveCommittedTurnsExposeCombinedContextText(t *testing.T) {
+func TestUserContextAggregator_ConsecutiveCommittedTurnsEmitCommitThenExtension(t *testing.T) {
 	fix := newTestFixture(t)
-	var turns []string
+	var events []string
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
 		OnUserTurnCommitted: func(text string, _ time.Time, _ string) {
-			turns = append(turns, text)
+			events = append(events, "committed:"+text)
+		},
+		OnUserTurnExtended: func(text string, _ time.Time, _ string) {
+			events = append(events, "extended:"+text)
 		},
 	})
 	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
@@ -625,18 +628,41 @@ func TestUserContextAggregator_ConsecutiveCommittedTurnsExposeCombinedContextTex
 	a.addUserMessage("second")
 	fix.TaskCtx.callEvents.stopAndDrain()
 
-	if len(turns) != 2 {
-		t.Fatalf("committed turns = %+v, want 2", turns)
-	}
-	if turns[0] != "first" {
-		t.Fatalf("first committed turn = %q, want first", turns[0])
-	}
-	if turns[1] != "first second" {
-		t.Fatalf("second committed turn = %q, want combined context text", turns[1])
+	wantEvents := []string{"committed:first", "extended:first second"}
+	if len(events) != len(wantEvents) || events[0] != wantEvents[0] || events[1] != wantEvents[1] {
+		t.Fatalf("user events = %+v, want %+v", events, wantEvents)
 	}
 	messages := a.messagesForTest()
 	if len(messages) != 2 || messages[1].Role != "user" || messages[1].Content != "first second" {
 		t.Fatalf("LLM context = %+v, want one combined user message", messages)
+	}
+}
+
+func TestUserContextAggregator_ToolInProgressMakesNextUserMessageNew(t *testing.T) {
+	fix := newTestFixture(t)
+	var events []string
+	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+		OnUserTurnCommitted: func(text string, _ time.Time, _ string) {
+			events = append(events, "committed:"+text)
+		},
+		OnUserTurnExtended: func(text string, _ time.Time, _ string) {
+			events = append(events, "extended:"+text)
+		},
+	})
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	a.addUserMessage("first")
+	a.addFunctionCallInProgress(NewFunctionCallInProgressFrame("get_guidance", "call-1", nil, `{}`, false))
+	a.addUserMessage("second")
+	fix.TaskCtx.callEvents.stopAndDrain()
+
+	wantEvents := []string{"committed:first", "committed:second"}
+	if len(events) != len(wantEvents) || events[0] != wantEvents[0] || events[1] != wantEvents[1] {
+		t.Fatalf("user events = %+v, want %+v", events, wantEvents)
+	}
+	messages := a.messagesForTest()
+	if len(messages) != 5 || messages[1].Content != "first" || messages[4].Role != "user" || messages[4].Content != "second" {
+		t.Fatalf("LLM context = %+v, want separate user messages around tool context", messages)
 	}
 }
 

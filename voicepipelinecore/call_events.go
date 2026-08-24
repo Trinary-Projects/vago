@@ -28,6 +28,7 @@ type callEventDispatcher struct {
 	onBotFirstSpeech         func(time.Time)
 	onFirstUserAudio         func(time.Time)
 	onUserTurnCommitted      func(text string, at time.Time, promptKey string)
+	onUserTurnExtended       func(text string, at time.Time, promptKey string)
 	onAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	onToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	onLLMCallCompleted       func(text string, interrupted bool)
@@ -50,6 +51,7 @@ func newCallEventDispatcher(logger *log.Logger, events CallEvents) *callEventDis
 		onBotFirstSpeech:         events.OnBotFirstSpeech,
 		onFirstUserAudio:         events.OnFirstUserAudio,
 		onUserTurnCommitted:      events.OnUserTurnCommitted,
+		onUserTurnExtended:       events.OnUserTurnExtended,
 		onAssistantTurnCommitted: events.OnAssistantTurnCommitted,
 		onToolResultCommitted:    events.OnToolResultCommitted,
 		onLLMCallCompleted:       events.OnLLMCallCompleted,
@@ -115,6 +117,13 @@ func (l *callEventDispatcher) fireUserTurnCommitted(text string, at time.Time, p
 		return
 	}
 	l.dispatch("OnUserTurnCommitted", func() { l.onUserTurnCommitted(text, at, promptKey) })
+}
+
+func (l *callEventDispatcher) fireUserTurnExtended(text string, at time.Time, promptKey string) {
+	if l == nil || l.onUserTurnExtended == nil {
+		return
+	}
+	l.dispatch("OnUserTurnExtended", func() { l.onUserTurnExtended(text, at, promptKey) })
 }
 
 func (l *callEventDispatcher) fireAssistantTurnCommitted(text string, at time.Time, metrics TurnMetrics, promptKey string) {

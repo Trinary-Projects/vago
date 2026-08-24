@@ -126,14 +126,16 @@ func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Messa
 func (a *UserContextAggregator) addUserMessage(text string) {
 	at := time.Now()
 	_, promptKey, concatenated := a.recordUserMessage(text)
-	committedText := text
 	if concatenated != "" {
 		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
-		committedText = concatenated
 	}
 	a.taskCtx.UIEvents.UserTranscription(text, true, at)
 	if a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireUserTurnCommitted(committedText, at, promptKey)
+		if concatenated != "" {
+			a.taskCtx.callEvents.fireUserTurnExtended(concatenated, at, promptKey)
+		} else {
+			a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
+		}
 	}
 }
 
@@ -222,14 +224,16 @@ func (a *UserContextAggregator) submitUserMessage(text string) {
 	}
 	at := time.Now()
 	messages, promptKey, concatenated := a.recordUserMessage(text)
-	committedText := text
 	if concatenated != "" {
 		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
-		committedText = concatenated
 	}
 	a.taskCtx.UIEvents.UserTranscription(text, true, at)
 	if a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireUserTurnCommitted(committedText, at, promptKey)
+		if concatenated != "" {
+			a.taskCtx.callEvents.fireUserTurnExtended(concatenated, at, promptKey)
+		} else {
+			a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
+		}
 	}
 	a.interruptSent = false
 	a.resetInterimTranscript()

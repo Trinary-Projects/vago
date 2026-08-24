@@ -173,7 +173,7 @@ func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
 
 	state.AdvanceStage(cfg.ResolveStage("closing_and_assurance", nil))
 	callbacks.AppendDebugLogChunk("stage changed", at.Add(time.Second), "", nil)
-	events.OnUserTurnCommitted("first second", at.Add(2*time.Second), "prompt-v2")
+	events.OnUserTurnExtended("first second", at.Add(2*time.Second), "prompt-v2")
 
 	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -230,6 +230,37 @@ func TestCallEventCallbacksReplacesConsecutiveUserChunk(t *testing.T) {
 	}
 	if finalUser.ID == initial.ID || finalUser.Text != "third" {
 		t.Fatalf("post-assistant user chunk = %+v, want separate third turn", finalUser)
+	}
+}
+
+func TestCallEventCallbacksNewUserCommitNeverReplacesPreviousChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 8, 24, 16, 19, 46, 0, time.UTC)
+	events.OnUserTurnCommitted("before tool", at, "")
+	events.OnUserTurnCommitted("during tool", at.Add(time.Second), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List user chunks: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("chunk count = %d, want 2", len(items))
+	}
+	var first, second ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &first); err != nil {
+		t.Fatalf("Unmarshal first chunk: %v", err)
+	}
+	if err := json.Unmarshal([]byte(items[1]), &second); err != nil {
+		t.Fatalf("Unmarshal second chunk: %v", err)
+	}
+	if first.Text != "before tool" || second.Text != "during tool" || first.ID == second.ID {
+		t.Fatalf("user chunks = %+v, %+v, want distinct persisted messages", first, second)
 	}
 }
 

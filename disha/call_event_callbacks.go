@@ -25,11 +25,10 @@ type CallEventCallbacks struct {
 	userID         string
 	botType        string
 
-	// lastUserChunk is the immediately persisted logical user turn. The call
-	// event dispatcher serializes committed-turn callbacks, while debug chunks
-	// may be appended independently and intentionally do not clear this state.
-	// When the core context concatenates another user turn, we replace this
-	// Redis item by ID so the eventual Postgres row matches the LLM context.
+	// lastUserChunk identifies the Redis item for the latest new user-message
+	// event. If the core context subsequently extends that same message, the
+	// extension event replaces this item by ID. The core aggregator, rather
+	// than this persistence integration, decides whether a message is new.
 	lastUserChunk *ConversationChunk
 
 	// llmCallCompleted receives each finished LLM generation (Python's
@@ -137,6 +136,7 @@ func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
 		OnBotFirstSpeech:         c.OnBotFirstSpeech,
 		OnFirstUserAudio:         c.OnFirstUserAudio,
 		OnUserTurnCommitted:      c.OnUserTurnCommitted,
+		OnUserTurnExtended:       c.OnUserTurnExtended,
 		OnAssistantTurnCommitted: c.OnAssistantTurnCommitted,
 		OnToolResultCommitted:    c.OnToolResultCommitted,
 		OnLLMCallCompleted:       c.OnLLMCallCompleted,
@@ -166,15 +166,17 @@ func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, prom
 	if c == nil {
 		return
 	}
-	if c.lastUserChunk != nil {
-		c.replaceLastUserChunk(text, at, promptKey)
-		return
-	}
 	c.lastUserChunk = c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
 }
 
+func (c *CallEventCallbacks) OnUserTurnExtended(text string, at time.Time, promptKey string) {
+	if c == nil {
+		return
+	}
+	c.replaceLastUserChunk(text, at, promptKey)
+}
+
 func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) {
-	c.lastUserChunk = nil
 	c.appendConversationChunk(text, "assistant", at, metrics, promptKey)
 	if c.assistantTurnCommitted != nil {
 		c.assistantTurnCommitted(text, at)
@@ -182,7 +184,6 @@ func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time,
 }
 
 func (c *CallEventCallbacks) OnToolResultCommitted(assistantToolCall voicepipelinecore.Message, toolResult voicepipelinecore.Message, at time.Time) {
-	c.lastUserChunk = nil
 	c.appendConversationChunkWithAdditionalData(
 		assistantToolCall.Content,
 		assistantToolCall.Role,

@@ -91,11 +91,11 @@ type CallEvents struct {
 	OnUserFirstSpeech func(time.Time)
 	OnBotFirstSpeech  func(time.Time)
 	OnFirstUserAudio  func(time.Time)
-	// OnUserTurnCommitted receives the exact user message stored in the LLM
-	// context. Consecutive user commits therefore carry the fully concatenated
-	// text; persistence integrations can replace their still-open user turn
-	// until an assistant/tool context boundary is committed.
+	// OnUserTurnCommitted fires when the context aggregator appends a new user
+	// message. OnUserTurnExtended fires when it extends the existing trailing
+	// user message and receives that message's exact updated content.
 	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
+	OnUserTurnExtended       func(text string, at time.Time, promptKey string)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the

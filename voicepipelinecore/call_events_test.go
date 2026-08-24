@@ -47,6 +47,9 @@ func TestCallEventsDispatchCommittedTurnsInOrder(t *testing.T) {
 		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
 			got = append(got, "user:"+text+":"+promptKey)
 		},
+		OnUserTurnExtended: func(text string, at time.Time, promptKey string) {
+			got = append(got, "user-extended:"+text+":"+promptKey)
+		},
 		OnAssistantTurnCommitted: func(text string, at time.Time, metrics TurnMetrics, promptKey string) {
 			got = append(got, "assistant:"+text+":"+promptKey)
 			if metrics.LLMTTFBMs != 12 {
@@ -56,10 +59,11 @@ func TestCallEventsDispatchCommittedTurnsInOrder(t *testing.T) {
 	})
 
 	l.fireUserTurnCommitted("one", time.Now(), "prompt-v1")
+	l.fireUserTurnExtended("one more", time.Now(), "prompt-v1")
 	l.fireAssistantTurnCommitted("two", time.Now(), TurnMetrics{LLMTTFBMs: 12}, "prompt-v1")
 	l.stopAndDrain()
 
-	want := []string{"user:one:prompt-v1", "assistant:two:prompt-v1"}
+	want := []string{"user:one:prompt-v1", "user-extended:one more:prompt-v1", "assistant:two:prompt-v1"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
