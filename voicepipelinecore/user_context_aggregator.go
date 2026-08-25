@@ -52,7 +52,7 @@ func (a *UserContextAggregator) resetInterimTranscript() {
 func (a *UserContextAggregator) sendLiveTranscript(text string) {
 	// Interim user transcription events are intentionally suppressed.
 	// They are high-frequency diagnostics/UI traffic and final RTVI
-	// user-transcription events are still emitted from addUserMessage.
+	// user-transcription events are still emitted from commitUserMessage.
 }
 
 func (a *UserContextAggregator) updateInterimTranscript(f TranscriptFrame) string {
@@ -111,21 +111,23 @@ func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Messa
 	a.state.mu.Lock()
 	defer a.state.mu.Unlock()
 
-	if len(a.state.messages) > 0 && a.state.messages[len(a.state.messages)-1].Role == "user" {
-		last := &a.state.messages[len(a.state.messages)-1]
+	lastIndex := len(a.state.messages) - 1
+	if lastIndex >= 0 && lastIndex == a.state.liveUserMessageIndex && a.state.messages[lastIndex].Role == "user" {
+		last := &a.state.messages[lastIndex]
 		last.Content += " " + text
 		concatenated = last.Content
 	} else {
 		a.state.messages = append(a.state.messages, Message{Role: "user", Content: text})
+		a.state.liveUserMessageIndex = len(a.state.messages) - 1
 	}
 	promptKey = a.state.mainAgentSystemPromptLangfuseKey
 	snapshot = cloneMessages(a.state.messages)
 	return snapshot, promptKey, concatenated
 }
 
-func (a *UserContextAggregator) addUserMessage(text string) {
+func (a *UserContextAggregator) commitUserMessage(text string) []Message {
 	at := time.Now()
-	_, promptKey, concatenated := a.recordUserMessage(text)
+	messages, promptKey, concatenated := a.recordUserMessage(text)
 	if concatenated != "" {
 		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
 	}
@@ -137,6 +139,7 @@ func (a *UserContextAggregator) addUserMessage(text string) {
 			a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
 		}
 	}
+	return messages
 }
 
 func toolCallFromFunctionFrame(functionName, toolCallID string, arguments map[string]any, rawArguments string) ToolCall {
@@ -222,19 +225,7 @@ func (a *UserContextAggregator) submitUserMessage(text string) {
 	if a.taskCtx.callEvents != nil {
 		a.taskCtx.callEvents.fireUserFirstSpeech(time.Now())
 	}
-	at := time.Now()
-	messages, promptKey, concatenated := a.recordUserMessage(text)
-	if concatenated != "" {
-		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
-	}
-	a.taskCtx.UIEvents.UserTranscription(text, true, at)
-	if a.taskCtx.callEvents != nil {
-		if concatenated != "" {
-			a.taskCtx.callEvents.fireUserTurnExtended(concatenated, at, promptKey)
-		} else {
-			a.taskCtx.callEvents.fireUserTurnCommitted(text, at, promptKey)
-		}
-	}
+	messages := a.commitUserMessage(text)
 	a.interruptSent = false
 	a.resetInterimTranscript()
 	a.resetFinalTranscript()

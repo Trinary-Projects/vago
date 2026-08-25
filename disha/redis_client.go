@@ -263,10 +263,10 @@ func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID st
 	return nil
 }
 
-// ReplaceChunk updates one unsynced conversation chunk in place. The
-// optimistic transaction keeps the lookup-by-ID and LSET atomic even when a
-// debug chunk is appended concurrently. Retrying is safe because the chunk ID
-// and replacement payload are stable.
+// ReplaceChunk updates one unsynced conversation chunk in place. Conversation
+// chunk lists only grow via RPUSH, so appends cannot change an existing item's
+// index between the lookup and LSET. Retrying is safe because the chunk ID and
+// replacement payload are stable.
 func (c *redisClient) ReplaceChunk(ctx context.Context, userID, conversationID, chunkID string, chunk ConversationChunk) error {
 	key := conversationChunksKey(userID, conversationID)
 	payload, err := json.Marshal(chunk)
@@ -284,41 +284,30 @@ func (c *redisClient) ReplaceChunk(ctx context.Context, userID, conversationID, 
 	}
 
 	err = withRedisTimeoutRetry(ctx, func() error {
-		const maxTransactionAttempts = 3
-		for attempt := 1; attempt <= maxTransactionAttempts; attempt++ {
-			txErr := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
-				items, rangeErr := tx.LRange(ctx, key, 0, -1).Result()
-				if rangeErr != nil {
-					return rangeErr
-				}
+		items, rangeErr := c.rdb.LRange(ctx, key, 0, -1).Result()
+		if rangeErr != nil {
+			return rangeErr
+		}
 
-				index := -1
-				for i := len(items) - 1; i >= 0; i-- {
-					var candidate struct {
-						ID string `json:"id"`
-					}
-					if json.Unmarshal([]byte(items[i]), &candidate) == nil && candidate.ID == chunkID {
-						index = i
-						break
-					}
-				}
-				if index < 0 {
-					return fmt.Errorf("%w: %s", ErrConversationChunkNotFound, chunkID)
-				}
-
-				_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-					pipe.LSet(ctx, key, int64(index), payload)
-					return nil
-				})
-				return pipeErr
-			}, key)
-			if !errors.Is(txErr, redis.TxFailedErr) {
-				return txErr
+		index := -1
+		for i := len(items) - 1; i >= 0; i-- {
+			var candidate struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal([]byte(items[i]), &candidate) == nil && candidate.ID == chunkID {
+				index = i
+				break
 			}
 		}
-		return redis.TxFailedErr
+		if index < 0 {
+			return fmt.Errorf("%w: %s", ErrConversationChunkNotFound, chunkID)
+		}
+		return c.rdb.LSet(ctx, key, int64(index), payload).Err()
 	})
 	if err != nil {
+		if errors.Is(err, ErrConversationChunkNotFound) {
+			return err
+		}
 		wrapped := fmt.Errorf("disha: redis replace chunk %s in %s failed: %w", chunkID, key, err)
 		sentryutil.Capture(sentryutil.Event{
 			Err:  wrapped,

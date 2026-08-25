@@ -600,7 +600,7 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	})
 	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "sales_call/main_sys-3day_v2_v17")
 
-	a.addUserMessage("hello")
+	a.commitUserMessage("hello")
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(users) != 1 || users[0] != "hello" {
@@ -624,8 +624,8 @@ func TestUserContextAggregator_ConsecutiveCommittedTurnsEmitCommitThenExtension(
 	})
 	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
-	a.addUserMessage("first")
-	a.addUserMessage("second")
+	a.commitUserMessage("first")
+	a.commitUserMessage("second")
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	wantEvents := []string{"committed:first", "extended:first second"}
@@ -635,6 +635,46 @@ func TestUserContextAggregator_ConsecutiveCommittedTurnsEmitCommitThenExtension(
 	messages := a.messagesForTest()
 	if len(messages) != 2 || messages[1].Role != "user" || messages[1].Content != "first second" {
 		t.Fatalf("LLM context = %+v, want one combined user message", messages)
+	}
+}
+
+func TestUserContextAggregator_DoesNotExtendPreloadedUserMessage(t *testing.T) {
+	tests := []struct {
+		name          string
+		preloadedText string
+	}{
+		{name: "fresh greeting seed", preloadedText: "hello?"},
+		{name: "resume instruction", preloadedText: "<system_message>resume the conversation</system_message>"},
+		{name: "replayed prior user turn", preloadedText: "my earlier answer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fix := newTestFixture(t)
+			var events []string
+			fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+				OnUserTurnCommitted: func(text string, _ time.Time, _ string) {
+					events = append(events, "committed:"+text)
+				},
+				OnUserTurnExtended: func(text string, _ time.Time, _ string) {
+					events = append(events, "extended:"+text)
+				},
+			})
+			a := NewUserContextAggregator(fix.TaskCtx, []Message{
+				{Role: "system", Content: "prompt"},
+				{Role: "user", Content: tt.preloadedText},
+			}, "")
+
+			a.commitUserMessage("live answer")
+			fix.TaskCtx.callEvents.stopAndDrain()
+
+			if len(events) != 1 || events[0] != "committed:live answer" {
+				t.Fatalf("user events = %+v, want committed live answer", events)
+			}
+			messages := a.messagesForTest()
+			if len(messages) != 3 || messages[1].Content != tt.preloadedText || messages[2].Role != "user" || messages[2].Content != "live answer" {
+				t.Fatalf("LLM context = %+v, want preloaded user message followed by separate live answer", messages)
+			}
+		})
 	}
 }
 
@@ -651,9 +691,9 @@ func TestUserContextAggregator_ToolInProgressMakesNextUserMessageNew(t *testing.
 	})
 	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
 
-	a.addUserMessage("first")
+	a.commitUserMessage("first")
 	a.addFunctionCallInProgress(NewFunctionCallInProgressFrame("get_guidance", "call-1", nil, `{}`, false))
-	a.addUserMessage("second")
+	a.commitUserMessage("second")
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	wantEvents := []string{"committed:first", "committed:second"}

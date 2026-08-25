@@ -14,6 +14,7 @@ var errEmptyInitialMessages = errors.New("voicepipelinecore: aggregator pair req
 type aggregatorSharedState struct {
 	mu                               sync.Mutex
 	messages                         []Message
+	liveUserMessageIndex             int
 	mainAgentSystemPromptLangfuseKey string
 }
 
@@ -39,6 +40,7 @@ func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, m
 	}
 	return &aggregatorSharedState{
 		messages:                         messages,
+		liveUserMessageIndex:             -1,
 		mainAgentSystemPromptLangfuseKey: mainAgentSystemPromptLangfuseKey,
 	}
 }

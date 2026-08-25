@@ -91,9 +91,10 @@ type CallEvents struct {
 	OnUserFirstSpeech func(time.Time)
 	OnBotFirstSpeech  func(time.Time)
 	OnFirstUserAudio  func(time.Time)
-	// OnUserTurnCommitted fires when the context aggregator appends a new user
-	// message. OnUserTurnExtended fires when it extends the existing trailing
-	// user message and receives that message's exact updated content.
+	// OnUserTurnCommitted fires when the context aggregator appends a new live
+	// user message. OnUserTurnExtended fires when it extends that same live
+	// message and receives its exact updated content. Preloaded user-role
+	// messages are never extension targets.
 	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
 	OnUserTurnExtended       func(text string, at time.Time, promptKey string)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)

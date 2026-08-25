@@ -2,6 +2,7 @@ package disha
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -281,6 +282,13 @@ func (c *CallEventCallbacks) replaceLastUserChunk(text string, at time.Time, pro
 	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
 	defer cancel()
 	if err := c.redis.ReplaceChunk(ctx, c.userID, c.conversationID, previous.ID, replacement); err != nil {
+		if errors.Is(err, ErrConversationChunkNotFound) {
+			if c.logger != nil {
+				c.logger.Printf("disha: chunk replace target missing; appending recovery chunk conversation=%s old_chunk=%s\n", c.conversationID, previous.ID)
+			}
+			c.lastUserChunk = c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
+			return
+		}
 		if c.logger != nil {
 			c.logger.Printf("disha: chunk replace failed conversation=%s role=user chunk=%s: %v\n", c.conversationID, previous.ID, err)
 		}

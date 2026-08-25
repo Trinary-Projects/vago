@@ -264,6 +264,78 @@ func TestCallEventCallbacksNewUserCommitNeverReplacesPreviousChunk(t *testing.T)
 	}
 }
 
+func TestCallEventCallbacksExtensionWithoutPersistedCommitAppends(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	events.OnUserTurnExtended("first second", time.Date(2026, 8, 24, 16, 19, 46, 0, time.UTC), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List recovery chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count = %d, want 1", len(items))
+	}
+	var chunk ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &chunk); err != nil {
+		t.Fatalf("Unmarshal recovery chunk: %v", err)
+	}
+	if chunk.Text != "first second" {
+		t.Fatalf("recovery text = %q, want full extension", chunk.Text)
+	}
+}
+
+func TestCallEventCallbacksMissingReplacementAppendsAndRecovers(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 8, 24, 16, 19, 46, 0, time.UTC)
+	events.OnUserTurnCommitted("first", at, "")
+	key := conversationChunksKey("user-1", "conv-1")
+	redisServer.Del(key)
+
+	events.OnUserTurnExtended("first second", at.Add(time.Second), "")
+	items, err := redisServer.List(key)
+	if err != nil {
+		t.Fatalf("List fallback chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("fallback chunk count = %d, want 1", len(items))
+	}
+	var fallback ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &fallback); err != nil {
+		t.Fatalf("Unmarshal fallback chunk: %v", err)
+	}
+	if fallback.Text != "first second" {
+		t.Fatalf("fallback text = %q, want full extension", fallback.Text)
+	}
+
+	events.OnUserTurnExtended("first second third", at.Add(2*time.Second), "")
+	items, err = redisServer.List(key)
+	if err != nil {
+		t.Fatalf("List replaced fallback chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("replaced fallback chunk count = %d, want 1", len(items))
+	}
+	var replaced ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &replaced); err != nil {
+		t.Fatalf("Unmarshal replaced fallback chunk: %v", err)
+	}
+	if replaced.ID != fallback.ID || replaced.Text != "first second third" {
+		t.Fatalf("replaced fallback chunk = %+v, want ID %s and complete text", replaced, fallback.ID)
+	}
+}
+
 // TestCallEventCallbacksConversationStateUploadEveryChunkRole verifies
 // debug-log chunks (AppendDebugLogChunk) and tool-context chunks
 // (OnToolResultCommitted) also get a conversation_state_s3_key — every
