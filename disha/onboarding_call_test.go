@@ -213,6 +213,7 @@ func TestOnboardingPromptCompilerMissingStagePrompt(t *testing.T) {
 
 func seedOnboardingConversation(t *testing.T, server *miniredis.Miniredis, conversationID string, variant *string) {
 	t.Helper()
+	edPeRXVariant := "test"
 	seedConversationData(t, server, conversationID, ConversationData{
 		Conversation: ConversationRow{
 			ID:          conversationID,
@@ -223,6 +224,7 @@ func seedOnboardingConversation(t *testing.T, server *miniredis.Miniredis, conve
 		UserProfile: UserProfileData{
 			UserID:                "user-ob",
 			OnboardingCallVariant: variant,
+			EDPeRXVariant:         &edPeRXVariant,
 			Gender:                "female",
 		},
 	})
@@ -272,7 +274,9 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 	if !ok {
 		t.Fatalf("system_prompt_variables = %#v, want DocumentVariables", pl.PromptMetadata["system_prompt_variables"])
 	}
-	if promptVars["gender"] != "female" || promptVars["patient_info"] != "Riya, age 32, wants better sleep" {
+	if promptVars["gender"] != "female" ||
+		promptVars["ed_pe_rx_variant"] != "test" ||
+		promptVars["patient_info"] != "Riya, age 32, wants better sleep" {
 		t.Fatalf("system_prompt_variables mismatch: %v", promptVars)
 	}
 	if _, ok := promptVars["analysis"]; ok {
