@@ -1,14 +1,17 @@
 package llmrouter
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1043,6 +1046,114 @@ func TestResponsesWebSocketCloseIsIdempotentAndStreamReturnsCancellation(t *test
 	}
 }
 
+func TestResponsesWebSocketDialLogsFirstConnectAndInsideTurnOffset(t *testing.T) {
+	server := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
+		sendResponsesText(t, conn, "resp-dial-log-first", "OK")
+	})
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const endpointKey = "responses_ws_dial_log_first_test"
+	installResponsesTestEndpoint(t, endpointKey, openAIResponsesTestEndpoint(server.server.URL))
+
+	var logBuf bytes.Buffer
+	client, err := NewResponsesWebSocket(Config{FixedEndpoint: endpointKey, Logger: log.New(&logBuf, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hi"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "Responses WebSocket dial connected") ||
+		!strings.Contains(logged, "dial_seq=1") ||
+		!strings.Contains(logged, "redial=false") ||
+		!strings.Contains(logged, "drop_reason=first") {
+		t.Fatalf("connected log missing expected first-dial fields: %q", logged)
+	}
+	if !strings.Contains(logged, "Responses WebSocket dial inside turn") || !strings.Contains(logged, "dial_seq=1") {
+		t.Fatalf("inside-turn log missing expected fields: %q", logged)
+	}
+	if !regexp.MustCompile(`connect_offset_ms=\d+(\.\d+)?`).MatchString(logged) {
+		t.Fatalf("inside-turn log missing well-formed connect_offset_ms: %q", logged)
+	}
+}
+
+func TestResponsesWebSocketDialLogsRedialReasonAfterCancellation(t *testing.T) {
+	silent := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, _ *websocket.Conn) {})
+	working := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
+		sendResponsesText(t, conn, "resp-dial-log-redial", "OK")
+	})
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		firstKey  = "responses_ws_dial_log_redial_first"
+		secondKey = "responses_ws_dial_log_redial_second"
+		groupKey  = "responses_ws_dial_log_redial_group"
+	)
+	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(silent.server.URL))
+	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(working.server.URL))
+	installResponsesTestGroup(t, groupKey, firstKey, secondKey)
+
+	var logBuf bytes.Buffer
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Logger: log.New(&logBuf, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if result, err := client.Stream(ctx, vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hang"}}}, func(string) {}); err == nil || !result.Interrupted {
+		t.Fatalf("silent result/error = %#v / %v, want interrupted timeout", result, err)
+	}
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "retry"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "dial_seq=2") || !strings.Contains(logged, "redial=true") || !strings.Contains(logged, "drop_reason=cancellation") {
+		t.Fatalf("redial log missing expected fields for cancellation drop: %q", logged)
+	}
+}
+
+func TestResponsesWebSocketDialLogsFailedAttemptsBeforeSuccess(t *testing.T) {
+	server := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
+		sendResponsesText(t, conn, "resp-dial-log-failed-attempt", "OK")
+	})
+	t.Setenv("RESPONSES_WS_TEST_MISSING_KEY", "")
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		firstKey  = "responses_ws_dial_log_failed_first"
+		secondKey = "responses_ws_dial_log_failed_second"
+		groupKey  = "responses_ws_dial_log_failed_group"
+	)
+	installResponsesTestEndpoint(t, firstKey, endpointConfig{
+		Provider: providerOpenAI, APIKeyEnv: "RESPONSES_WS_TEST_MISSING_KEY", BaseURL: server.server.URL + "/first/v1",
+	})
+	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(server.server.URL))
+	installResponsesTestGroup(t, groupKey, firstKey, secondKey)
+
+	var logBuf bytes.Buffer
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Logger: log.New(&logBuf, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hi"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "Responses WebSocket dial failed cfg="+firstKey) {
+		t.Fatalf("failed-attempt log missing for first candidate: %q", logged)
+	}
+	if !strings.Contains(logged, "Responses WebSocket dial connected") || !strings.Contains(logged, "failed_attempts=1") {
+		t.Fatalf("connected log missing failed_attempts=1: %q", logged)
+	}
+}
+
 // TestLiveGPT56LunaResponsesWebSocketClient is opt-in because it uses real
 // credentials and billable endpoints. It exercises the production client (not
 // the standalone wire probe), including a fresh-socket replay of tool history.
@@ -1090,7 +1201,7 @@ func TestLiveGPT56LunaResponsesWebSocketClient(t *testing.T) {
 	client.mu.Lock()
 	activeConn := client.conn
 	client.mu.Unlock()
-	client.dropConnection(activeConn, false)
+	client.dropConnection(activeConn, false, "test_forced_fresh_socket")
 	toolCall := first.ToolCalls[0]
 	continuedMessages := append(cloneRouterMessages(firstMessages),
 		vpc.Message{Role: "assistant", ToolCalls: []vpc.ToolCall{toolCall}},

@@ -50,6 +50,8 @@ type ResponsesWebSocketClient struct {
 	streamInterrupted bool
 	chain             responsesChainState
 	promptMetadata    map[string]any
+	dialSeq           int
+	lastDropReason    string
 }
 
 var _ Client = (*ResponsesWebSocketClient)(nil)
@@ -284,6 +286,9 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 		return res, dialErr
 	}
 	res.Model = endpoint.Model
+	if !reused {
+		c.logf("Responses WebSocket dial inside turn dial_seq=%d connect_offset_ms=%.1f", c.currentDialSeq(), msFromDuration(time.Since(started)))
+	}
 
 	retriedStaleSocket := false
 	retriedEvictedChain := false
@@ -306,7 +311,7 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 		// reconnect once and replay the canonical full history.
 		if err != nil && reused && !retriedStaleSocket && streamResult.TransportErr && !streamResult.SawResponse && !streamResult.SawOutput && ctx.Err() == nil && !c.wasStreamInterrupted() {
 			retriedStaleSocket = true
-			c.dropConnection(conn, false)
+			c.dropConnection(conn, false, "stale_socket")
 			conn, endpoint, reused, dialErr = c.ensureConnection(ctx)
 			servedConfig = endpoint
 			if dialErr != nil {
@@ -322,7 +327,7 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 		// be mistaken for the replacement request.
 		if err != nil && previous != "" && !retriedEvictedChain && !streamResult.SawOutput && streamResult.ErrorCode == "previous_response_not_found" && ctx.Err() == nil {
 			retriedEvictedChain = true
-			c.dropConnection(conn, false)
+			c.dropConnection(conn, false, "evicted_chain")
 			conn, endpoint, reused, dialErr = c.ensureConnection(ctx)
 			servedConfig = endpoint
 			if dialErr != nil {
@@ -343,7 +348,7 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 		// this endpoint produced nothing before cancellation, advance so that
 		// retry cannot loop forever on a silent candidate. A real barge-in has
 		// already observed text/tool output and reconnects to the same endpoint.
-		c.dropConnection(conn, !streamResult.SawOutput)
+		c.dropConnection(conn, !streamResult.SawOutput, "interrupted_turn")
 		if ctx.Err() != nil {
 			return res, ctx.Err()
 		}
@@ -356,7 +361,7 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 			return res, context.Canceled
 		}
 		if streamResult.TransportErr || responsesFailureIsRetryable(streamResult.StatusCode, streamResult.ErrorCode) {
-			c.dropConnection(conn, true)
+			c.dropConnection(conn, true, "retryable_error")
 		}
 		return res, err
 	}
@@ -423,6 +428,12 @@ func (c *ResponsesWebSocketClient) wasStreamInterrupted() bool {
 	return c.streamInterrupted
 }
 
+func (c *ResponsesWebSocketClient) currentDialSeq() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dialSeq
+}
+
 func (c *ResponsesWebSocketClient) ensureConnection(ctx context.Context) (*websocket.Conn, endpointConfig, bool, error) {
 	c.mu.Lock()
 	if c.closed {
@@ -438,10 +449,13 @@ func (c *ResponsesWebSocketClient) ensureConnection(ctx context.Context) (*webso
 	startIndex := c.nextIndex
 	c.mu.Unlock()
 
+	dialStart := time.Now()
+	failedAttempts := 0
 	var dialErrors []error
 	for offset := 0; offset < len(c.candidates); offset++ {
 		index := (startIndex + offset) % len(c.candidates)
 		endpoint := c.candidates[index]
+		attemptStart := time.Now()
 		dialCtx, cancel := context.WithTimeout(ctx, responsesWebSocketDialTimeout)
 		conn, err := dialResponsesWebSocket(dialCtx, endpoint)
 		cancel()
@@ -450,8 +464,9 @@ func (c *ResponsesWebSocketClient) ensureConnection(ctx context.Context) (*webso
 				c.setNextCandidate(index + 1)
 				return nil, endpoint, false, ctx.Err()
 			}
-			c.logf("connect failed cfg=%s: %v", endpoint.Key, err)
+			c.logf("Responses WebSocket dial failed cfg=%s attempt_ms=%.1f: %v", endpoint.Key, msFromDuration(time.Since(attemptStart)), err)
 			dialErrors = append(dialErrors, fmt.Errorf("%s: %w", endpoint.Key, err))
+			failedAttempts++
 			continue
 		}
 
@@ -469,8 +484,16 @@ func (c *ResponsesWebSocketClient) ensureConnection(ctx context.Context) (*webso
 		c.activeIndex = index
 		c.nextIndex = index
 		c.chain = responsesChainState{}
+		c.dialSeq++
+		dialSeq := c.dialSeq
+		dropReason := c.lastDropReason
+		c.lastDropReason = ""
 		c.mu.Unlock()
-		c.logf("connected cfg=%s model=%s", endpoint.Key, endpoint.Model)
+		if dropReason == "" {
+			dropReason = "first"
+		}
+		c.logf("Responses WebSocket dial connected dial_seq=%d redial=%t drop_reason=%s cfg=%s model=%s attempt_ms=%.1f total_dial_ms=%.1f failed_attempts=%d",
+			dialSeq, dialSeq > 1, dropReason, endpoint.Key, endpoint.Model, msFromDuration(time.Since(attemptStart)), msFromDuration(time.Since(dialStart)), failedAttempts)
 		return conn, endpoint, false, nil
 	}
 
@@ -478,7 +501,12 @@ func (c *ResponsesWebSocketClient) ensureConnection(ctx context.Context) (*webso
 	if len(c.candidates) > 0 {
 		c.nextIndex = (startIndex + 1) % len(c.candidates)
 	}
+	exhaustedDropReason := c.lastDropReason
 	c.mu.Unlock()
+	if exhaustedDropReason == "" {
+		exhaustedDropReason = "first"
+	}
+	c.logf("Responses WebSocket dial exhausted drop_reason=%s total_dial_ms=%.1f failed_attempts=%d", exhaustedDropReason, msFromDuration(time.Since(dialStart)), failedAttempts)
 	return nil, endpointConfig{}, false, fmt.Errorf("llmrouter: all Responses WebSocket endpoints failed: %w", errors.Join(dialErrors...))
 }
 
@@ -1100,6 +1128,7 @@ func (c *ResponsesWebSocketClient) dropConnectionForCancellation(expected *webso
 	c.conn = nil
 	c.activeIndex = -1
 	c.chain = responsesChainState{}
+	c.lastDropReason = "cancellation"
 	if activeIndex >= 0 {
 		c.nextIndex = activeIndex
 		if advance && len(c.candidates) > 1 {
@@ -1112,7 +1141,7 @@ func (c *ResponsesWebSocketClient) dropConnectionForCancellation(expected *webso
 	}
 }
 
-func (c *ResponsesWebSocketClient) dropConnection(expected *websocket.Conn, advance bool) {
+func (c *ResponsesWebSocketClient) dropConnection(expected *websocket.Conn, advance bool, reason string) {
 	c.mu.Lock()
 	if c.conn != expected {
 		c.mu.Unlock()
@@ -1123,6 +1152,7 @@ func (c *ResponsesWebSocketClient) dropConnection(expected *websocket.Conn, adva
 	c.conn = nil
 	c.activeIndex = -1
 	c.chain = responsesChainState{}
+	c.lastDropReason = reason
 	if advance && len(c.candidates) > 1 && activeIndex >= 0 {
 		c.nextIndex = (activeIndex + 1) % len(c.candidates)
 	} else if activeIndex >= 0 {
@@ -1151,6 +1181,7 @@ func (c *ResponsesWebSocketClient) Interrupt() {
 	advance := !c.streamSawOutput
 	c.conn = nil
 	c.activeIndex = -1
+	c.lastDropReason = "interrupt"
 	if activeIndex >= 0 {
 		c.nextIndex = activeIndex
 		if advance && len(c.candidates) > 1 {
