@@ -37,11 +37,13 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 			"system_prompt_version":   17,
 			"system_prompt_variables": DocumentVariables{"patient_info": "Riya"},
 		},
-		PromptTokens:     11,
-		CompletionTokens: 7,
-		StatusCode:       http.StatusOK,
-		Completed:        true,
-		FinishReason:     "stop",
+		PromptTokens:      11,
+		CompletionTokens:  7,
+		StatusCode:        http.StatusOK,
+		Completed:         true,
+		FinishReason:      "stop",
+		ResponseInputMode: "incremental",
+		ReasoningTokens:   0,
 	})
 
 	var got capturedAPIRequest
@@ -117,5 +119,11 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 	}
 	if got := responsePayload["finish_reason"]; got != "stop" {
 		t.Fatalf("response_payload[finish_reason] = %#v, want %q", got, "stop")
+	}
+	if got := responsePayload["response_input_mode"]; got != "incremental" {
+		t.Fatalf("response_payload[response_input_mode] = %#v, want incremental", got)
+	}
+	if got := responsePayload["reasoning_tokens"]; got != float64(0) {
+		t.Fatalf("response_payload[reasoning_tokens] = %#v, want 0", got)
 	}
 }
