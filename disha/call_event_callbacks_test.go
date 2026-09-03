@@ -142,6 +142,69 @@ func TestCallEventCallbacksConversationStateUploadOnCommittedTurns(t *testing.T)
 	}
 }
 
+func TestCallEventCallbacksRewritesConsecutiveUserChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        OnboardingCallBotType,
+	}, redisClient, nil, nil)
+
+	cfg := parseStudentTestConfig(t)
+	state := NewConversationState(cfg, "student_test")
+	uploader := &fakeJSONUploader{}
+	callbacks.SetChunkDecorator(newOnboardingChunkDecorator(state, uploader, "user-1", "conv-1", nil))
+
+	events := callbacks.Events()
+	firstAt := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("hello doctor", firstAt, "prompt-1")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List first chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after first turn = %d, want 1", len(items))
+	}
+	var first ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &first); err != nil {
+		t.Fatalf("Unmarshal first chunk: %v", err)
+	}
+
+	state.AdvanceStage(&cfg.CommonStages[0])
+	events.OnUserTurnCommitted("hello doctor I need help", firstAt.Add(time.Second), "prompt-2")
+
+	items, err = redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List rewritten chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after continuation = %d, want 1", len(items))
+	}
+	var rewritten ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &rewritten); err != nil {
+		t.Fatalf("Unmarshal rewritten chunk: %v", err)
+	}
+	if rewritten.ID != first.ID || rewritten.Created != first.Created {
+		t.Fatalf("rewritten identity = (%q, %q), want (%q, %q)", rewritten.ID, rewritten.Created, first.ID, first.Created)
+	}
+	if rewritten.Text != "hello doctor I need help" {
+		t.Fatalf("rewritten text = %q, want merged text", rewritten.Text)
+	}
+	if rewritten.CurrentAgenda == nil || *rewritten.CurrentAgenda != cfg.CommonStages[0].Name {
+		t.Fatalf("rewritten current agenda = %v, want %s", rewritten.CurrentAgenda, cfg.CommonStages[0].Name)
+	}
+	if rewritten.MainAgentSystemPromptLangfuseKey == nil || *rewritten.MainAgentSystemPromptLangfuseKey != "prompt-2" {
+		t.Fatalf("rewritten prompt key = %v, want prompt-2", rewritten.MainAgentSystemPromptLangfuseKey)
+	}
+	if uploader.callCount() != 2 {
+		t.Fatalf("upload call count = %d, want 2", uploader.callCount())
+	}
+	if uploader.calls[0].objectKey != uploader.calls[1].objectKey {
+		t.Fatalf("rewrite upload keys = %q and %q, want same chunk key", uploader.calls[0].objectKey, uploader.calls[1].objectKey)
+	}
+}
+
 // TestCallEventCallbacksConversationStateUploadEveryChunkRole verifies
 // debug-log chunks (AppendDebugLogChunk) and tool-context chunks
 // (OnToolResultCommitted) also get a conversation_state_s3_key — every
@@ -625,5 +688,207 @@ func TestCallEventCallbacksOnboardingPostCallNilProviderUnaffected(t *testing.T)
 		if !ok || value != nil {
 			t.Fatalf("%s = %v (present=%v), want explicit null", key, value, ok)
 		}
+	}
+}
+
+// TestCallEventCallbacksUserRewriteSkipsDebugChunkIndex verifies that an
+// intervening debug-log chunk (AppendDebugLogChunk, isDebugLog=true) never
+// becomes the rewrite target: it does not update lastChunk, so a
+// subsequent consecutive user turn still rewrites the earlier user chunk
+// in place rather than the debug chunk that was appended after it.
+func TestCallEventCallbacksUserRewriteSkipsDebugChunkIndex(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+	callbacks.AppendDebugLogChunk("debug note", at.Add(time.Second), "", nil)
+	events.OnUserTurnCommitted("a b", at.Add(2*time.Second), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List chunks: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("chunk count = %d, want 2", len(items))
+	}
+
+	var userChunk, debugChunk ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &userChunk); err != nil {
+		t.Fatalf("Unmarshal chunk 0: %v", err)
+	}
+	if err := json.Unmarshal([]byte(items[1]), &debugChunk); err != nil {
+		t.Fatalf("Unmarshal chunk 1: %v", err)
+	}
+
+	if userChunk.Role != "user" || userChunk.Text != "a b" {
+		t.Fatalf("chunk 0 = (role=%q, text=%q), want (user, %q)", userChunk.Role, userChunk.Text, "a b")
+	}
+	if !debugChunk.IsDebugLog || debugChunk.Text != "debug note" {
+		t.Fatalf("chunk 1 = (is_debug_log=%v, text=%q), want unchanged debug chunk", debugChunk.IsDebugLog, debugChunk.Text)
+	}
+}
+
+// TestCallEventCallbacksUserAfterAssistantAppendsNewChunk verifies a user
+// turn following an assistant turn always appends a fresh chunk rather
+// than rewriting, because lastChunk no longer points at a user-role chunk.
+func TestCallEventCallbacksUserAfterAssistantAppendsNewChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+	events.OnAssistantTurnCommitted("reply", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "")
+	events.OnUserTurnCommitted("b", at.Add(2*time.Second), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List chunks: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("chunk count = %d, want 3", len(items))
+	}
+
+	var chunks [3]ConversationChunk
+	for i, raw := range items {
+		if err := json.Unmarshal([]byte(raw), &chunks[i]); err != nil {
+			t.Fatalf("Unmarshal chunk %d: %v", i, err)
+		}
+	}
+
+	wantRoles := []string{"user", "assistant", "user"}
+	for i, want := range wantRoles {
+		if chunks[i].Role != want {
+			t.Fatalf("chunk %d role = %q, want %q", i, chunks[i].Role, want)
+		}
+	}
+	if chunks[2].Text != "b" {
+		t.Fatalf("chunk 2 text = %q, want %q", chunks[2].Text, "b")
+	}
+	if chunks[2].ID == chunks[0].ID || chunks[2].ID == chunks[1].ID {
+		t.Fatalf("chunk 2 id = %q, want distinct from chunks 0/1 (%q, %q)", chunks[2].ID, chunks[0].ID, chunks[1].ID)
+	}
+}
+
+// TestCallEventCallbacksUserAfterToolPairAppendsNewChunk verifies a user
+// turn following a tool-call/tool-result pair always appends a fresh
+// chunk, because lastChunk ends up pointing at the tool-role chunk, not a
+// user-role one.
+func TestCallEventCallbacksUserAfterToolPairAppendsNewChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+
+	assistantToolCall := voicepipelinecore.Message{
+		Role: "assistant",
+		ToolCalls: []voicepipelinecore.ToolCall{{
+			ID:   "call_1",
+			Type: "function",
+			Function: voicepipelinecore.ToolCallFunction{
+				Name:      "end_call",
+				Arguments: `{}`,
+			},
+		}},
+	}
+	toolResult := voicepipelinecore.Message{Role: "tool", Content: "ok", ToolCallID: "call_1"}
+	events.OnToolResultCommitted(assistantToolCall, toolResult, at.Add(time.Second))
+
+	events.OnUserTurnCommitted("b", at.Add(2*time.Second), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List chunks: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("chunk count = %d, want 4", len(items))
+	}
+
+	var chunks [4]ConversationChunk
+	for i, raw := range items {
+		if err := json.Unmarshal([]byte(raw), &chunks[i]); err != nil {
+			t.Fatalf("Unmarshal chunk %d: %v", i, err)
+		}
+	}
+
+	wantRoles := []string{"user", "assistant", "tool", "user"}
+	for i, want := range wantRoles {
+		if chunks[i].Role != want {
+			t.Fatalf("chunk %d role = %q, want %q", i, chunks[i].Role, want)
+		}
+	}
+	if chunks[3].Text != "b" {
+		t.Fatalf("chunk 3 text = %q, want %q", chunks[3].Text, "b")
+	}
+	for i := 0; i < 3; i++ {
+		if chunks[3].ID == chunks[i].ID {
+			t.Fatalf("chunk 3 id = %q, want distinct from chunk %d id", chunks[3].ID, i)
+		}
+	}
+}
+
+// TestCallEventCallbacksThirdConsecutiveUserRewritesAgain verifies the
+// rewrite path is not a one-shot: a third consecutive user turn rewrites
+// the same chunk that the second turn already rewrote, keeping exactly
+// one chunk with the original id.
+func TestCallEventCallbacksThirdConsecutiveUserRewritesAgain(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List first chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after first turn = %d, want 1", len(items))
+	}
+	var first ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &first); err != nil {
+		t.Fatalf("Unmarshal first chunk: %v", err)
+	}
+
+	events.OnUserTurnCommitted("a b", at.Add(time.Second), "")
+	events.OnUserTurnCommitted("a b c", at.Add(2*time.Second), "")
+
+	items, err = redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List final chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after third turn = %d, want 1", len(items))
+	}
+	var final ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &final); err != nil {
+		t.Fatalf("Unmarshal final chunk: %v", err)
+	}
+	if final.ID != first.ID {
+		t.Fatalf("final id = %q, want original id %q", final.ID, first.ID)
+	}
+	if final.Text != "a b c" {
+		t.Fatalf("final text = %q, want %q", final.Text, "a b c")
 	}
 }

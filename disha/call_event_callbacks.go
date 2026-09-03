@@ -15,6 +15,14 @@ const (
 	chunkWriteTimeout       = 5 * time.Second
 )
 
+type lastPersistedChunk struct {
+	role    string
+	id      string
+	created string
+	index   int64
+	valid   bool
+}
+
 type CallEventCallbacks struct {
 	redis            RedisClient
 	api              *APIClient
@@ -24,6 +32,11 @@ type CallEventCallbacks struct {
 	conversationID string
 	userID         string
 	botType        string
+
+	// lastChunk is read and written only by CallEvents.On* methods on the
+	// dispatcher's single FIFO goroutine, so it needs no locking. Direct
+	// AppendDebugLogChunk calls never read or update it.
+	lastChunk lastPersistedChunk
 
 	// llmCallCompleted receives each finished LLM generation (Python's
 	// OnboardingPipelineManager.on_llm_call_complete delegating to the
@@ -156,6 +169,10 @@ func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
 
 func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string) {
+	if c.lastChunk.valid && c.lastChunk.role == "user" {
+		c.rewriteLastUserChunk(text, at, promptKey)
+		return
+	}
 	c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
 }
 
@@ -227,12 +244,39 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 	if c == nil || c.redis == nil {
 		return
 	}
+	chunk := c.buildChunk(text, role, at, metrics, promptKey, additionalData, isDebugLog, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
+	defer cancel()
+	index, err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, *chunk)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
+		}
+		return
+	}
+	if !isDebugLog {
+		c.lastChunk = lastPersistedChunk{
+			role:    chunk.Role,
+			id:      chunk.ID,
+			created: chunk.Created,
+			index:   index,
+			valid:   true,
+		}
+	}
+}
+
+func (c *CallEventCallbacks) buildChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool, chunkID, created string) *ConversationChunk {
 	var promptKeyPtr *string
 	if promptKey != "" {
 		promptKeyPtr = &promptKey
 	}
-	chunkID := uuid.NewString()
-	chunk := ConversationChunk{
+	if chunkID == "" {
+		chunkID = uuid.NewString()
+	}
+	if created == "" {
+		created = at.Format(time.RFC3339Nano)
+	}
+	chunk := &ConversationChunk{
 		ID:                               chunkID,
 		Text:                             text,
 		Role:                             role,
@@ -243,18 +287,36 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 		TTSTTFBMs:                        assistantMetricSeconds(role, metrics.TTSTTFBMs),
 		V2VLatencyMs:                     assistantMetricSeconds(role, metrics.E2ELatencyMs),
 		TextAggregationMs:                assistantMetricSeconds(role, metrics.TTSTextAggregationMs),
-		Created:                          at.Format(time.RFC3339Nano),
+		Created:                          created,
 		IsDebugLog:                       isDebugLog,
 		AdditionalData:                   additionalData,
 		MainAgentSystemPromptLangfuseKey: promptKeyPtr,
 	}
 	if c.chunkDecorator != nil {
-		c.chunkDecorator(&chunk)
+		c.chunkDecorator(chunk)
 	}
+	return chunk
+}
+
+func (c *CallEventCallbacks) rewriteLastUserChunk(text string, at time.Time, promptKey string) {
+	if c == nil || c.redis == nil {
+		return
+	}
+	chunk := c.buildChunk(
+		text,
+		"user",
+		at,
+		voicepipelinecore.TurnMetrics{},
+		promptKey,
+		nil,
+		false,
+		c.lastChunk.id,
+		c.lastChunk.created,
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
 	defer cancel()
-	if err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, chunk); err != nil && c.logger != nil {
-		c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
+	if err := c.redis.SetChunk(ctx, c.userID, c.conversationID, c.lastChunk.index, *chunk); err != nil && c.logger != nil {
+		c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, chunk.Role, err)
 	}
 }
 

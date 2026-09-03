@@ -29,7 +29,8 @@ type RedisClient interface {
 	MGetCache(ctx context.Context, keys ...string) ([][]byte, error)
 	SetCache(ctx context.Context, key string, value any, expiration time.Duration) error
 	AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
-	AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) error
+	AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) (int64, error)
+	SetChunk(ctx context.Context, userID, conversationID string, index int64, chunk ConversationChunk) error
 	Close() error
 }
 
@@ -226,7 +227,43 @@ func (c *redisClient) SetCache(ctx context.Context, key string, value any, expir
 	return nil
 }
 
-func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) error {
+func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) (int64, error) {
+	key := conversationChunksKey(userID, conversationID)
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		wrapped := fmt.Errorf("disha: chunk marshal failed: %w", err)
+		sentryutil.Capture(sentryutil.Event{
+			Err:  wrapped,
+			Tags: map[string]string{"component": "disha_redis", "operation": "MARSHAL"},
+			Details: map[string]any{
+				"key": key,
+			},
+		})
+		return 0, wrapped
+	}
+	var length int64
+	if err := withRedisTimeoutRetry(ctx, func() error {
+		var err error
+		length, err = c.rdb.RPush(ctx, key, payload).Result()
+		return err
+	}); err != nil {
+		wrapped := fmt.Errorf("disha: redis RPUSH %s failed: %w", key, err)
+		sentryutil.Capture(sentryutil.Event{
+			Err:  wrapped,
+			Tags: map[string]string{"component": "disha_redis", "operation": "RPUSH"},
+			Details: map[string]any{
+				"key": key,
+			},
+		})
+		return 0, wrapped
+	}
+	if c.logger != nil {
+		c.logger.Printf("Appended chunk %s to Redis conversation %s\n", chunk.ID, conversationID)
+	}
+	return length - 1, nil
+}
+
+func (c *redisClient) SetChunk(ctx context.Context, userID, conversationID string, index int64, chunk ConversationChunk) error {
 	key := conversationChunksKey(userID, conversationID)
 	payload, err := json.Marshal(chunk)
 	if err != nil {
@@ -241,12 +278,12 @@ func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID st
 		return wrapped
 	}
 	if err := withRedisTimeoutRetry(ctx, func() error {
-		return c.rdb.RPush(ctx, key, payload).Err()
+		return c.rdb.LSet(ctx, key, index, payload).Err()
 	}); err != nil {
-		wrapped := fmt.Errorf("disha: redis RPUSH %s failed: %w", key, err)
+		wrapped := fmt.Errorf("disha: redis LSET %s failed: %w", key, err)
 		sentryutil.Capture(sentryutil.Event{
 			Err:  wrapped,
-			Tags: map[string]string{"component": "disha_redis", "operation": "RPUSH"},
+			Tags: map[string]string{"component": "disha_redis", "operation": "LSET"},
 			Details: map[string]any{
 				"key": key,
 			},
@@ -254,7 +291,7 @@ func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID st
 		return wrapped
 	}
 	if c.logger != nil {
-		c.logger.Printf("Appended chunk %s to Redis conversation %s\n", chunk.ID, conversationID)
+		c.logger.Printf("Set chunk %s in Redis conversation %s at index %d\n", chunk.ID, conversationID, index)
 	}
 	return nil
 }
