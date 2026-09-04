@@ -1,9 +1,10 @@
 // Package llmrouter is the live-call LLM resilience layer for the voice
 // pipeline. It selects the fastest healthy endpoint within a model group
 // (using endpoint health written to Redis by Disha's Python poller),
-// speaks to every provider in OpenAI Chat-Completions format over plain
-// HTTP (no provider SDKs), blacklists endpoints that error during a live
-// call, and triggers a re-poll when an endpoint errors or is slow.
+// speaks to ordinary providers in OpenAI Chat-Completions format over plain
+// HTTP and to designated OpenAI/Azure groups through the Responses WebSocket
+// API (no provider SDKs). Health-ranked HTTP groups retain blacklist/re-poll
+// behavior; ordered WebSocket groups retain a call-scoped persistent socket.
 //
 // It implements voicepipelinecore.LLMClient structurally (the Stream
 // method) without importing voicepipelinecore, so the core pipeline
@@ -31,6 +32,17 @@ const (
 	providerCerebras       provider = "cerebras"
 )
 
+// apiMode identifies the provider API/transport an endpoint requires. The
+// zero value remains Chat Completions so existing endpoint declarations stay
+// unchanged. NewClient dispatches Responses WebSocket endpoints to the
+// dedicated persistent-socket client.
+type apiMode string
+
+const (
+	apiModeChatCompletions    apiMode = ""
+	apiModeResponsesWebSocket apiMode = "responses_websocket"
+)
+
 // endpointConfig is one selectable LLM endpoint. The Key must match the
 // Python OpenAIModels enum value because it forms the Redis health key
 // (live_call_modal_health:{Key}) the Python poller writes.
@@ -40,6 +52,12 @@ type endpointConfig struct {
 	Model     string
 	Region    string
 	APIKeyEnv string // env var holding the API key (Bearer / azure api-key)
+	APIMode   apiMode
+
+	// ReasoningEffort is used by Responses clients, where reasoning lives
+	// under the top-level reasoning object rather than Chat Completions'
+	// provider-specific extra body.
+	ReasoningEffort string
 
 	// EndpointEnv holds the OpenAI-compatible base URL for grok/azure
 	// endpoints (e.g. https://<resource>.openai.azure.com/openai/v1).
@@ -85,6 +103,12 @@ const (
 	gpt41Model = "gpt-4.1"
 )
 
+// GroupGPT56LunaNonReasoning mirrors Disha's
+// LLMFailoverConfigName.gpt_5_6_luna_non_reasoning target set. It is exported
+// for the Responses WebSocket client; the Chat-Completions-only New
+// constructor intentionally rejects it while NewClient dispatches it.
+const GroupGPT56LunaNonReasoning = "gpt-5.6-luna-non-reasoning"
+
 // EndpointOpenRouterGemini25FlashLite is the fixed-endpoint config key for
 // the onboarding stage-transition tracker's one-shot classifier (used via
 // Config.FixedEndpoint, never in a health-selected group).
@@ -93,9 +117,45 @@ const EndpointOpenRouterGemini25FlashLite = "openrouter_gemini_2_5_flash_lite"
 func floatPtr(v float64) *float64 { return &v }
 func intPtr(v int) *int           { return &v }
 
-// endpointConfigs is the Go port of OPEN_AI_MODEL_CONFIG, scoped to the
-// configs reachable from the sales model group and its gpt-4.1 fallback.
+// endpointConfigs is the Go port of Disha's provider target registry, scoped
+// to endpoints needed by Vago's live-call and one-shot clients.
 var endpointConfigs = map[string]endpointConfig{
+	// --- GPT-5.6 Luna, Responses WebSocket, reasoning disabled ---
+	// Target names, deployment names, and environment variables mirror
+	// disha-backend/services/llm_target.py. The first three Azure endpoints
+	// already include /openai/v1 in their configured base URL; North Central
+	// is a resource root and the Responses client will normalize both shapes.
+	"azure_gpt_5_6_luna_non_reasoning_eastus": {
+		Key: "azure_gpt_5_6_luna_non_reasoning_eastus", Provider: providerAzure,
+		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_EAST_API_KEY", EndpointEnv: "GROK_US_EAST_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_5_6_luna_non_reasoning_eastus2": {
+		Key: "azure_gpt_5_6_luna_non_reasoning_eastus2", Provider: providerAzure,
+		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_EAST_2_API_KEY", EndpointEnv: "GROK_US_EAST_2_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_5_6_luna_non_reasoning_westus": {
+		Key: "azure_gpt_5_6_luna_non_reasoning_westus", Provider: providerAzure,
+		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_WEST_API_KEY", EndpointEnv: "GROK_US_WEST_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_5_6_luna_non_reasoning_northcentralus": {
+		Key: "azure_gpt_5_6_luna_non_reasoning_northcentralus", Provider: providerAzure,
+		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "AZURE_OPENAI_US_NORTH_CENTRAL_API_KEY", EndpointEnv: "AZURE_OPENAI_US_NORTH_CENTRAL_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"openai_gpt_5_6_luna_non_reasoning": {
+		Key: "openai_gpt_5_6_luna_non_reasoning", Provider: providerOpenAI,
+		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "OPENAI_API_KEY", BaseURL: "https://api.openai.com/v1",
+		ReasoningEffort: "none",
+	},
+
 	// --- grok-4.1-fast-non-reasoning, Azure-hosted (OpenAI-compatible) ---
 	"grok_4_1_fnr_eastus": {
 		Key: "grok_4_1_fnr_eastus", Provider: providerGrok, Model: grokModel, Region: "us",
@@ -320,6 +380,25 @@ var hedgedPairs = map[string]hedgedPair{
 	GroupGPTOSS120FastHedged: {
 		Primary: "cerebras_gpt_oss_120b",
 		Hedge:   "openrouter_gpt_oss_120b_throughput",
+	},
+}
+
+// responsesWebSocketGroups holds ordered endpoint candidates for persistent
+// Responses WebSocket clients. These are deliberately separate from
+// modelGroups: modelGroups is health-ranked from Python poller Redis keys,
+// while Disha's Luna configuration is an ordered LLMFailoverService list and
+// is not registered with that poller. ResponsesWebSocketClient retains this
+// Azure-first order for connection attempts.
+var responsesWebSocketGroups = map[string]modelGroup{
+	GroupGPT56LunaNonReasoning: {
+		Configs: []string{
+			"azure_gpt_5_6_luna_non_reasoning_eastus",
+			"azure_gpt_5_6_luna_non_reasoning_eastus2",
+			"azure_gpt_5_6_luna_non_reasoning_westus",
+			"azure_gpt_5_6_luna_non_reasoning_northcentralus",
+			"openai_gpt_5_6_luna_non_reasoning",
+		},
+		Fallback: "openai_gpt_5_6_luna_non_reasoning",
 	},
 }
 

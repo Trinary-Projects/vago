@@ -242,7 +242,7 @@ func registerSalesTools(llm *voicepipelinecore.LLMProcessor, task *voicepipeline
 func newSalesLLMClient(deps Deps, pl *salesCallPlan) (voicepipelinecore.LLMClient, error) {
 	startup := pl.Startup
 	logger := startup.Logger
-	router, err := llmrouter.New(llmrouter.Config{
+	router, err := llmrouter.NewClient(llmrouter.Config{
 		Group:          salesModelGroup,
 		Region:         "us",
 		Redis:          deps.Redis,
