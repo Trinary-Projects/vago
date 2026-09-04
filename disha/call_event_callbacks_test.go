@@ -821,3 +821,119 @@ func TestCallEventCallbacksOnboardingPostCallNilProviderUnaffected(t *testing.T)
 		}
 	}
 }
+
+// TestCallEventCallbacksUserAfterToolPairAppendsNewChunk verifies a user
+// turn committed after a tool-call/tool-result pair appends a fresh chunk
+// alongside the persisted tool pair. Adapted from PR #41; under the
+// aggregator-owned design the core decides this (it emits
+// OnUserTurnCommitted, not OnUserTurnExtended), so the assertion here is
+// that the persistence layer appends and leaves the tool pair intact.
+func TestCallEventCallbacksUserAfterToolPairAppendsNewChunk(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+
+	assistantToolCall := voicepipelinecore.Message{
+		Role: "assistant",
+		ToolCalls: []voicepipelinecore.ToolCall{{
+			ID:   "call_1",
+			Type: "function",
+			Function: voicepipelinecore.ToolCallFunction{
+				Name:      "end_call",
+				Arguments: `{}`,
+			},
+		}},
+	}
+	toolResult := voicepipelinecore.Message{Role: "tool", Content: "ok", ToolCallID: "call_1"}
+	events.OnToolResultCommitted(assistantToolCall, toolResult, at.Add(time.Second))
+
+	events.OnUserTurnCommitted("b", at.Add(2*time.Second), "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List chunks: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("chunk count = %d, want 4", len(items))
+	}
+
+	var chunks [4]ConversationChunk
+	for i, raw := range items {
+		if err := json.Unmarshal([]byte(raw), &chunks[i]); err != nil {
+			t.Fatalf("Unmarshal chunk %d: %v", i, err)
+		}
+	}
+
+	wantRoles := []string{"user", "assistant", "tool", "user"}
+	for i, want := range wantRoles {
+		if chunks[i].Role != want {
+			t.Fatalf("chunk %d role = %q, want %q", i, chunks[i].Role, want)
+		}
+	}
+	if chunks[3].Text != "b" {
+		t.Fatalf("chunk 3 text = %q, want %q", chunks[3].Text, "b")
+	}
+	for i := 0; i < 3; i++ {
+		if chunks[3].ID == chunks[i].ID {
+			t.Fatalf("chunk 3 id = %q, want distinct from chunk %d id", chunks[3].ID, i)
+		}
+	}
+}
+
+// TestCallEventCallbacksThirdConsecutiveExtensionReplacesAgain verifies the
+// replace path is not a one-shot: a third consecutive live utterance
+// extends the same chunk the second one already replaced, keeping exactly
+// one chunk with the original id and created timestamp. Adapted from PR
+// #41's rewrite-again test onto the commit/extend event pair.
+func TestCallEventCallbacksThirdConsecutiveExtensionReplacesAgain(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+	}, redisClient, nil, nil)
+
+	events := callbacks.Events()
+	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events.OnUserTurnCommitted("a", at, "")
+
+	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List first chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after first turn = %d, want 1", len(items))
+	}
+	var first ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &first); err != nil {
+		t.Fatalf("Unmarshal first chunk: %v", err)
+	}
+
+	events.OnUserTurnExtended("a b", at.Add(time.Second), "")
+	events.OnUserTurnExtended("a b c", at.Add(2*time.Second), "")
+
+	items, err = redisServer.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List final chunk: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("chunk count after third turn = %d, want 1", len(items))
+	}
+	var final ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &final); err != nil {
+		t.Fatalf("Unmarshal final chunk: %v", err)
+	}
+	if final.ID != first.ID || final.Created != first.Created {
+		t.Fatalf("final identity = (%q, %q), want (%q, %q)", final.ID, final.Created, first.ID, first.Created)
+	}
+	if final.Text != "a b c" {
+		t.Fatalf("final text = %q, want %q", final.Text, "a b c")
+	}
+}

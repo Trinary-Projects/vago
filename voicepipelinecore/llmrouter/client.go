@@ -87,6 +87,36 @@ type Router struct {
 	promptMetadata map[string]any
 }
 
+// Client is the common live-call client surface. Both the existing
+// Chat-Completions Router and the persistent Responses WebSocket client
+// implement it, including the prompt-metadata refresh used by onboarding and
+// protocol retrieval.
+type Client interface {
+	vpc.LLMClient
+	SetPromptMetadata(map[string]any)
+}
+
+// NewClient selects the transport declared by the model group. Existing
+// Chat-Completions groups still build Router; Responses WebSocket groups build
+// the dedicated persistent client. Call-bot constructors use this factory so
+// moving a bot to a WebSocket group is a config change rather than a second
+// wiring path.
+func NewClient(cfg Config) (Client, error) {
+	if configUsesResponsesWebSocket(cfg) {
+		return NewResponsesWebSocket(cfg)
+	}
+	return New(cfg)
+}
+
+func configUsesResponsesWebSocket(cfg Config) bool {
+	if cfg.FixedEndpoint != "" {
+		endpoint, ok := endpointConfigs[cfg.FixedEndpoint]
+		return ok && endpoint.APIMode == apiModeResponsesWebSocket
+	}
+	_, ok := responsesWebSocketGroups[cfg.Group]
+	return ok
+}
+
 // New builds a Router for the given model group. The poll-trigger URL is
 // read from the environment; the Vertex token source is process-wide and
 // lazily loads its key from S3 on first use, so an absent/bad Vertex key
@@ -97,15 +127,28 @@ func New(cfg Config) (*Router, error) {
 		return nil, errors.New("llmrouter: Config.Redis is required")
 	}
 	if cfg.FixedEndpoint != "" {
-		if _, ok := endpointConfigs[cfg.FixedEndpoint]; !ok {
+		endpoint, ok := endpointConfigs[cfg.FixedEndpoint]
+		if !ok {
 			return nil, fmt.Errorf("llmrouter: unknown fixed endpoint %q", cfg.FixedEndpoint)
+		}
+		if endpoint.APIMode == apiModeResponsesWebSocket {
+			return nil, fmt.Errorf("llmrouter: endpoint %q requires the Responses WebSocket client", cfg.FixedEndpoint)
 		}
 	} else {
 		if cfg.Group == "" {
 			return nil, errors.New("llmrouter: Config.Group is required")
 		}
-		if _, ok := modelGroups[cfg.Group]; !ok {
+		if _, ok := responsesWebSocketGroups[cfg.Group]; ok {
+			return nil, fmt.Errorf("llmrouter: model group %q requires the Responses WebSocket client", cfg.Group)
+		}
+		group, ok := modelGroups[cfg.Group]
+		if !ok {
 			return nil, fmt.Errorf("llmrouter: unknown model group %q", cfg.Group)
+		}
+		for _, key := range group.Configs {
+			if endpointConfigs[key].APIMode == apiModeResponsesWebSocket {
+				return nil, fmt.Errorf("llmrouter: model group %q requires the Responses WebSocket client", cfg.Group)
+			}
 		}
 	}
 	httpClient := cfg.HTTPClient

@@ -424,7 +424,7 @@ func downloadCompiledCallFlow(ctx context.Context, s3 S3GetClient, key string) (
 }
 
 func newFollowUpLLMClient(deps Deps, pl *followUpPlan) (voicepipelinecore.LLMClient, error) {
-	return llmrouter.New(llmrouter.Config{
+	return llmrouter.NewClient(llmrouter.Config{
 		Group:          pl.ModelGroup,
 		Region:         "us",
 		Redis:          deps.Redis,
