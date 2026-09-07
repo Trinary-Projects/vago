@@ -73,6 +73,10 @@ type ttsCommand struct {
 // override it.
 var ttsDialURL = "wss://api.cartesia.ai/tts/websocket?cartesia_version=2025-04-16&api_key="
 
+// defaultCartesiaModelID is used when the caller passes an empty modelID,
+// matching the pre-A/B-test Cartesia model.
+const defaultCartesiaModelID = "sonic-3"
+
 // ttsPendingEndTimeout bounds how long the orchestrator will hold a
 // deferred EndFrame waiting for Cartesia's "done" event before giving
 // up and forwarding it anyway. Exposed as a package variable so tests
@@ -112,6 +116,7 @@ type TTSProcessor struct {
 	taskCtx  *TaskContext
 	metrics  *ProcessorMetrics
 	phonetic *phoneticFilter
+	modelID  string
 
 	outputSampleRate int
 
@@ -184,11 +189,18 @@ type CartesiaTTSDoneMessage struct {
 // only thing the caller supplies for pronunciation rewriting — the
 // filter itself is built and owned here, so the dictionary never has to
 // live on the shared TaskContext. A nil/empty dict means no filtering.
-func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string) *TTSProcessor {
+// modelID selects the Cartesia model (e.g. for the call_tts_variant_flag
+// A/B test); an empty string falls back to defaultCartesiaModelID. Voice
+// id, language, and output format are unaffected by this parameter.
+func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string, modelID string) *TTSProcessor {
+	if modelID == "" {
+		modelID = defaultCartesiaModelID
+	}
 	t := &TTSProcessor{
 		taskCtx:              taskCtx,
 		metrics:              NewProcessorMetrics("tts"),
 		phonetic:             newPhoneticFilter(phoneticDict),
+		modelID:              modelID,
 		outputSampleRate:     outputSampleRateFromRoom(taskCtx),
 		commands:             make(chan ttsCommand, 100),
 		ttsEvents:            make(chan ttsEvent, 100),
@@ -632,7 +644,7 @@ func (t *TTSProcessor) sendTextToTTS(text string) bool {
 		}
 	}
 	payload := map[string]interface{}{
-		"model_id":       "sonic-3",
+		"model_id":       t.modelID,
 		"transcript":     speakable,
 		"voice":          map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format":  map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
@@ -656,7 +668,7 @@ func (t *TTSProcessor) ResetTTSContext() bool {
 		return false
 	}
 	payload := map[string]interface{}{
-		"model_id":      "sonic-3",
+		"model_id":      t.modelID,
 		"transcript":    "",
 		"voice":         map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format": map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
@@ -816,7 +828,7 @@ func (t *TTSProcessor) connect() bool {
 		conn, _, err := websocket.DefaultDialer.Dial(ttsDialURL+os.Getenv("CARTESIA_API_KEY"), nil)
 		if err == nil {
 			t.websocketConn = conn
-			t.taskCtx.Logger.Println("TTS websocket connected")
+			t.taskCtx.Logger.Printf("TTS websocket connected model_id=%s\n", t.modelID)
 			return true
 		}
 		t.taskCtx.Logger.Printf("TTS connect failed: %v, retrying in 1s...", err)

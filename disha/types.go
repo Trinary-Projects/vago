@@ -33,6 +33,7 @@ type UserProfileData struct {
 	Phone                             string         `json:"phone"`
 	RemainingSalesCallTalktimeSeconds *float64       `json:"remaining_sales_call_talktime_seconds"`
 	CampaignPricingExperimentFlag     *string        `json:"campaign_pricing_experiment_flag"`
+	CallTTSVariantFlag                *string        `json:"call_tts_variant_flag"`
 	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
 	OnboardingCallVariant             *string        `json:"onboarding_call_variant"`
 	EDPeRXVariant                     *string        `json:"ed_pe_rx_variant"`

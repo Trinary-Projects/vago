@@ -443,7 +443,7 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
-	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
+	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict, resolveCartesiaModel(pl.Startup.Data.UserProfile.CallTTSVariantFlag, taskCtx.Logger))
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 

@@ -220,7 +220,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	registerFollowUpTools(llm, task, deps, pl)
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
-	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
+	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict, resolveCartesiaModel(pl.Startup.Data.UserProfile.CallTTSVariantFlag, taskCtx.Logger))
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 

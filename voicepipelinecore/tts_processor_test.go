@@ -30,7 +30,7 @@ import (
 // completes without timing out.
 func TestTTS_ForwardsEndFrameWhenIdle(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	// Don't actually send EndFrame through the helper — that would wait
 	// on the orchestrator's command channel forever. Instead, just run
@@ -52,7 +52,7 @@ func TestTTS_ForwardsEndFrameWhenIdle(t *testing.T) {
 // playback even if the orchestrator is busy.
 func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -78,7 +78,7 @@ func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
 // orchestrator.
 func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -114,7 +114,7 @@ func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 
 func TestTTS_CloseConnectionKeepsUpstreamPassThroughAlive(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -372,7 +372,13 @@ func stopTTSTestAndWait(t *testing.T, fix *testFixture, fs *fakeCartesiaServer, 
 // (mirroring the manual-wiring pattern used by the interrupt/pass-
 // through tests above) and starts all three.
 func newTTSPipelineForTest(fix *testFixture) (source, sink *QueueProcessor, p *TTSProcessor) {
-	p = NewTTSProcessor(fix.TaskCtx, nil)
+	return newTTSPipelineForTestWithModel(fix, "")
+}
+
+// newTTSPipelineForTestWithModel is newTTSPipelineForTest with an explicit
+// modelID, for tests asserting on the Cartesia model_id sent on the wire.
+func newTTSPipelineForTestWithModel(fix *testFixture, modelID string) (source, sink *QueueProcessor, p *TTSProcessor) {
+	p = NewTTSProcessor(fix.TaskCtx, nil, modelID)
 	source = newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink = newQueueProcessor(fix.TaskCtx, "sink", Downstream)
 	source.Link(p)
@@ -381,6 +387,103 @@ func newTTSPipelineForTest(fix *testFixture) (source, sink *QueueProcessor, p *T
 	p.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 	return source, sink, p
+}
+
+// readInboundUntil drains fc.inbound until a message matching pred arrives,
+// returning that message. Used to inspect specific Cartesia-bound payloads
+// (e.g. the initial generation vs. the continue:false reset) rather than
+// just the context id waitForContinueFalse returns.
+func readInboundUntil(t *testing.T, fc *fakeCartesiaConn, timeout time.Duration, pred func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case msg, ok := <-fc.inbound:
+			if !ok {
+				t.Fatalf("readInboundUntil: connection closed before a matching message arrived")
+			}
+			if pred(msg) {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("readInboundUntil: timed out waiting for a matching message")
+		}
+	}
+}
+
+// TestTTS_SendsConfiguredModelID verifies that a processor constructed with
+// an explicit Cartesia model id sends it in both the initial generation
+// payload (continue:true) and the reset payload (continue:false) — the two
+// call sites in sendTextToTTS/ResetTTSContext that used to hardcode
+// "sonic-3".
+func TestTTS_SendsConfiguredModelID(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTestWithModel(fix, "sonic-3.5")
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+
+	genMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && cont
+	})
+	if got, _ := genMsg["model_id"].(string); got != "sonic-3.5" {
+		t.Errorf("generation payload model_id = %q, want sonic-3.5", got)
+	}
+
+	resetMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && !cont
+	})
+	if got, _ := resetMsg["model_id"].(string); got != "sonic-3.5" {
+		t.Errorf("reset payload model_id = %q, want sonic-3.5", got)
+	}
+	contextID, _ := resetMsg["context_id"].(string)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
+}
+
+// TestTTS_EmptyModelIDDefaultsToSonic3 verifies that an empty modelID falls
+// back to the pre-A/B-test default "sonic-3" in both payload sites.
+func TestTTS_EmptyModelIDDefaultsToSonic3(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTestWithModel(fix, "")
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+
+	genMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && cont
+	})
+	if got, _ := genMsg["model_id"].(string); got != "sonic-3" {
+		t.Errorf("generation payload model_id = %q, want sonic-3", got)
+	}
+
+	resetMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && !cont
+	})
+	if got, _ := resetMsg["model_id"].(string); got != "sonic-3" {
+		t.Errorf("reset payload model_id = %q, want sonic-3", got)
+	}
+	contextID, _ := resetMsg["context_id"].(string)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
 }
 
 // TestTTS_PendingEndForwardsAfterCartesiaDone is the baseline happy
@@ -505,7 +608,7 @@ func TestTTS_InvalidContextIDErrorRemainsSuppressed(t *testing.T) {
 }
 
 func TestTTS_ProviderErrorRateLimitResetsAfterWindow(t *testing.T) {
-	p := NewTTSProcessor(newTestFixture(t).TaskCtx, nil)
+	p := NewTTSProcessor(newTestFixture(t).TaskCtx, nil, "")
 	startedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < ttsProviderErrorReportLimit; i++ {

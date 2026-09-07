@@ -27,7 +27,7 @@ func (r *testOutputRoom) perfDiagnosticsEnabled() bool            { return false
 func TestTTSUsesRoomOutputSampleRateForFrames(t *testing.T) {
 	fix := newTestFixture(t)
 	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: customOutputSampleRate}
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	wantFrameBytes := pcmFrameBytesForRate(customOutputSampleRate)
 	input := make([]byte, wantFrameBytes+4)
