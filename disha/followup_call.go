@@ -355,6 +355,7 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"membership_expiry_date": user.MembershipExpiryDate,
 		"subscription_status":    user.SubscriptionStatus,
 		"subscription_amount":    user.SubscriptionAmount,
+		"trial_amount":           user.TrialAmount,
 		"next_payment_due_date":  user.NextPaymentDueDate,
 		"payment_overdue":        user.PaymentOverdue,
 	}

@@ -46,6 +46,7 @@ type UserProfileData struct {
 	MembershipExpiryDate              *string        `json:"membership_expiry_date"`
 	SubscriptionStatus                *string        `json:"subscription_status"`
 	SubscriptionAmount                *float64       `json:"subscription_amount"`
+	TrialAmount                       *float64       `json:"trial_amount"`
 	NextPaymentDueDate                *string        `json:"next_payment_due_date"`
 	PaymentOverdue                    *bool          `json:"payment_overdue"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
