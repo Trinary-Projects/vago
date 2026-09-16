@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,9 +20,10 @@ import (
 const (
 	responsesWebSocketDialTimeout  = 2 * time.Second
 	responsesWebSocketWriteTimeout = 2 * time.Second
-	responsesWebSocketEventTimeout = 4 * time.Second
 	openAIResponsesWebSocketURL    = "wss://api.openai.com/v1/responses"
 )
+
+var responsesWebSocketEventTimeout = 4 * time.Second
 
 var errResponsesWebSocketClosed = errors.New("llmrouter: Responses WebSocket client is closed")
 
@@ -30,6 +32,8 @@ var errResponsesWebSocketClosed = errors.New("llmrouter: Responses WebSocket cli
 // state private, and sends only incremental input when Vago's canonical
 // history still matches the preceding response. Rewrites and replayed resumes
 // automatically start a new chain from the full canonical history.
+// A read timeout after all output items finish synthesizes a successful
+// completion, discarding the socket and chain without advancing the endpoint.
 //
 // Stream calls are serialized because one call uses the implicit default lane.
 // Interrupt may run concurrently: it always clears the chain, closes the socket
@@ -117,20 +121,22 @@ type responsesServerEvent struct {
 }
 
 type responsesStreamResult struct {
-	ID           string
-	Model        string
-	Text         string
-	ToolCalls    []vpc.ToolCall
-	Usage        responsesUsage
-	TTFB         time.Duration
-	Total        time.Duration
-	FinishReason string
-	ErrorCode    string
-	SawOutput    bool
-	SawResponse  bool
-	Incomplete   bool
-	TransportErr bool
-	StatusCode   int
+	ID                 string
+	Model              string
+	Text               string
+	ToolCalls          []vpc.ToolCall
+	Usage              responsesUsage
+	TTFB               time.Duration
+	Total              time.Duration
+	FinishReason       string
+	ErrorCode          string
+	SawOutput          bool
+	SawResponse        bool
+	Incomplete         bool
+	TerminalTimeout    bool
+	CompletedItemCount int
+	TransportErr       bool
+	StatusCode         int
 }
 
 // NewResponsesWebSocket builds the dedicated client for a Responses
@@ -256,6 +262,9 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 			ResponseInputMode: responseInputMode,
 			ReasoningTokens:   streamResult.Usage.OutputTokensDetails.ReasoningTokens,
 		}
+		if streamResult.TerminalTimeout && entry.Completed {
+			entry.TerminalEvent = "timeout_after_output"
+		}
 		if servedConfig.Key != "" {
 			entry.UsingFallback = c.candidateIndex(servedConfig.Key) > 0
 		}
@@ -372,7 +381,11 @@ func (c *ResponsesWebSocketClient) Stream(ctx context.Context, llmReq vpc.LLMReq
 	if reasoningTokens := streamResult.Usage.OutputTokensDetails.ReasoningTokens; reasoningTokens > 0 {
 		c.logf("reasoning.effort=none returned reasoning_tokens=%d cfg=%s", reasoningTokens, servedConfig.Key)
 	}
-	if streamResult.Incomplete {
+	if streamResult.TerminalTimeout {
+		c.clearChain()
+		c.dropConnection(conn, false, "terminal_timeout")
+		c.logf("Responses WebSocket terminal event timeout cfg=%s text_chars=%d items=%d tool_calls=%d total_ms=%.1f", servedConfig.Key, len(streamResult.Text), streamResult.CompletedItemCount, len(streamResult.ToolCalls), msFromDuration(res.Total))
+	} else if streamResult.Incomplete {
 		c.clearChain()
 	} else {
 		c.rememberCompleted(conn, llmReq.Messages, streamResult)
@@ -852,6 +865,7 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 
 	var text strings.Builder
 	var completedItems []responsesOutputItem
+	var itemInProgress bool
 	defer func() {
 		_ = conn.SetReadDeadline(time.Time{})
 		if result.Text == "" {
@@ -875,6 +889,45 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 			if ctx.Err() != nil {
 				return result, ctx.Err()
 			}
+			// Azure Luna endpoints sometimes finish every output item and
+			// then never send response.completed within the event deadline.
+			// The output is final, so treat the turn as complete instead of
+			// failing it; Stream drops the socket and chain but keeps the
+			// endpoint. A timeout while an item is still streaming, or with
+			// no text/tool output at all, stays a transport error.
+			var netErr net.Error
+			if errors.As(readErr, &netErr) && netErr.Timeout() && !itemInProgress && len(completedItems) > 0 {
+				toolCalls := responsesToolCalls(completedItems)
+				finalText := text.String()
+				itemText := ""
+				if finalText == "" {
+					itemText = responsesOutputText(completedItems)
+					finalText = itemText
+				}
+				if finalText != "" || len(toolCalls) > 0 {
+					result.TerminalTimeout = true
+					result.CompletedItemCount = len(completedItems)
+					result.SawResponse = true
+					result.ToolCalls = toolCalls
+					result.Text = finalText
+					if itemText != "" {
+						result.SawOutput = true
+						c.markStreamOutput(conn)
+						if result.TTFB == 0 {
+							result.TTFB = time.Since(started)
+						}
+						if onToken != nil {
+							onToken(itemText)
+						}
+					}
+					result.Total = time.Since(started)
+					result.FinishReason = "stop"
+					if len(result.ToolCalls) > 0 {
+						result.FinishReason = "tool_calls"
+					}
+					return result, nil
+				}
+			}
 			result.TransportErr = true
 			return result, readErr
 		}
@@ -886,7 +939,7 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 			continue
 		}
 		switch envelope.Type {
-		case "response.created", "response.in_progress", "response.output_text.delta", "response.function_call_arguments.delta", "response.output_item.done", "response.completed", "response.incomplete", "response.failed", "error":
+		case "response.created", "response.in_progress", "response.output_item.added", "response.output_text.delta", "response.function_call_arguments.delta", "response.output_item.done", "response.completed", "response.incomplete", "response.failed", "error":
 		default:
 			continue
 		}
@@ -902,10 +955,14 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 			if result.ID == "" {
 				result.ID = event.Response.ID
 			}
+		case "response.output_item.added":
+			result.SawResponse = true
+			itemInProgress = true
 		case "response.output_text.delta":
 			if event.Delta == "" {
 				continue
 			}
+			itemInProgress = true
 			result.SawOutput = true
 			c.markStreamOutput(conn)
 			if result.TTFB == 0 {
@@ -917,6 +974,7 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 			}
 		case "response.function_call_arguments.delta":
 			if event.Delta != "" {
+				itemInProgress = true
 				result.SawOutput = true
 				c.markStreamOutput(conn)
 				if result.TTFB == 0 {
@@ -924,6 +982,7 @@ func (c *ResponsesWebSocketClient) request(ctx context.Context, conn *websocket.
 				}
 			}
 		case "response.output_item.done":
+			itemInProgress = false
 			completedItems = append(completedItems, event.Item)
 			if event.Item.Type == "function_call" {
 				result.SawOutput = true
