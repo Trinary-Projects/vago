@@ -131,8 +131,10 @@ func TestLLM_DelegatesToClientAndReportsModel(t *testing.T) {
 
 // TestLLM_FiresOnLLMCallCompleted verifies the OnLLMCallCompleted call
 // event carries the full generated text with interrupted=false on a
-// clean completion, and interrupted=true with the partial text when the
-// client fails mid-stream (Python: is_interrupted = not completed).
+// clean completion. A live endpoint error is NOT an interruption when it
+// delivered text: that text was spoken and committed, so consumers such
+// as the onboarding stage tracker must still evaluate the turn. Only a
+// failure that produced no text reports interrupted=true.
 func TestLLM_FiresOnLLMCallCompleted(t *testing.T) {
 	type completedEvent struct {
 		text        string
@@ -170,8 +172,13 @@ func TestLLM_FiresOnLLMCallCompleted(t *testing.T) {
 	}
 
 	errored := run(t, &stubLLMClient{tokens: []string{"par", "tial"}, model: "m", err: errors.New("endpoint 500")})
-	if len(errored) != 1 || errored[0].text != "partial" || !errored[0].interrupted {
-		t.Errorf("errored events = %+v, want one {partial,true}", errored)
+	if len(errored) != 1 || errored[0].text != "partial" || errored[0].interrupted {
+		t.Errorf("errored events = %+v, want one {partial,false}: a failure that delivered text is not an interruption", errored)
+	}
+
+	silent := run(t, &stubLLMClient{model: "m", err: errors.New("endpoint 500")})
+	if len(silent) != 1 || silent[0].text != "" || !silent[0].interrupted {
+		t.Errorf("silent-failure events = %+v, want one {\"\",true}", silent)
 	}
 }
 

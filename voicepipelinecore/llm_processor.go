@@ -249,7 +249,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// PlaybackSink turns into BotStoppedSpeaking so UserIdleProcessor
 		// arms its prompt loop. Otherwise the caller sits in silence
 		// until the 120s watchdog.
-		p.taskCtx.Logger.Println("LLM stream failed:", err)
+		p.taskCtx.Logger.Printf("LLM stream failed: %v (text_chars=%d)\n", err, responseText.Len())
 		// Python parity: pipecat logs the failed call at ERROR level and
 		// the bots' loguru sentry_sink forwards every ERROR to Sentry, so
 		// a live LLM failure always raises a Sentry issue there. Capture
@@ -270,7 +270,19 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		})
 		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
-		p.fireLLMCallCompleted(responseText.String(), true)
+		// A transport failure is not a user interruption. Whatever text
+		// arrived before the stream broke was already aggregated, spoken
+		// and committed, so the call event must report a completed turn:
+		// Azure's Responses WebSocket routinely finishes a response and
+		// then withholds its terminal event past the 4s read deadline,
+		// and reporting those turns as interrupted made the onboarding
+		// stage tracker skip a fully delivered assistant utterance (a
+		// stage could then never advance). A failure that produced no
+		// text has nothing to evaluate and stays interrupted. Real
+		// cancellation (barge-in, EndFrame) is handled above and keeps
+		// Python's skip, because the model usually generates past what
+		// the user actually heard.
+		p.fireLLMCallCompleted(responseText.String(), responseText.Len() == 0)
 		return
 	}
 

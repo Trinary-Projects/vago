@@ -126,7 +126,4 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 	if got := responsePayload["reasoning_tokens"]; got != float64(0) {
 		t.Fatalf("response_payload[reasoning_tokens] = %#v, want 0", got)
 	}
-	if got, exists := responsePayload["terminal_event"]; exists {
-		t.Fatalf("response_payload[terminal_event] = %#v, want absent on a normal completion", got)
-	}
 }

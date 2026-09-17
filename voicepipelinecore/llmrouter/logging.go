@@ -35,10 +35,6 @@ type CallLog struct {
 	// "incremental". It deliberately records the mode, not the response ID.
 	ResponseInputMode string
 	ReasoningTokens   int
-	// TerminalEvent is "timeout_after_output" when the Responses WebSocket
-	// client synthesized completion after the provider finished every output
-	// item but never sent response.completed; empty otherwise.
-	TerminalEvent string
 }
 
 // deploymentName mirrors OpenAIConfigHandler.get_deployment_name so the

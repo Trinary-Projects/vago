@@ -78,9 +78,6 @@ func newLLMLogSink(api *APIClient, logger *log.Logger, usecaseType, userID, conv
 			responsePayload["response_input_mode"] = c.ResponseInputMode
 			responsePayload["reasoning_tokens"] = c.ReasoningTokens
 		}
-		if c.TerminalEvent != "" {
-			responsePayload["terminal_event"] = c.TerminalEvent
-		}
 		if c.ErrorMessage != "" {
 			responsePayload["error"] = map[string]any{
 				"type":        c.ErrorType,
