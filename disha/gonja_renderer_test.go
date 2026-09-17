@@ -161,6 +161,12 @@ func TestGonjaRenderOutput(t *testing.T) {
 			want:      "status=",
 		},
 		{
+			name:      "nested attribute substitution",
+			text:      "Hi {{ user.name }}",
+			variables: map[string]any{"user": map[string]any{"name": "Jaideep"}},
+			want:      "Hi Jaideep",
+		},
+		{
 			name:      "if guard true",
 			text:      "{% if diet_chart_available %}has chart{% else %}no chart{% endif %}",
 			variables: map[string]any{"diet_chart_available": true},
