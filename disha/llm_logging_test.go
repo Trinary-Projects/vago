@@ -57,7 +57,7 @@ func TestNewLLMLogSinkQueuesModuleLevelWrapper(t *testing.T) {
 	}
 	if got.Body["module_name"] != "services.llm_logging_service" ||
 		got.Body["func_name"] != "log_llm_call_job" ||
-		got.Body["sqs_queue"] != "p1-fast-l1" {
+		got.Body["sqs_queue"] != "llm-logs-parallel" {
 		t.Fatalf("enqueue target mismatch: %+v", got.Body)
 	}
 

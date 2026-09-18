@@ -16,7 +16,7 @@ const (
 	// SQS serialization stores __qualname__ and loses the bound self.
 	llmLogModule = "services.llm_logging_service"
 	llmLogFunc   = "log_llm_call_job"
-	llmLogQueue  = "p1-fast-l1"
+	llmLogQueue  = "llm-logs-parallel"
 
 	// Matches services.llm_logging_service.EntityType.CALL_CONVERSATION.
 	// The usecase_type is supplied per call so this sink is not bot-specific.
