@@ -277,16 +277,13 @@ func (fs *fakeCartesiaServer) conn(t *testing.T, index int) *fakeCartesiaConn {
 }
 
 // drainAndCloseAll repeatedly closes every connection accepted so far,
-// including ones that appear during the window. Only needed AFTER the
-// processor under test has been Stop()'d (see stopTTSTestAndWait):
-// TTSProcessor.closeTTSConnection is guarded by a one-shot sync.Once,
-// so a reconnect that races the orchestrator's own end-of-call close
-// can leave the reader blocked on a connection the client side will
-// never close again. Once the processor's ctx is cancelled, connect()
-// refuses to dial further, so closing whatever the reader is currently
-// blocked on from the server side is enough to let it observe ctx
-// cancellation and exit. This is a test-side workaround for that
-// pre-existing quirk, not something these tests are asserting about.
+// including ones that appear during the window. Only used AFTER the
+// processor under test has been Stop()'d (see stopTTSTestAndWait). It
+// was a workaround for a former one-shot sync.Once close that could
+// leave a reconnected socket unclosable; closeTTSConnection now closes
+// the current connection and stops reconnects itself (covered by
+// TestTTS_ReaderDoesNotReconnectAfterIntentionalClose), so this is only
+// belt-and-braces cleanup for the fake server.
 func (fs *fakeCartesiaServer) drainAndCloseAll(d time.Duration) {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
@@ -725,15 +722,10 @@ func TestTTS_ReconnectMidSynthesisEmitsTTSDone(t *testing.T) {
 		t.Errorf("expected no EndFrame (none was queued), got %d", c)
 	}
 
-	// Drive shutdown through a real EndFrame rather than a bare Stop():
-	// closeTTSConnection's read of t.websocketConn is only synchronized
-	// against the reader's reconnect write when its first call happens
-	// on the orchestrator goroutine as a continuation of processing a
-	// channel event (the reconnect event here). A bare Stop() from the
-	// test goroutine would be the first ever call in this scenario, with
-	// no happens-before edge back to the reconnect — a real (if
-	// pre-existing and out of scope) race between the reader and
-	// whichever goroutine first calls closeTTSConnection.
+	// Drive shutdown through a real EndFrame to also cover the
+	// forward-then-close path after a reconnect. (websocketConn is now
+	// guarded by connMu, so a bare Stop() would be race-free too; see
+	// TestTTS_StopClosesReconnectedConnection.)
 	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
 	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
 
@@ -767,9 +759,8 @@ func TestTTS_ReconnectIdleEmitsNoFrames(t *testing.T) {
 		t.Errorf("expected no EndFrame, got %d", c)
 	}
 
-	// Drive shutdown through a real EndFrame rather than a bare Stop() —
-	// see the comment in TestTTS_ReconnectMidSynthesisEmitsTTSDone for
-	// why a bare Stop() here would race against the reader's reconnect.
+	// Drive shutdown through a real EndFrame, as in
+	// TestTTS_ReconnectMidSynthesisEmitsTTSDone.
 	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
 	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
 
@@ -777,5 +768,77 @@ func TestTTS_ReconnectIdleEmitsNoFrames(t *testing.T) {
 
 	if c := countFrames[TTSDoneFrame](sink.Captured()); c != 0 {
 		t.Errorf("expected no TTSDoneFrame ever, got %d in %s", c, describeFrameTypes(sink.Captured()))
+	}
+}
+
+// connCount returns how many connections the fake server has accepted.
+func (fs *fakeCartesiaServer) connCount() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return len(fs.conns)
+}
+
+// TestTTS_ReaderDoesNotReconnectAfterIntentionalClose covers the
+// end-of-call stall: forwarding a deferred EndFrame closes the Cartesia
+// socket while the task is still running. The reader must treat that
+// read error as an intentional close and exit, not reconnect — a
+// reconnected socket would keep the reader blocked in ReadMessage until
+// PipelineTask's 10s WaitGroup bound gives up. The test deliberately
+// does NOT mop up server-side connections (no drainAndCloseAll): the
+// processor must release everything on its own.
+func TestTTS_ReaderDoesNotReconnectAfterIntentionalClose(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+	withTTSPendingEndTimeout(t, 30*time.Second)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+	contextID := conn.waitForContinueFalse(t, 2*time.Second)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	time.Sleep(50 * time.Millisecond) // let handleEnd defer it
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	// Give a would-be reconnect time to dial the fake server.
+	time.Sleep(300 * time.Millisecond)
+	if n := fs.connCount(); n != 1 {
+		t.Fatalf("expected no reconnect after intentional close, server accepted %d connections", n)
+	}
+
+	for _, proc := range []Processor{source, p, sink} {
+		proc.Stop()
+	}
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("goroutines did not exit promptly after intentional close: %v", err)
+	}
+}
+
+// TestTTS_StopClosesReconnectedConnection verifies that a genuine
+// mid-call drop still reconnects, and that a later bare Stop closes the
+// reconnected socket (not just the original one) so the reader exits
+// without any server-side help.
+func TestTTS_StopClosesReconnectedConnection(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	fs.conn(t, 0).conn.Close() // server-initiated drop mid-call
+	fs.conn(t, 1)              // reader reconnected
+	time.Sleep(50 * time.Millisecond)
+
+	for _, proc := range []Processor{source, p, sink} {
+		proc.Stop()
+	}
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("goroutines did not exit promptly after Stop: %v", err)
+	}
+	if n := fs.connCount(); n != 2 {
+		t.Errorf("expected exactly 2 connections (original + one reconnect), got %d", n)
 	}
 }

@@ -152,9 +152,11 @@ func TestAPIClientUpdateConversationFallbackQueuesJob(t *testing.T) {
 
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
 	at := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
+	endedAt := time.Date(2026, 5, 22, 1, 9, 3, 123456789, time.UTC)
 	err := client.UpdateConversationWithFallback(context.Background(), UpdateConversationRequest{
 		ConversationID: "conv-1",
 		BotJoinedAt:    &at,
+		EndedAt:        &endedAt,
 	})
 	if err != nil {
 		t.Fatalf("UpdateConversationWithFallback: %v", err)
@@ -176,7 +178,9 @@ func TestAPIClientUpdateConversationFallbackQueuesJob(t *testing.T) {
 		second.Body["func_name"] != "update_conversation" ||
 		second.Body["sqs_queue"] != "p0-fast-l1" ||
 		kwargs["conversation_id"] != "conv-1" ||
-		kwargs["bot_joined_at"] != at.Format(time.RFC3339) {
+		kwargs["bot_joined_at"] != at.Format(time.RFC3339) ||
+		kwargs["ended_at"] != endedAt.Format(time.RFC3339Nano) ||
+		kwargs["ended_at"] != first.Body["ended_at"] {
 		t.Fatalf("fallback body mismatch: %+v", second.Body)
 	}
 	if _, ok := kwargs["user_joined_at"]; ok {

@@ -202,11 +202,38 @@ func (c *CallEventCallbacks) OnToolResultCommitted(assistantToolCall voicepipeli
 	)
 }
 
+// OnCallEnded runs after PipelineTask has stop-and-drained CallEvents, so
+// no further committed-turn chunks can be written. It first writes ended_at
+// through PATCH /bot/update_conversation (falling back to the
+// voice_bot_operations.update_conversation SQS job on failure); Disha
+// enqueues the conversation-chunk sync itself when ended_at is first
+// written, so the sync is not delayed by the debug-log upload and post-call
+// HTTP round trips. The worker no longer enqueues the chunk sync. The same
+// ended_at value is then sent to run_post_call_operations, followed by the
+// Daily metrics enqueue.
 func (c *CallEventCallbacks) OnCallEnded(reason voicepipelinecore.EndReason, stats voicepipelinecore.CallStats) {
+	// Resolve once so update_conversation and run_post_call_operations send
+	// an identical ended_at (the zero-value fallback calls time.Now()).
+	stats.EndedAt = resolveEndedAt(stats)
+	endedAt := stats.EndedAt
+	c.updateConversation(UpdateConversationRequest{
+		ConversationID: c.conversationID,
+		EndedAt:        &endedAt,
+	})
 	logDataS3Key := uploadDebugLogs(c.logger, c.debugLogUploader, stats.DebugLogs)
 	c.runPostCallOperations(reason, stats, logDataS3Key)
 	c.enqueueDailyMetrics(stats)
-	c.enqueueChunkSync()
+}
+
+// resolveEndedAt returns the call's end time, falling back to now when the
+// pipeline did not record one. OnCallEnded resolves it once and stores it
+// back on stats so update_conversation and run_post_call_operations send an
+// identical value; it is idempotent for an already-resolved stats.
+func resolveEndedAt(stats voicepipelinecore.CallStats) time.Time {
+	if stats.EndedAt.IsZero() {
+		return time.Now()
+	}
+	return stats.EndedAt
 }
 
 func (c *CallEventCallbacks) updateConversation(req UpdateConversationRequest) {
@@ -331,12 +358,9 @@ func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndR
 		EndReason:                      mapEndReason(reason),
 		TotalUserDuration:              int(stats.TotalUserDurationSec),
 		FirstUserAudioFramesReceivedAt: optionalTime(stats.FirstUserAudioFrameAt),
-		EndedAt:                        stats.EndedAt,
+		EndedAt:                        resolveEndedAt(stats),
 		LogDataS3Key:                   logDataS3Key,
 		OnboardingCallDone:             false,
-	}
-	if req.EndedAt.IsZero() {
-		req.EndedAt = time.Now()
 	}
 	if c.postCallDecorator != nil {
 		c.postCallDecorator(&req)
@@ -368,27 +392,6 @@ func (c *CallEventCallbacks) enqueueDailyMetrics(stats voicepipelinecore.CallSta
 	}
 	if err := c.api.EnqueueJob(ctx, req); err != nil && c.logger != nil {
 		c.logger.Printf("disha: enqueue Daily metrics failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
-	}
-}
-
-func (c *CallEventCallbacks) enqueueChunkSync() {
-	if c == nil || c.api == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), postCallRequestTimeout)
-	defer cancel()
-	req := EnqueueJobRequest{
-		ModuleName: "services.conversation_chunk_manager",
-		FuncName:   "sync_conversation_chunks_to_db",
-		Kwargs: map[string]any{
-			"user_id":         c.userID,
-			"conversation_id": c.conversationID,
-			"bot_type":        c.botType,
-		},
-		SQSQueue: "p1-fast-l1",
-	}
-	if err := c.api.EnqueueJob(ctx, req); err != nil && c.logger != nil {
-		c.logger.Printf("disha: enqueue chunk sync failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
 	}
 }
 

@@ -127,6 +127,7 @@ type UpdateConversationRequest struct {
 	UserJoinedAt      *time.Time `json:"user_joined_at,omitempty"`
 	UserFirstSpeechAt *time.Time `json:"user_first_speech_at,omitempty"`
 	BotFirstSpeechAt  *time.Time `json:"bot_first_speech_at,omitempty"`
+	EndedAt           *time.Time `json:"ended_at,omitempty"`
 }
 
 // PostCallOperationsRequest mirrors VoiceBotAPIService.run_post_call_
