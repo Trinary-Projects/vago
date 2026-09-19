@@ -170,4 +170,9 @@ type EnqueueJobRequest struct {
 	Kwargs         map[string]any `json:"kwargs"`
 	SQSQueue       string         `json:"sqs_queue"`
 	MessageGroupID string         `json:"message_group_id,omitempty"`
+	// IdempotencyKey is the envelope-level dedupe key. disha-backend's
+	// worker dispatcher SETNXs it before invoking the job, so a replay
+	// of the same logical operation runs at most once. Omitted when
+	// empty so older backends are unaffected.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }

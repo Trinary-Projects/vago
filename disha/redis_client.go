@@ -17,6 +17,7 @@ import (
 const (
 	conversationDataKeyPrefix  = "conversation_data"
 	conversationChunkKeyPrefix = "conversation_chunks"
+	outboxKeyPrefix            = "vago_outbox"
 )
 
 var ErrConversationDataNotFound = errors.New("disha: conversation_data not found in Redis")
@@ -30,6 +31,17 @@ type RedisClient interface {
 	SetCache(ctx context.Context, key string, value any, expiration time.Duration) error
 	AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	AppendChunk(ctx context.Context, userID, conversationID string, chunk ConversationChunk) error
+
+	// Outbox durability primitives. These are phrased as outbox
+	// operations rather than raw Redis verbs so the claim's atomicity
+	// (a Lua script) stays an implementation detail of this file,
+	// matching how AppendChunk hides its RPUSH.
+	EnqueueOutboxItem(ctx context.Context, id string, payload []byte, runAt time.Time) error
+	ClaimOutboxItems(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]OutboxRecord, error)
+	RescheduleOutboxItem(ctx context.Context, id string, payload []byte, runAt time.Time) error
+	DeleteOutboxItem(ctx context.Context, id string) error
+	ParkOutboxItem(ctx context.Context, id string, payload []byte) error
+
 	Close() error
 }
 
@@ -257,6 +269,172 @@ func (c *redisClient) AppendChunk(ctx context.Context, userID, conversationID st
 		c.logger.Printf("Appended chunk %s to Redis conversation %s\n", chunk.ID, conversationID)
 	}
 	return nil
+}
+
+// outboxClaimScript atomically leases due items. A ZRANGEBYSCORE
+// followed by a separate ZADD would race: two pods can read the same
+// member before either re-scores it, and the item then runs twice. The
+// script re-scores each claimed member to now+lease, so the new score IS
+// the lease — a pod that dies mid-attempt simply lets the item fall due
+// again, with no separate lock and no reaper. Members whose item key has
+// expired are dropped from the set as we go.
+//
+// KEYS[1] due-set key, KEYS[2] item-key prefix
+// ARGV[1] now (unix ms), ARGV[2] lease deadline (unix ms), ARGV[3] limit
+// returns a flat [id, payload, id, payload, ...]
+var outboxClaimScript = redis.NewScript(`
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[3])
+local out = {}
+for i = 1, #due do
+  local id = due[i]
+  local payload = redis.call('GET', KEYS[2] .. id)
+  if payload then
+    redis.call('ZADD', KEYS[1], ARGV[2], id)
+    out[#out + 1] = id
+    out[#out + 1] = payload
+  else
+    redis.call('ZREM', KEYS[1], id)
+  end
+end
+return out
+`)
+
+func (c *redisClient) EnqueueOutboxItem(ctx context.Context, id string, payload []byte, runAt time.Time) error {
+	return c.writeOutboxItem(ctx, id, payload, runAt, "ENQUEUE")
+}
+
+func (c *redisClient) RescheduleOutboxItem(ctx context.Context, id string, payload []byte, runAt time.Time) error {
+	return c.writeOutboxItem(ctx, id, payload, runAt, "RESCHEDULE")
+}
+
+func (c *redisClient) writeOutboxItem(ctx context.Context, id string, payload []byte, runAt time.Time, operation string) error {
+	itemKey := outboxItemKey(id)
+	if err := withRedisTimeoutRetry(ctx, func() error {
+		_, err := c.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, itemKey, payload, outboxItemTTL)
+			pipe.ZAdd(ctx, outboxDueKey(), redis.Z{
+				Score:  float64(runAt.UnixMilli()),
+				Member: id,
+			})
+			return nil
+		})
+		return err
+	}); err != nil {
+		wrapped := fmt.Errorf("disha: redis outbox %s %s failed: %w", operation, itemKey, err)
+		captureOutboxRedisFailure(wrapped, "OUTBOX_"+operation, itemKey)
+		return wrapped
+	}
+	return nil
+}
+
+func (c *redisClient) ClaimOutboxItems(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]OutboxRecord, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var raw []any
+	if err := withRedisTimeoutRetry(ctx, func() error {
+		res, err := outboxClaimScript.Run(ctx, c.rdb,
+			[]string{outboxDueKey(), outboxItemKeyPrefix()},
+			now.UnixMilli(),
+			now.Add(lease).UnixMilli(),
+			limit,
+		).Result()
+		if err != nil {
+			return err
+		}
+		values, ok := res.([]any)
+		if !ok {
+			return fmt.Errorf("unexpected claim result type %T", res)
+		}
+		raw = values
+		return nil
+	}); err != nil {
+		wrapped := fmt.Errorf("disha: redis outbox CLAIM failed: %w", err)
+		captureOutboxRedisFailure(wrapped, "OUTBOX_CLAIM", outboxDueKey())
+		return nil, wrapped
+	}
+
+	records := make([]OutboxRecord, 0, len(raw)/2)
+	for i := 0; i+1 < len(raw); i += 2 {
+		id, ok := raw[i].(string)
+		if !ok {
+			continue
+		}
+		payload, ok := raw[i+1].(string)
+		if !ok {
+			continue
+		}
+		records = append(records, OutboxRecord{ID: id, Payload: []byte(payload)})
+	}
+	return records, nil
+}
+
+func (c *redisClient) DeleteOutboxItem(ctx context.Context, id string) error {
+	itemKey := outboxItemKey(id)
+	if err := withRedisTimeoutRetry(ctx, func() error {
+		_, err := c.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, itemKey)
+			pipe.ZRem(ctx, outboxDueKey(), id)
+			return nil
+		})
+		return err
+	}); err != nil {
+		wrapped := fmt.Errorf("disha: redis outbox DELETE %s failed: %w", itemKey, err)
+		captureOutboxRedisFailure(wrapped, "OUTBOX_DELETE", itemKey)
+		return wrapped
+	}
+	return nil
+}
+
+func (c *redisClient) ParkOutboxItem(ctx context.Context, id string, payload []byte) error {
+	deadKey := outboxDeadKey()
+	if err := withRedisTimeoutRetry(ctx, func() error {
+		_, err := c.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.RPush(ctx, deadKey, payload)
+			pipe.LTrim(ctx, deadKey, -outboxDeadListCap, -1)
+			pipe.Del(ctx, outboxItemKey(id))
+			pipe.ZRem(ctx, outboxDueKey(), id)
+			return nil
+		})
+		return err
+	}); err != nil {
+		wrapped := fmt.Errorf("disha: redis outbox PARK %s failed: %w", id, err)
+		captureOutboxRedisFailure(wrapped, "OUTBOX_PARK", deadKey)
+		return wrapped
+	}
+	return nil
+}
+
+// captureOutboxRedisFailure rate-limits outbox Redis reporting. The
+// drainer claims every ~5s per pod, so an unconditional capture here
+// would turn a brief Redis blip into thousands of events — reproducing
+// the exact VAGO-7 problem this change exists to remove. One event per
+// operation per minute is enough to see that Redis is unhealthy.
+func captureOutboxRedisFailure(err error, operation, key string) {
+	if !allowSentryReport("outbox_redis:"+operation, time.Now()) {
+		return
+	}
+	sentryutil.Capture(sentryutil.Event{
+		Err:     err,
+		Tags:    map[string]string{"component": "disha_redis", "operation": operation},
+		Details: map[string]any{"key": key},
+	})
+}
+
+func outboxDueKey() string {
+	return outboxKeyPrefix + ":due"
+}
+
+func outboxDeadKey() string {
+	return outboxKeyPrefix + ":dead"
+}
+
+func outboxItemKeyPrefix() string {
+	return outboxKeyPrefix + ":item:"
+}
+
+func outboxItemKey(id string) string {
+	return outboxItemKeyPrefix() + id
 }
 
 func conversationDataKey(conversationID string) string {

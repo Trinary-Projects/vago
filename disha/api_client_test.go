@@ -122,128 +122,6 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 	}
 }
 
-func TestAPIClientUpdateConversationFallbackQueuesJob(t *testing.T) {
-	requests := make(chan capturedAPIRequest, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("ReadAll: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		var body map[string]any
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &body); err != nil {
-				t.Errorf("Unmarshal request: %v", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		}
-		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path, Body: body}
-		if r.URL.Path == "/bot/update_conversation" {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("db down"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":true}`))
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewAPIClient(server.URL, 10*time.Second, nil)
-	at := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
-	err := client.UpdateConversationWithFallback(context.Background(), UpdateConversationRequest{
-		ConversationID: "conv-1",
-		BotJoinedAt:    &at,
-	})
-	if err != nil {
-		t.Fatalf("UpdateConversationWithFallback: %v", err)
-	}
-
-	first := <-requests
-	if first.Method != http.MethodPatch || first.Path != "/bot/update_conversation" {
-		t.Fatalf("first request = %s %s, want PATCH /bot/update_conversation", first.Method, first.Path)
-	}
-	second := <-requests
-	if second.Method != http.MethodPost || second.Path != "/common/enqueue_job" {
-		t.Fatalf("fallback request = %s %s, want POST /common/enqueue_job", second.Method, second.Path)
-	}
-	kwargs, ok := second.Body["kwargs"].(map[string]any)
-	if !ok {
-		t.Fatalf("kwargs = %#v, want object", second.Body["kwargs"])
-	}
-	if second.Body["module_name"] != "bots.operations.voice_bot_operations" ||
-		second.Body["func_name"] != "update_conversation" ||
-		second.Body["sqs_queue"] != "p0-fast-l1" ||
-		kwargs["conversation_id"] != "conv-1" ||
-		kwargs["bot_joined_at"] != at.Format(time.RFC3339) {
-		t.Fatalf("fallback body mismatch: %+v", second.Body)
-	}
-	if _, ok := kwargs["user_joined_at"]; ok {
-		t.Fatalf("fallback kwargs should omit nil fields: %+v", kwargs)
-	}
-}
-
-func TestAPIClientRunPostCallFallbackQueuesJob(t *testing.T) {
-	requests := make(chan capturedAPIRequest, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("ReadAll: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		var body map[string]any
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &body); err != nil {
-				t.Errorf("Unmarshal request: %v", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		}
-		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path, Body: body}
-		if r.URL.Path == "/bot/run_post_call_operations" {
-			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte("temporary outage"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":true}`))
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewAPIClient(server.URL, 10*time.Second, nil)
-	endedAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
-	err := client.RunPostCallOperationsWithFallback(context.Background(), PostCallOperationsRequest{
-		ConversationID:     "conv-1",
-		TotalUserDuration:  13,
-		EndedAt:            endedAt,
-		LogDataS3Key:       "debug_log_data/conv-1/log_data.json",
-		OnboardingCallDone: false,
-	})
-	if err != nil {
-		t.Fatalf("RunPostCallOperationsWithFallback: %v", err)
-	}
-
-	<-requests
-	second := <-requests
-	if second.Method != http.MethodPost || second.Path != "/common/enqueue_job" {
-		t.Fatalf("fallback request = %s %s, want POST /common/enqueue_job", second.Method, second.Path)
-	}
-	kwargs, ok := second.Body["kwargs"].(map[string]any)
-	if !ok {
-		t.Fatalf("kwargs = %#v, want object", second.Body["kwargs"])
-	}
-	if second.Body["module_name"] != "bots.operations.voice_bot_operations" ||
-		second.Body["func_name"] != "run_post_call_operations" ||
-		second.Body["sqs_queue"] != "p0-fast-l1" ||
-		kwargs["conversation_id"] != "conv-1" ||
-		kwargs["end_reason"] != nil ||
-		kwargs["ended_at"] != endedAt.Format(time.RFC3339) {
-		t.Fatalf("fallback body mismatch: %+v", second.Body)
-	}
-}
-
 func TestAPIClientEnqueueJob(t *testing.T) {
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
@@ -306,13 +184,13 @@ func TestAPIClientSetUserCareplan(t *testing.T) {
 	client := NewAPIClient(server.URL, 0, nil)
 
 	detected := "hair_loss"
-	err := client.SetUserCareplanWithFallback(context.Background(), SetUserCareplanRequest{
+	err := client.SetUserCareplanDurable(context.Background(), SetUserCareplanRequest{
 		UserID:             "user-1",
 		OnboardingCarePlan: "general",
 		DetectedCarePlan:   &detected,
-	})
+	}, OutboxContext{IdempotencyKey: "vago:careplan:user-1:general"})
 	if err != nil {
-		t.Fatalf("SetUserCareplanWithFallback: %v", err)
+		t.Fatalf("SetUserCareplanDurable: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPost || got.Path != "/bot/set_user_careplan" {
@@ -345,12 +223,12 @@ func TestAPIClientAddTagToUser(t *testing.T) {
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, 0, nil)
 
-	err := client.AddTagToUserWithFallback(context.Background(), AddTagToUserRequest{
+	err := client.AddTagToUserDurable(context.Background(), AddTagToUserRequest{
 		UserID:  "user-1",
 		TagName: "Stage Transition Failure",
-	})
+	}, OutboxContext{IdempotencyKey: "vago:tag:user-1:Stage Transition Failure"})
 	if err != nil {
-		t.Fatalf("AddTagToUserWithFallback: %v", err)
+		t.Fatalf("AddTagToUserDurable: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPost || got.Path != "/bot/add_tag_to_user" {
@@ -358,61 +236,6 @@ func TestAPIClientAddTagToUser(t *testing.T) {
 	}
 	if got.Body["user_id"] != "user-1" || got.Body["tag_name"] != "Stage Transition Failure" {
 		t.Fatalf("body mismatch: %+v", got.Body)
-	}
-}
-
-func TestAPIClientCareplanAndTagFallbacksQueueJobs(t *testing.T) {
-	requests := make(chan capturedAPIRequest, 8)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var body map[string]any
-		if len(raw) > 0 {
-			_ = json.Unmarshal(raw, &body)
-		}
-		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path, Body: body}
-		if strings.HasPrefix(r.URL.Path, "/bot/") {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":true}`))
-	}))
-	t.Cleanup(server.Close)
-	client := NewAPIClient(server.URL, 10*time.Second, nil)
-
-	if err := client.SetUserCareplanWithFallback(context.Background(), SetUserCareplanRequest{
-		UserID:             "user-1",
-		OnboardingCarePlan: "general",
-	}); err != nil {
-		t.Fatalf("SetUserCareplanWithFallback: %v", err)
-	}
-	<-requests // failed API call
-	fallback := <-requests
-	if fallback.Path != "/common/enqueue_job" ||
-		fallback.Body["module_name"] != "bots.operations.voice_bot_operations" ||
-		fallback.Body["func_name"] != "set_user_careplan" ||
-		fallback.Body["sqs_queue"] != "p0-fast-l1" {
-		t.Fatalf("careplan fallback mismatch: %+v", fallback.Body)
-	}
-	kwargs, _ := fallback.Body["kwargs"].(map[string]any)
-	if kwargs["user_id"] != "user-1" || kwargs["onboarding_care_plan"] != "general" {
-		t.Fatalf("careplan fallback kwargs mismatch: %+v", kwargs)
-	}
-
-	if err := client.AddTagToUserWithFallback(context.Background(), AddTagToUserRequest{
-		UserID:  "user-1",
-		TagName: "Stage Transition Failure",
-	}); err != nil {
-		t.Fatalf("AddTagToUserWithFallback: %v", err)
-	}
-	<-requests // failed API call
-	fallback = <-requests
-	if fallback.Body["func_name"] != "add_tag_to_user" || fallback.Body["sqs_queue"] != "p0-fast-l1" {
-		t.Fatalf("tag fallback mismatch: %+v", fallback.Body)
-	}
-	kwargs, _ = fallback.Body["kwargs"].(map[string]any)
-	if kwargs["tag_name"] != "Stage Transition Failure" {
-		t.Fatalf("tag fallback kwargs mismatch: %+v", kwargs)
 	}
 }
 

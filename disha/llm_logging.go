@@ -124,8 +124,14 @@ func newLLMLogSink(api *APIClient, logger *log.Logger, usecaseType, userID, conv
 			FuncName:   llmLogFunc,
 			Kwargs:     kwargs,
 			SQSQueue:   llmLogQueue,
-		}); err != nil && logger != nil {
-			logger.Printf("disha: LLM call log enqueue failed: %v\n", err)
+		}); err != nil {
+			if logger != nil {
+				logger.Printf("disha: LLM call log enqueue failed: %v\n", err)
+			}
+			// Per-turn volume is why this is rate-limited rather than
+			// captured per failure: this one site produced much of
+			// VAGO-7's event count.
+			reportTelemetryDrop(llmLogModule+"."+llmLogFunc, conversationID, err)
 		}
 	}
 }

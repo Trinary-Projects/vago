@@ -163,9 +163,16 @@ func (m *OnboardingStageThresholdMonitor) tagUser(userID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), stageThresholdTagTimeout)
 	defer cancel()
 
-	if err := m.api.AddTagToUserWithFallback(ctx, AddTagToUserRequest{
+	if err := m.api.AddTagToUserDurable(ctx, AddTagToUserRequest{
 		UserID:  userID,
 		TagName: stageTransitionFailureTag,
+	}, OutboxContext{
+		IdempotencyKey: idempotencyKey(opAddTagToUser, userID, stageTransitionFailureTag),
+		SentryTags: map[string]string{
+			"conversation_id": m.conversationID,
+			"user_id":         userID,
+			"bot_type":        OnboardingCallBotType,
+		},
 	}); err != nil {
 		// Python logs and captures the tagging failure but never lets it
 		// affect the call.

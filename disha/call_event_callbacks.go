@@ -138,19 +138,19 @@ func (c *CallEventCallbacks) Events() voicepipelinecore.CallEvents {
 }
 
 func (c *CallEventCallbacks) OnBotJoined(at time.Time) {
-	c.updateConversation(UpdateConversationRequest{ConversationID: c.conversationID, BotJoinedAt: &at})
+	c.updateConversation("bot_joined", UpdateConversationRequest{ConversationID: c.conversationID, BotJoinedAt: &at})
 }
 
 func (c *CallEventCallbacks) OnUserJoined(at time.Time) {
-	c.updateConversation(UpdateConversationRequest{ConversationID: c.conversationID, UserJoinedAt: &at})
+	c.updateConversation("user_joined", UpdateConversationRequest{ConversationID: c.conversationID, UserJoinedAt: &at})
 }
 
 func (c *CallEventCallbacks) OnUserFirstSpeech(at time.Time) {
-	c.updateConversation(UpdateConversationRequest{ConversationID: c.conversationID, UserFirstSpeechAt: &at})
+	c.updateConversation("user_first_speech", UpdateConversationRequest{ConversationID: c.conversationID, UserFirstSpeechAt: &at})
 }
 
 func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
-	c.updateConversation(UpdateConversationRequest{ConversationID: c.conversationID, BotFirstSpeechAt: &at})
+	c.updateConversation("bot_first_speech", UpdateConversationRequest{ConversationID: c.conversationID, BotFirstSpeechAt: &at})
 }
 
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
@@ -192,14 +192,35 @@ func (c *CallEventCallbacks) OnCallEnded(reason voicepipelinecore.EndReason, sta
 	c.enqueueChunkSync()
 }
 
-func (c *CallEventCallbacks) updateConversation(req UpdateConversationRequest) {
+// updateConversation fires four times per call with different fields, so
+// the lifecycle event name is part of the idempotency key — a single
+// per-conversation key would let the first event suppress the other
+// three. It also keeps duplicate OnboardingConsultStarted analytics from
+// firing on a replayed user_first_speech.
+func (c *CallEventCallbacks) updateConversation(event string, req UpdateConversationRequest) {
 	if c == nil || c.api == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), callEventRequestTimeout)
 	defer cancel()
-	if err := c.api.UpdateConversationWithFallback(ctx, req); err != nil && c.logger != nil {
-		c.logger.Printf("disha: update_conversation failed: %v\n", err)
+	oc := c.outboxContext(opUpdateConversation, c.conversationID, event)
+	if err := c.api.UpdateConversationDurable(ctx, req, oc); err != nil && c.logger != nil {
+		c.logger.Printf("disha: update_conversation(%s) failed: %v\n", event, err)
+	}
+}
+
+// outboxContext bundles the deterministic idempotency key with the call
+// identity. The tags are persisted on the outbox item so the drainer —
+// which runs long after this task is gone — can still report a give-up
+// against the right conversation.
+func (c *CallEventCallbacks) outboxContext(operation string, keyParts ...string) OutboxContext {
+	return OutboxContext{
+		IdempotencyKey: idempotencyKey(operation, keyParts...),
+		SentryTags: map[string]string{
+			"conversation_id": c.conversationID,
+			"user_id":         c.userID,
+			"bot_type":        c.botType,
+		},
 	}
 }
 
@@ -279,7 +300,8 @@ func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndR
 	if c.postCallDecorator != nil {
 		c.postCallDecorator(&req)
 	}
-	if err := c.api.RunPostCallOperationsWithFallback(ctx, req); err != nil && c.logger != nil {
+	oc := c.outboxContext(opRunPostCallOperations, c.conversationID)
+	if err := c.api.RunPostCallOperationsDurable(ctx, req, oc); err != nil && c.logger != nil {
 		c.logger.Printf("disha: run_post_call_operations failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
 	}
 }
@@ -304,8 +326,11 @@ func (c *CallEventCallbacks) enqueueDailyMetrics(stats voicepipelinecore.CallSta
 		},
 		SQSQueue: "p1-fast-l1",
 	}
-	if err := c.api.EnqueueJob(ctx, req); err != nil && c.logger != nil {
-		c.logger.Printf("disha: enqueue Daily metrics failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
+	if err := c.api.EnqueueJob(ctx, req); err != nil {
+		if c.logger != nil {
+			c.logger.Printf("disha: enqueue Daily metrics failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
+		}
+		reportTelemetryDrop("bots.webhooks.fetch_and_store_daily_metrics", c.conversationID, err)
 	}
 }
 
@@ -325,7 +350,8 @@ func (c *CallEventCallbacks) enqueueChunkSync() {
 		},
 		SQSQueue: "p1-fast-l1",
 	}
-	if err := c.api.EnqueueJob(ctx, req); err != nil && c.logger != nil {
+	oc := c.outboxContext(opSyncConversationChunks, c.conversationID)
+	if err := c.api.EnqueueJobDurable(ctx, opSyncConversationChunks, req, oc); err != nil && c.logger != nil {
 		c.logger.Printf("disha: enqueue chunk sync failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
 	}
 }

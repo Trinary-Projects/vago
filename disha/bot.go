@@ -16,6 +16,7 @@ type Deps struct {
 	PhoneticDict *PhoneticDict
 	S3           S3GetClient
 	GKEPatcher   GKEPatcher
+	Outbox       *Outbox
 }
 
 type GKEPatcher interface {

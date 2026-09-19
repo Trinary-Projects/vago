@@ -147,6 +147,26 @@ func (s scriptedCacheRedis) AppendChunk(context.Context, string, string, Convers
 	return errors.New("unused")
 }
 
+func (s scriptedCacheRedis) EnqueueOutboxItem(context.Context, string, []byte, time.Time) error {
+	return errors.New("unused")
+}
+
+func (s scriptedCacheRedis) ClaimOutboxItems(context.Context, time.Time, time.Duration, int) ([]OutboxRecord, error) {
+	return nil, errors.New("unused")
+}
+
+func (s scriptedCacheRedis) RescheduleOutboxItem(context.Context, string, []byte, time.Time) error {
+	return errors.New("unused")
+}
+
+func (s scriptedCacheRedis) DeleteOutboxItem(context.Context, string) error {
+	return errors.New("unused")
+}
+
+func (s scriptedCacheRedis) ParkOutboxItem(context.Context, string, []byte) error {
+	return errors.New("unused")
+}
+
 func (s scriptedCacheRedis) Close() error { return nil }
 
 func TestDocumentStoreReportsMissingDocumentToSentry(t *testing.T) {
