@@ -69,7 +69,7 @@ func (s *aggregatorSharedState) replaceSystemMessage(text string) {
 func (s *aggregatorSharedState) snapshot() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneMessages(s.messages)
+	return cloneMessages(messagesFromInitial(s.messages))
 }
 
 func (s *aggregatorSharedState) messagesForTest() []Message {

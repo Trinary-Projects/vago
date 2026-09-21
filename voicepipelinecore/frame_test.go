@@ -77,8 +77,8 @@ func TestPostPlaybackFramesUseSystemPriority(t *testing.T) {
 		name  string
 		frame Frame
 	}{
-		{name: "WordTimestampFrame", frame: NewWordTimestampFrame([]string{"hi"})},
-		{name: "TTSDoneFrame", frame: NewTTSDoneFrame()},
+		{name: "WordTimestampFrame", frame: playedWordsFrame([]string{"hi"})},
+		{name: "TTSDoneFrame", frame: TTSDoneFrame{played: true}},
 		{name: "BotStartedSpeakingFrame", frame: NewBotStartedSpeakingFrame()},
 		{name: "BotStoppedSpeakingFrame", frame: NewBotStoppedSpeakingFrame()},
 	}

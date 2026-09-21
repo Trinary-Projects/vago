@@ -23,7 +23,14 @@ func continuationPair(t *testing.T) (*testFixture, *ContextAggregatorPair, int64
 	return fix, pair, id
 }
 
+func completeGeneration(fix *testFixture, pair *ContextAggregatorPair, id int64, text string) {
+	end := NewLLMResponseEndFrame()
+	end.ResponseID, end.Text = id, text
+	pair.User().ProcessFrame(fix.RootCtx, end, Upstream)
+}
+
 func commitContinuationResponse(fix *testFixture, pair *ContextAggregatorPair, id int64) {
+	completeGeneration(fix, pair, id, "spoken trigger")
 	pair.Assistant().ProcessFrame(fix.RootCtx, NewWordTimestampFrame([]string{"spoken", "trigger"}), Downstream)
 	stopped := NewBotStoppedSpeakingFrame()
 	stopped.ResponseID = id
@@ -31,7 +38,7 @@ func commitContinuationResponse(fix *testFixture, pair *ContextAggregatorPair, i
 }
 
 func continuationFrame(id int64) LLMMessagesAppendFrame {
-	f := NewLLMMessagesAppendFrame([]Message{{Role: "user", Content: "continue with the new stage", Synthetic: true}}, true)
+	f := NewLLMMessagesAppendFrame([]Message{{Role: "user", Content: "continue with the new stage"}}, true)
 	f.AfterResponseID = id
 	return f
 }
@@ -46,15 +53,15 @@ func TestResponseContinuationUsesPlayedHistoryAndNewPromptOnce(t *testing.T) {
 	pair.User().ProcessFrame(fix.RootCtx, continuationFrame(id), Downstream)
 	pair.User().ProcessFrame(fix.RootCtx, continuationFrame(id), Downstream)
 	messages := pair.MessagesSnapshot()
-	if len(messages) != 4 || messages[0].Content != "new stage" || messages[2].Content != "spoken trigger" || !messages[3].Synthetic {
+	if len(messages) != 4 || messages[0].Content != "new stage" || messages[2].Content != "spoken trigger" || messages[3].Role != "user" || messages[3].Content != "continue with the new stage" {
 		t.Fatalf("continuation context = %+v", messages)
 	}
 	if pair.user.state.responseID == id || pair.user.state.responseID == 0 {
 		t.Fatal("continuation did not start a distinct response")
 	}
-	// Instruction metadata is internal, not part of the provider payload.
+	// Response identity is internal, not part of the provider payload.
 	raw, err := json.Marshal(messages)
-	if err != nil || strings.Contains(string(raw), "Synthetic") || strings.Contains(string(raw), "ResponseID") {
+	if err != nil || strings.Contains(string(raw), "ResponseID") {
 		t.Fatalf("internal fields leaked into provider JSON: %s, %v", raw, err)
 	}
 }
@@ -100,7 +107,7 @@ func TestResponseContinuationRejectsInvalidatedRequest(t *testing.T) {
 	}
 }
 
-func TestResponseContinuationRequiresMatchingNonemptyPlayback(t *testing.T) {
+func TestResponseContinuationDoesNotUsePlaybackAsGenerationCompletion(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		words  bool
@@ -139,15 +146,17 @@ func TestResponseContinuationSurvivingInputQueueIsRevalidated(t *testing.T) {
 	}
 }
 
-func TestResponseContinuationDoesNotMergeIntoRealUserSpeech(t *testing.T) {
+func TestResponseContinuationUsesNormalUserMessageMerging(t *testing.T) {
 	fix, pair, id := continuationPair(t)
 	commitContinuationResponse(fix, pair, id)
 	pair.User().ProcessFrame(fix.RootCtx, continuationFrame(id), Downstream)
 	pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "my actual answer", IsFinal: true}, Downstream)
 	pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
+	pair.Assistant().ProcessFrame(fix.RootCtx, NewInterruptFrame(), Downstream)
+	pair.User().ProcessFrame(fix.RootCtx, BotStoppedSpeakingFrame{Interrupted: true}, Upstream)
 	msgs := pair.MessagesSnapshot()
-	if len(msgs) != 5 || msgs[4].Content != "my actual answer" || msgs[4].Synthetic {
-		t.Fatalf("instruction merged into real user speech: %+v", msgs)
+	if len(msgs) != 4 || msgs[3].Role != "user" || msgs[3].Content != "continue with the new stage my actual answer" {
+		t.Fatalf("continuation did not follow normal user message merging: %+v", msgs)
 	}
 	var transcripts []string
 	for _, event := range fix.TaskCtx.UIEvents.Snapshot() {
@@ -214,7 +223,7 @@ func TestLLMResponseIdentitySurvivesGenerationAndEnrichment(t *testing.T) {
 	}
 }
 
-func TestPlaybackCompletionPreservesResponseIDAndClearsItForNudges(t *testing.T) {
+func TestPlaybackCompletionPreservesResponseAndNudgeIdentity(t *testing.T) {
 	fix := newTestFixture(t)
 	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
 	p := NewPlaybackSinkProcessor(fix.TaskCtx)
@@ -226,7 +235,8 @@ func TestPlaybackCompletionPreservesResponseIDAndClearsItForNudges(t *testing.T)
 	p.handleQueueFrame(start)
 	p.handleQueueFrame(NewTTSDoneFrame())
 	p.tick()
-	p.handleQueueFrame(NewTTSSpeakFrame("Hello?"))
+	nudge := NewTTSSpeakFrame("Hello?")
+	p.handleQueueFrame(nudge)
 	p.handleQueueFrame(NewTTSDoneFrame())
 	p.tick()
 	deadline := time.Now().Add(time.Second)
@@ -240,7 +250,7 @@ func TestPlaybackCompletionPreservesResponseIDAndClearsItForNudges(t *testing.T)
 			ids = append(ids, stopped.ResponseID)
 		}
 	}
-	if len(ids) != 2 || ids[0] != 123 || ids[1] != 0 {
+	if len(ids) != 2 || ids[0] != 123 || ids[1] != nudge.ID() {
 		t.Fatalf("playback response IDs = %v", ids)
 	}
 }

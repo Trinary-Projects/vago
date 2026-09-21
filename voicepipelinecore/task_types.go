@@ -10,9 +10,9 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
-	// Synthetic instructions participate in LLM context, but are not user speech.
-	Synthetic  bool  `json:"-"`
-	ResponseID int64 `json:"-"`
+	// ResponseID correlates generated context, tool history, and played speech.
+	ResponseID      int64 `json:"-"`
+	pendingPlayback bool
 }
 
 // ToolDefinition is an OpenAI-format function tool definition.

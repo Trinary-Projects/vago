@@ -8,10 +8,11 @@ import (
 
 type AssistantContextAggregator struct {
 	*BaseProcessor
-	mu          sync.Mutex
-	taskCtx     *TaskContext
-	state       *aggregatorSharedState
-	playedWords []string
+	mu               sync.Mutex
+	taskCtx          *TaskContext
+	state            *aggregatorSharedState
+	playedWords      []string
+	playedResponseID int64
 }
 
 func newAssistantContextAggregatorWithState(taskCtx *TaskContext, state *aggregatorSharedState) *AssistantContextAggregator {
@@ -51,27 +52,43 @@ func (a *AssistantContextAggregator) playedTextLocked() string {
 func (a *AssistantContextAggregator) commitPlayedAssistantText(turn AssistantTurnCompletion) {
 	a.mu.Lock()
 	spoken := a.playedTextLocked()
+	if turn.ResponseID == 0 {
+		turn.ResponseID = a.playedResponseID
+	}
+	a.playedResponseID = 0
 	a.mu.Unlock()
 
-	var promptKey string
-	if spoken != "" {
-		a.state.mu.Lock()
-		a.state.messages = append(a.state.messages, Message{Role: "assistant", Content: spoken, ResponseID: turn.ResponseID})
-		promptKey = a.state.mainAgentSystemPromptLangfuseKey
-		if turn.Reason == AssistantTurnPlaybackCompleted && turn.ResponseID != 0 &&
-			turn.ResponseID == a.state.responseID && !a.state.ending {
-			a.state.completedResponseID = turn.ResponseID
+	a.state.mu.Lock()
+	promptKey := a.state.mainAgentSystemPromptLangfuseKey
+	found := false
+	messages := a.state.messages[:0]
+	for _, message := range a.state.messages {
+		if message.Role == "assistant" && len(message.ToolCalls) == 0 && turn.ResponseID != 0 && message.ResponseID == turn.ResponseID {
+			found = true
+			if spoken == "" {
+				continue
+			}
+			message.Content, message.pendingPlayback = spoken, false
 		}
-		a.state.mu.Unlock()
+		if turn.Reason != AssistantTurnPlaybackCompleted && message.pendingPlayback {
+			a.taskCtx.metrics.snapshotAndReset(message.ResponseID)
+			continue
+		}
+		messages = append(messages, message)
 	}
+	a.state.messages = messages
+	if !found && spoken != "" {
+		a.state.messages = append(a.state.messages, Message{Role: "assistant", Content: spoken, ResponseID: turn.ResponseID})
+	}
+	if turn.Reason == AssistantTurnPlaybackCompleted && turn.ResponseID != 0 && !a.state.ending {
+		a.state.completedResponseID = turn.ResponseID
+	}
+	a.state.mu.Unlock()
 
 	interrupted := turn.Reason == AssistantTurnInterrupted
-	metrics := TurnMetrics{}
+	metrics := a.taskCtx.metrics.snapshotAndReset(turn.ResponseID)
 	if spoken != "" {
 		a.taskCtx.Logger.Printf("Committing to history (interrupted=%v): %s\n", interrupted, spoken)
-		if a.taskCtx.metrics != nil {
-			metrics = a.taskCtx.metrics.snapshotAndReset()
-		}
 		if interrupted {
 			a.taskCtx.UIEvents.BotStoppedSpeaking(time.Now())
 		}
@@ -91,13 +108,20 @@ func (a *AssistantContextAggregator) ProcessFrame(ctx context.Context, frame Fra
 	case WordTimestampFrame:
 		// Downstream from PlaybackSink after the audio frame for these words
 		// has actually been played.
+		a.mu.Lock()
+		a.playedResponseID = f.ResponseID
+		a.mu.Unlock()
 		a.appendPlayedAssistantWords(f.Words)
 		a.PushFrame(f, dir)
 	case BotStoppedSpeakingFrame:
 		a.commitPlayedAssistantText(AssistantTurnCompletion{ResponseID: f.ResponseID, Reason: AssistantTurnPlaybackCompleted})
+		a.PushFrame(f.Clone(), Upstream)
 		a.PushFrame(f, dir)
 	case InterruptFrame:
 		a.commitPlayedAssistantText(AssistantTurnCompletion{Reason: AssistantTurnInterrupted})
+		stopped := NewBotStoppedSpeakingFrame()
+		stopped.Interrupted = true
+		a.PushFrame(stopped, Upstream)
 		a.PushFrame(f, dir)
 	case EndFrame:
 		a.taskCtx.Logger.Printf("EndFrame at AssistantContextAggregator: reason=%q\n", f.Reason)

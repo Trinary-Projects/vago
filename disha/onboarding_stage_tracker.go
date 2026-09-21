@@ -41,7 +41,7 @@ const (
 	// onboardingTranscript (Python's max_turns=None).
 	transcriptAllTurns = -1
 
-	stageContinuationInstruction = "<system_instruction>The system prompt has been updated for the next stage. Continue the conversation naturally using the new instructions, without repeating what you just said.</system_instruction>"
+	stageContinuationInstruction = "<system_message>The system prompt has been updated for the next stage. Continue the conversation naturally using the new instructions, without repeating what you just said.</system_message>"
 )
 
 // serverMessageEmitter is the narrow RTVI surface the tracker/manager
@@ -103,12 +103,6 @@ type OnboardingStageTracker struct {
 	// classifierMu serializes SetPromptMetadata + Stream on the shared
 	// classifier so overlapping runs can't mismatch metadata and call.
 	classifierMu sync.Mutex
-
-	// Only one pending continuation is needed. IDs come from the originating
-	// LLM request, not callback arrival order; idle nudges have ID zero.
-	continuationMu    sync.Mutex
-	pendingResponseID int64
-	playedResponseID  int64
 }
 
 func NewOnboardingStageTracker(
@@ -417,55 +411,17 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 		return
 	}
 	t.sendRTVI(fmt.Sprintf("%s Transition complete %s => %s", stageTrackerLogPrefix, startedStageName, output))
-	t.armContinuation(continuationResponseID)
+	t.queueContinuation(continuationResponseID)
 }
 
-// Either playback or the stage transition may finish first. Both paths try
-// the same one-shot continuation; the aggregator revalidates it at consumption.
-func (t *OnboardingStageTracker) armContinuation(responseID int64) {
-	if responseID == 0 {
-		return
-	}
-	t.continuationMu.Lock()
-	if responseID >= t.playedResponseID && responseID >= t.pendingResponseID {
-		t.pendingResponseID = responseID
-	}
-	ready := t.takeContinuationLocked()
-	t.continuationMu.Unlock()
-	t.queueContinuation(ready)
-}
-
-func (t *OnboardingStageTracker) OnAssistantTurnCommitted(turn voicepipelinecore.AssistantTurnCompletion) {
-	t.continuationMu.Lock()
-	if turn.Reason != voicepipelinecore.AssistantTurnPlaybackCompleted {
-		t.pendingResponseID = 0
-	} else if turn.ResponseID > t.playedResponseID {
-		t.playedResponseID = turn.ResponseID
-	}
-	ready := t.takeContinuationLocked()
-	t.continuationMu.Unlock()
-	t.queueContinuation(ready)
-}
-
-func (t *OnboardingStageTracker) takeContinuationLocked() int64 {
-	if t.pendingResponseID == 0 || t.pendingResponseID > t.playedResponseID {
-		return 0
-	}
-	responseID := t.pendingResponseID
-	t.pendingResponseID = 0
-	if responseID != t.playedResponseID {
-		return 0
-	}
-	return responseID
-}
-
+// Core admits this request after generation context is ready and preserves queued speech.
 func (t *OnboardingStageTracker) queueContinuation(responseID int64) {
 	ctx, pair, _ := t.infrastructure()
 	if responseID == 0 || ctx == nil || ctx.Err() != nil || pair == nil {
 		return
 	}
 	frame := voicepipelinecore.NewLLMMessagesAppendFrame([]voicepipelinecore.Message{
-		{Role: "user", Content: stageContinuationInstruction, Synthetic: true},
+		{Role: "user", Content: stageContinuationInstruction},
 	}, true)
 	frame.AfterResponseID = responseID
 	pair.User().QueueFrame(frame, voicepipelinecore.Downstream)
@@ -551,9 +507,6 @@ func onboardingTranscript(messages []voicepipelinecore.Message, maxTurns int) st
 	}
 	filtered := make([]voicepipelinecore.Message, 0, len(messages))
 	for _, m := range messages {
-		if m.Synthetic {
-			continue
-		}
 		if m.Content == "" {
 			continue
 		}

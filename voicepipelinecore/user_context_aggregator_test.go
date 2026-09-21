@@ -567,6 +567,8 @@ func TestUserContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	// User says "I have a question" — 4 words → barge-in fires.
 	source.QueueFrame(TranscriptFrame{Text: "I have a question", IsFinal: false, ResponseID: 1}, Downstream)
 	time.Sleep(20 * time.Millisecond)
+	sink.QueueFrame(BotStoppedSpeakingFrame{Interrupted: true}, Upstream)
+	time.Sleep(10 * time.Millisecond)
 	// Now final tokens + <end> arrive after barge-in.
 	source.QueueFrame(TranscriptFrame{Text: "I have a question", IsFinal: true, ResponseID: 1}, Downstream)
 	source.QueueFrame(TranscriptFrame{Text: "<end>", IsFinal: true, ResponseID: 1}, Downstream)
@@ -619,18 +621,19 @@ func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testi
 			users = append(users, text)
 		},
 	})
-	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
-
-	down, _ := runProcessorTest(t, fix, runConfig{
-		processor: a,
-		framesToSend: []Frame{
-			TranscriptFrame{Text: "first", IsFinal: true},
-			TranscriptFrame{Text: "<end>", IsFinal: true},
-			TranscriptFrame{Text: "second", IsFinal: true},
-			TranscriptFrame{Text: "<end>", IsFinal: true},
-		},
-		sendEndFrame: true,
-	})
+	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
+	sink := newQueueProcessor(fix.TaskCtx, "output", Downstream)
+	processors := []Processor{pair.User(), pair.Assistant(), sink}
+	NewPipeline(processors).Start(fix.RootCtx)
+	defer stopProcessorsAndWait(t, fix, time.Second, processors...)
+	for i, text := range []string{"first", "second"} {
+		pair.User().QueueFrame(NewTranscriptFrame(text, true, i+1, false), Downstream)
+		pair.User().QueueFrame(NewTranscriptFrame("<end>", true, i+1, false), Downstream)
+		awaitSpeechCondition(t, "user request", func() bool {
+			return countFrames[LLMMessagesFrame](sink.Captured()) == i+1
+		})
+	}
+	down := sink.Captured()
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(users) != 2 || users[0] != "first" || users[1] != "first second" {

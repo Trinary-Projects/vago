@@ -340,3 +340,10 @@ func countFrames[T Frame](frames []Frame) int {
 	}
 	return count
 }
+
+// Already-played words enter the assistant side with playback priority.
+func playedWordsFrame(words []string) WordTimestampFrame {
+	f := NewWordTimestampFrame(words)
+	f.played = true
+	return f
+}

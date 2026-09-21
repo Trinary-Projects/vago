@@ -80,14 +80,21 @@ func noContinuationRequest(t *testing.T, sink *stageContinuationSink) {
 	}
 }
 
+func finishContinuationGeneration(h *stageMachineHarness, id int64) {
+	end := voicepipelinecore.NewLLMResponseEndFrame()
+	end.ResponseID, end.Text = id, continuationTestStatement
+	h.pair.User().ProcessFrame(context.Background(), end, voicepipelinecore.Upstream)
+}
+
 func finishContinuationPlayback(h *stageMachineHarness, id int64) {
+	finishContinuationGeneration(h, id)
 	// Played text deliberately differs from the generated trigger. Matching
 	// stays on generated text while the next request contains what was heard.
 	h.pair.Assistant().ProcessFrame(context.Background(), voicepipelinecore.NewWordTimestampFrame([]string{"played", "trigger"}), voicepipelinecore.Downstream)
 	stopped := voicepipelinecore.NewBotStoppedSpeakingFrame()
 	stopped.ResponseID = id
 	h.pair.Assistant().ProcessFrame(context.Background(), stopped, voicepipelinecore.Downstream)
-	h.tracker.OnAssistantTurnCommitted(voicepipelinecore.AssistantTurnCompletion{ResponseID: id, Reason: voicepipelinecore.AssistantTurnPlaybackCompleted})
+
 }
 
 func TestStageContinuationBothCompletionOrders(t *testing.T) {
@@ -105,13 +112,7 @@ func TestStageContinuationBothCompletionOrders(t *testing.T) {
 			}
 			h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{ResponseID: id, Text: continuationTestStatement})
 			if !playbackFirst {
-				waitForCondition(t, time.Second, "pending transition", func() bool {
-					h.tracker.continuationMu.Lock()
-					defer h.tracker.continuationMu.Unlock()
-					return h.tracker.pendingResponseID == id
-				})
-				noContinuationRequest(t, sink)
-				finishContinuationPlayback(h, id)
+				finishContinuationGeneration(h, id)
 			}
 			next := awaitContinuationRequest(t, sink)
 			messages := next.Messages
@@ -119,20 +120,24 @@ func TestStageContinuationBothCompletionOrders(t *testing.T) {
 				t.Fatal("continuation used the old stage prompt")
 			}
 			last := messages[len(messages)-1]
-			if last.Role != "user" || last.Content != stageContinuationInstruction || !last.Synthetic {
+			if last.Role != "user" || last.Content != stageContinuationInstruction {
 				t.Fatalf("continuation instruction = %+v", last)
 			}
-			if messages[len(messages)-2].Content != "played trigger" {
-				t.Fatal("continuation missing played assistant history")
+			wantPrevious := continuationTestStatement
+			if playbackFirst {
+				wantPrevious = "played trigger"
+			}
+			if messages[len(messages)-2].Content != wantPrevious {
+				t.Fatalf("previous response = %q, want %q", messages[len(messages)-2].Content, wantPrevious)
 			}
 			if next.ID() == id {
 				t.Fatal("continuation reused the old response identity")
 			}
-			if strings.Contains(onboardingTranscript(messages, transcriptAllTurns), stageContinuationInstruction) {
-				t.Fatal("synthetic instruction entered patient transcript")
+			if !strings.Contains(onboardingTranscript(messages, transcriptAllTurns), "patient: "+stageContinuationInstruction) {
+				t.Fatal("continuation instruction missing from patient transcript")
 			}
 			// A duplicate completion event cannot run the same continuation twice.
-			h.tracker.OnAssistantTurnCommitted(voicepipelinecore.AssistantTurnCompletion{ResponseID: id, Reason: voicepipelinecore.AssistantTurnPlaybackCompleted})
+
 			noContinuationRequest(t, sink)
 		})
 	}
@@ -184,10 +189,9 @@ func TestStageContinuationInterruptionAndShutdownWhileTransitionPending(t *testi
 			}
 			h.pair.User().ProcessFrame(context.Background(), frame, voicepipelinecore.Downstream)
 			h.pair.Assistant().ProcessFrame(context.Background(), frame, voicepipelinecore.Downstream)
-			h.tracker.OnAssistantTurnCommitted(voicepipelinecore.AssistantTurnCompletion{Reason: reason})
 			// Even a late success callback cannot resurrect the invalidated turn.
 			finishContinuationPlayback(h, id)
-			h.tracker.armContinuation(id)
+			h.tracker.queueContinuation(id)
 			noContinuationRequest(t, sink)
 		})
 	}
@@ -265,12 +269,12 @@ func TestStageContinuationCannotUseIdleNudgeCompletion(t *testing.T) {
 	awaitContinuationRequest(t, sink)
 }
 
-func TestOnboardingTranscriptSkipsSyntheticInstructionsBeforeWindowing(t *testing.T) {
+func TestOnboardingTranscriptIncludesContinuationInstructionInWindow(t *testing.T) {
 	messages := []voicepipelinecore.Message{
 		{Role: "system", Content: "prompt"}, {Role: "user", Content: "real answer"},
-		{Role: "assistant", Content: "trigger"}, {Role: "user", Content: stageContinuationInstruction, Synthetic: true},
+		{Role: "assistant", Content: "trigger"}, {Role: "user", Content: stageContinuationInstruction},
 	}
-	if got := onboardingTranscript(messages, 2); got != "patient: real answer\ndisha: trigger" {
+	if got := onboardingTranscript(messages, 2); got != "disha: trigger\npatient: "+stageContinuationInstruction {
 		t.Fatalf("transcript = %q", got)
 	}
 }

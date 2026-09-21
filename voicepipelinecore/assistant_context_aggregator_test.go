@@ -31,8 +31,8 @@ func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing
 	source.QueueFrame(TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
 	time.Sleep(20 * time.Millisecond)
 
-	mid.QueueFrame(NewWordTimestampFrame([]string{"hi"}), Downstream)
-	mid.QueueFrame(NewWordTimestampFrame([]string{"there"}), Downstream)
+	mid.QueueFrame(playedWordsFrame([]string{"hi"}), Downstream)
+	mid.QueueFrame(playedWordsFrame([]string{"there"}), Downstream)
 	mid.QueueFrame(NewBotStoppedSpeakingFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 
@@ -65,8 +65,8 @@ func TestAssistantContextAggregator_CommitsBeforeEndFrameReachesSink(t *testing.
 	assistant.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
-	source.QueueFrame(NewWordTimestampFrame([]string{"goodbye"}), Downstream)
-	source.QueueFrame(NewWordTimestampFrame([]string{"."}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"goodbye"}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"."}), Downstream)
 	source.QueueFrame(NewEndFrame(string(EndReasonUnspecified)), Downstream)
 
 	deadline := time.Now().Add(time.Second)
@@ -100,7 +100,7 @@ func TestAssistantContextAggregator_InterruptCommitsPlayedAssistantText(t *testi
 	assistant.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
-	source.QueueFrame(NewWordTimestampFrame([]string{"partial"}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"partial"}), Downstream)
 	source.QueueFrame(NewInterruptFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, assistant, sink)

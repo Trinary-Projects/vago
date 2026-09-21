@@ -158,6 +158,10 @@ func (f LLMResponseStartFrame) IsInterruptible() bool { return true }
 
 type LLMResponseEndFrame struct {
 	FrameBase
+	ResponseID int64
+	// Text is generated context for the next inference, reconciled with played
+	// words by the assistant aggregator. It is never a transcript notification.
+	Text string
 }
 
 func NewLLMResponseEndFrame() LLMResponseEndFrame {
@@ -211,7 +215,9 @@ func (f EndFrame) IsInterruptible() bool { return false }
 
 type WordTimestampFrame struct {
 	FrameBase
-	Words []string
+	Words      []string
+	ResponseID int64
+	played     bool
 }
 
 func NewWordTimestampFrame(words []string) WordTimestampFrame {
@@ -220,15 +226,14 @@ func NewWordTimestampFrame(words []string) WordTimestampFrame {
 
 func (f WordTimestampFrame) FrameType() FrameType { return WordTimestamp }
 
-// WordTimestampFrame is emitted only after the corresponding audio has
-// actually played. Treat it as system-priority so an InterruptFrame cannot
-// overtake or purge already-played assistant words before
-// AssistantContextAggregator reconciles them.
-func (f WordTimestampFrame) IsSystem() bool        { return true }
-func (f WordTimestampFrame) IsInterruptible() bool { return false }
+// Pending words stay ordered with audio. Playback promotes a copy to an
+// urgent, non-interruptible notification only after its audio was written.
+func (f WordTimestampFrame) IsSystem() bool        { return f.played }
+func (f WordTimestampFrame) IsInterruptible() bool { return !f.played }
 
 type TTSDoneFrame struct {
 	FrameBase
+	played bool
 }
 
 func NewTTSDoneFrame() TTSDoneFrame {
@@ -237,11 +242,9 @@ func NewTTSDoneFrame() TTSDoneFrame {
 
 func (f TTSDoneFrame) FrameType() FrameType { return TTSDone }
 
-// TTSDoneFrame is a post-playback structural signal. Keep it in the same
-// priority class as WordTimestampFrame/BotStoppedSpeakingFrame so the played
-// completion sequence preserves order at post-playback processors.
-func (f TTSDoneFrame) IsSystem() bool        { return true }
-func (f TTSDoneFrame) IsInterruptible() bool { return false }
+// Synthesis completion is ordered behind audio; only the played copy is urgent.
+func (f TTSDoneFrame) IsSystem() bool        { return f.played }
+func (f TTSDoneFrame) IsInterruptible() bool { return !f.played }
 
 type TTSSpeakFrame struct {
 	FrameBase
@@ -258,6 +261,7 @@ func (f TTSSpeakFrame) IsInterruptible() bool { return true }
 
 type BotStartedSpeakingFrame struct {
 	FrameBase
+	ResponseID int64
 }
 
 func NewBotStartedSpeakingFrame() BotStartedSpeakingFrame {
@@ -269,11 +273,16 @@ func (f BotStartedSpeakingFrame) FrameType() FrameType { return BotStartedSpeaki
 // Pipecat models bot-speaking notifications as SystemFrame.
 func (f BotStartedSpeakingFrame) IsSystem() bool        { return true }
 func (f BotStartedSpeakingFrame) IsInterruptible() bool { return false }
-func (f BotStartedSpeakingFrame) Clone() Frame          { return NewBotStartedSpeakingFrame() }
+func (f BotStartedSpeakingFrame) Clone() Frame {
+	clone := NewBotStartedSpeakingFrame()
+	clone.ResponseID = f.ResponseID
+	return clone
+}
 
 type BotStoppedSpeakingFrame struct {
 	FrameBase
-	ResponseID int64
+	ResponseID  int64
+	Interrupted bool
 }
 
 func NewBotStoppedSpeakingFrame() BotStoppedSpeakingFrame {
@@ -289,6 +298,7 @@ func (f BotStoppedSpeakingFrame) IsInterruptible() bool { return false }
 func (f BotStoppedSpeakingFrame) Clone() Frame {
 	clone := NewBotStoppedSpeakingFrame()
 	clone.ResponseID = f.ResponseID
+	clone.Interrupted = f.Interrupted
 	return clone
 }
 
@@ -343,8 +353,8 @@ type LLMMessagesAppendFrame struct {
 	FrameBase
 	Messages []Message
 	RunLLM   bool
-	// Nonzero restricts injection to this response's clean playback completion.
-	// The user aggregator checks again when consuming the frame, after queueing.
+	// Nonzero restricts this request to the originating response. The core
+	// admits it after generation context is available, without waiting for audio.
 	AfterResponseID int64
 }
 
@@ -386,6 +396,7 @@ func (f STTConnectFrame) IsInterruptible() bool { return false }
 
 type FunctionCallInProgressFrame struct {
 	FrameBase
+	ResponseID           int64
 	FunctionName         string
 	ToolCallID           string
 	Arguments            map[string]any
@@ -410,6 +421,7 @@ func (f FunctionCallInProgressFrame) IsInterruptible() bool { return false }
 
 type FunctionCallResultFrame struct {
 	FrameBase
+	ResponseID   int64
 	FunctionName string
 	ToolCallID   string
 	Arguments    map[string]any

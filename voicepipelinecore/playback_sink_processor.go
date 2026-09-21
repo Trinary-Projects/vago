@@ -27,6 +27,11 @@ const (
 // On EndFrame, ProcessFrame blocks until runPlayback has drained the
 // queue, written the silence tail, and forwarded EndFrame downstream,
 // so task cleanup cannot cancel ctx mid-drain.
+type playbackCommand struct {
+	frame Frame
+	ctx   context.Context
+}
+
 type PlaybackSinkProcessor struct {
 	*BaseProcessor
 	taskCtx          *TaskContext
@@ -36,8 +41,8 @@ type PlaybackSinkProcessor struct {
 	frameBytes       int
 	bgPCM            []int16 // background audio loop buffer at outputSampleRate mono
 
-	queueCh chan Frame    // ProcessFrame → runPlayback
-	endDone chan struct{} // closed by runPlayback after EndFrame is forwarded
+	queueCh chan playbackCommand // ProcessFrame → runPlayback
+	endDone chan struct{}        // closed by runPlayback after EndFrame is forwarded
 
 	// Owned by runPlayback only:
 	bgPos           int
@@ -97,7 +102,7 @@ func NewPlaybackSinkProcessor(taskCtx *TaskContext) *PlaybackSinkProcessor {
 		frameSamples:     pcmSamplesPerFrameForRate(outputSampleRate),
 		frameBytes:       pcmFrameBytesForRate(outputSampleRate),
 		bgPCM:            bgPCM,
-		queueCh:          make(chan Frame, 256),
+		queueCh:          make(chan playbackCommand, 256),
 		endDone:          make(chan struct{}),
 	}
 	p.BaseProcessor = NewBaseProcessor("PlaybackSink", p, taskCtx)
@@ -134,23 +139,27 @@ func (p *PlaybackSinkProcessor) Start(ctx context.Context) {
 }
 
 func (p *PlaybackSinkProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
+	if dir == Upstream {
+		p.PushFrame(frame, dir)
+		return
+	}
 	switch frame.(type) {
 	case EndFrame:
 		// EndFrame must drain through runPlayback (audio tail + silence)
 		// before task cleanup stops the processor.
 		select {
-		case p.queueCh <- frame:
+		case p.queueCh <- playbackCommand{frame: frame, ctx: ctx}:
 		case <-p.ctx.Done():
 			return
 		}
 		select {
 		case <-p.endDone:
-		case <-p.ctx.Done():
+		case <-ctx.Done():
 		}
 	case AudioFrame, WordTimestampFrame, TTSDoneFrame,
 		LLMResponseStartFrame, TTSSpeakFrame, InterruptFrame:
 		select {
-		case p.queueCh <- frame:
+		case p.queueCh <- playbackCommand{frame: frame, ctx: ctx}:
 		case <-p.ctx.Done():
 		}
 	case LLMResponseEndFrame:
@@ -169,8 +178,10 @@ func (p *PlaybackSinkProcessor) runPlayback() {
 		select {
 		case <-p.ctx.Done():
 			return
-		case f := <-p.queueCh:
-			p.handleQueueFrame(f)
+		case cmd := <-p.queueCh:
+			if !cmd.frame.IsInterruptible() || cmd.ctx.Err() == nil {
+				p.handleQueueFrame(cmd.frame)
+			}
 		case tickAt := <-ticker.C:
 			timingEnabled := p.audioTimingEnabled()
 			if timingEnabled && !lastTick.IsZero() {
@@ -212,17 +223,10 @@ func (p *PlaybackSinkProcessor) handleQueueFrame(f Frame) {
 			p.taskCtx.Logger.Printf("EndFrame queued in PlaybackSink after %d pending playback frames: reason=%q\n", len(p.playbackQueue), v.Reason)
 		}
 		p.playbackQueue = append(p.playbackQueue, v)
-	case LLMResponseStartFrame:
-		p.responseID = v.ResponseID
+	case LLMResponseStartFrame, TTSSpeakFrame:
+		// A new utterance is an ordered boundary, never a queue reset.
 		p.interrupted = false
-		p.playbackStarted = false
-		p.playbackQueue = nil
-		p.metrics.StartAt(MetricE2ELatency, v.StartedAt)
-	case TTSSpeakFrame:
-		p.responseID = 0 // Idle nudges are not an LLM response.
-		p.interrupted = false
-		p.playbackStarted = false
-		p.playbackQueue = nil
+		p.playbackQueue = append(p.playbackQueue, v)
 	case InterruptFrame:
 		p.interrupted = true
 		// Only shutdown survives the playback queue purge. Queued
@@ -255,6 +259,16 @@ func (p *PlaybackSinkProcessor) tick() bool {
 	var botPCM []int16
 	for len(p.playbackQueue) > 0 {
 		switch f := p.playbackQueue[0].(type) {
+		case LLMResponseStartFrame:
+			p.responseID = f.ResponseID
+			p.playbackStarted = false
+			p.metrics.StartAt(MetricE2ELatency, f.StartedAt)
+			p.playbackQueue = p.playbackQueue[1:]
+		case TTSSpeakFrame:
+			p.responseID = f.ID()
+			p.playbackStarted = false
+			p.metrics.Reset()
+			p.playbackQueue = p.playbackQueue[1:]
 		case AudioFrame:
 			if !p.playbackStarted {
 				p.playbackStarted = true
@@ -267,8 +281,11 @@ func (p *PlaybackSinkProcessor) tick() bool {
 				// cancel its idle timer; downstream is informational for
 				// any future post-Playback consumer. Mirrors Pipecat's
 				// BaseOutputTransport.MediaSender._bot_started_speaking.
-				p.Broadcast(NewBotStartedSpeakingFrame())
+				started := NewBotStartedSpeakingFrame()
+				started.ResponseID = p.responseID
+				p.Broadcast(started)
 				if mf := p.metrics.Stop(MetricE2ELatency); mf != nil {
+					mf.ResponseID = p.responseID
 					p.PushFrame(*mf, Downstream)
 				}
 			}
@@ -276,19 +293,19 @@ func (p *PlaybackSinkProcessor) tick() bool {
 			p.playbackQueue = p.playbackQueue[1:]
 			goto mix
 		case WordTimestampFrame:
+			f.played = true
 			p.PushFrame(f, Downstream)
 			p.playbackQueue = p.playbackQueue[1:]
 		case TTSDoneFrame:
+			f.played = true
 			p.taskCtx.Logger.Println("Playback complete")
 			p.taskCtx.UIEvents.BotStoppedSpeaking(time.Now())
 			p.PushFrame(f, Downstream)
-			// Broadcast: upstream tells UserContextAggregator/UserIdle that
-			// the bot finished speaking; downstream tells the assistant
-			// context aggregator to commit the played words before EndFrame
-			// can reach PipelineSink.
+			// Commit played words before notifying upstream turn handling.
 			stopped := NewBotStoppedSpeakingFrame()
 			stopped.ResponseID = p.responseID
-			p.Broadcast(stopped)
+			// AssistantContextAggregator notifies upstream after history commit.
+			p.PushFrame(stopped, Downstream)
 			p.playbackQueue = p.playbackQueue[1:]
 		case EndFrame:
 			p.playbackQueue = p.playbackQueue[1:]

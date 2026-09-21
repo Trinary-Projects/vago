@@ -88,8 +88,8 @@ func TestContextEnricherIgnoresOtherFrames(t *testing.T) {
 	down, _ := runProcessorTest(t, fix, runConfig{
 		processor: p,
 		framesToSend: []Frame{
-			NewTextFrame("text"),
 			NewInterruptFrame(),
+			NewTextFrame("text"),
 			NewTranscriptFrame("hello", true, 1, false),
 		},
 		sendEndFrame: true,

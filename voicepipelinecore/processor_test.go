@@ -402,7 +402,7 @@ func TestBaseProcessor_QueueFrameDirectionRouting(t *testing.T) {
 
 	// Send a data frame and a system frame and verify both are received.
 	pt.QueueFrame(TextFrame{Text: "data"}, Downstream)
-	pt.QueueFrame(InterruptFrame{}, Downstream)
+	pt.QueueFrame(BotStartedSpeakingFrame{}, Downstream)
 
 	// Wait for them to be processed
 	deadline := time.Now().Add(time.Second)
@@ -430,7 +430,7 @@ func TestBaseProcessor_QueueFrameDirectionRouting(t *testing.T) {
 		switch r.frame.(type) {
 		case TextFrame:
 			sawData = true
-		case InterruptFrame:
+		case BotStartedSpeakingFrame:
 			sawSystem = true
 		}
 	}
