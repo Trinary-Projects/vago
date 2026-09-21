@@ -13,10 +13,8 @@ const (
 	MetricProcessing      MetricLabel = "processing"
 	MetricTextAggregation MetricLabel = "text_aggregation"
 	MetricE2ELatency      MetricLabel = "e2e_latency"
-	// MetricContextEnrich times a blocking pre-LLM context rewrite
-	// (ContextEnricherProcessor). It is deliberately separate from the LLM's
-	// own MetricTTFB: the enricher runs upstream of LLMProcessor, so
-	// llm_ttfb_ms keeps measuring only the model's time to first token.
+	// MetricContextEnrich times request-only enrichment before LLMProcessor
+	// starts MetricTTFB, keeping retrieval latency out of llm_ttfb_ms.
 	MetricContextEnrich MetricLabel = "context_enrich"
 )
 
@@ -31,8 +29,7 @@ type MetricsData struct {
 // It is intercepted by the pipeline's Send function and never reaches processors.
 type MetricsFrame struct {
 	FrameBase
-	Data       []MetricsData
-	ResponseID int64
+	Data []MetricsData
 }
 
 func NewMetricsFrame(data []MetricsData) MetricsFrame {
@@ -100,7 +97,7 @@ func (m *ProcessorMetrics) Reset() {
 
 type perTurnMetrics struct {
 	mu      sync.Mutex
-	current map[int64]TurnMetrics
+	current TurnMetrics
 }
 
 func (m *perTurnMetrics) absorb(frame MetricsFrame) {
@@ -109,34 +106,29 @@ func (m *perTurnMetrics) absorb(frame MetricsFrame) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.current == nil {
-		m.current = make(map[int64]TurnMetrics)
-	}
-	current := m.current[frame.ResponseID]
 	for _, d := range frame.Data {
 		switch {
 		case d.Processor == "llm" && d.Label == MetricTTFB:
-			current.LLMTTFBMs = d.ValueMs
+			m.current.LLMTTFBMs = d.ValueMs
 		case d.Processor == "llm" && d.Label == MetricProcessing:
-			current.LLMProcessingMs = d.ValueMs
+			m.current.LLMProcessingMs = d.ValueMs
 		case d.Processor == "tts" && d.Label == MetricTextAggregation:
-			current.TTSTextAggregationMs = d.ValueMs
+			m.current.TTSTextAggregationMs = d.ValueMs
 		case d.Processor == "tts" && d.Label == MetricTTFB:
-			current.TTSTTFBMs = d.ValueMs
+			m.current.TTSTTFBMs = d.ValueMs
 		case d.Processor == "playback" && d.Label == MetricE2ELatency:
-			current.E2ELatencyMs = d.ValueMs
+			m.current.E2ELatencyMs = d.ValueMs
 		}
 	}
-	m.current[frame.ResponseID] = current
 }
 
-func (m *perTurnMetrics) snapshotAndReset(id int64) TurnMetrics {
+func (m *perTurnMetrics) snapshotAndReset() TurnMetrics {
 	if m == nil {
 		return TurnMetrics{}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := m.current[id]
-	delete(m.current, id)
+	out := m.current
+	m.current = TurnMetrics{}
 	return out
 }

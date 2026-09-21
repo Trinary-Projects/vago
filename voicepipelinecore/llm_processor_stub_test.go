@@ -230,11 +230,16 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 			{tokens: []string{"guidance ", "received"}},
 		},
 	}
-	aggregator := NewUserContextAggregator(fix.TaskCtx, []Message{
+	pair := NewContextAggregatorPair(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 		{Role: "user", Content: "hello?"},
 	}, "")
+	aggregator := pair.User()
 	llm := NewLLMProcessorWithClient(fix.TaskCtx, client)
+	llm.SetMessagesEnricher(func(_ context.Context, messages []Message) []Message {
+		messages[0].Content += " enriched"
+		return messages
+	})
 
 	handlerCalls := make(chan ToolCallRequest, 1)
 	llm.RegisterTool(ToolDefinition{
@@ -253,10 +258,12 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
 	source.Link(aggregator)
 	aggregator.Link(llm)
-	llm.Link(sink)
+	llm.Link(pair.Assistant())
+	pair.Assistant().Link(sink)
 	source.Start(fix.RootCtx)
 	aggregator.Start(fix.RootCtx)
 	llm.Start(fix.RootCtx)
+	pair.Assistant().Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
 	source.QueueFrame(LLMMessagesAppendFrame{RunLLM: true}, Downstream)
@@ -271,7 +278,7 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 
 	source.QueueFrame(EndFrame{}, Downstream)
 	time.Sleep(50 * time.Millisecond)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, sink)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, pair.Assistant(), sink)
 
 	select {
 	case req := <-handlerCalls:
@@ -288,6 +295,14 @@ func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 	requests := client.Requests()
 	if len(requests) != 2 {
 		t.Fatalf("client requests = %+v, want two LLM calls", requests)
+	}
+	for _, request := range requests {
+		if request.Messages[0].Content != "sales prompt enriched" {
+			t.Fatalf("initial and tool-result runs must each enrich their own copy: %+v", request.Messages)
+		}
+	}
+	if pair.MessagesSnapshot()[0].Content != "sales prompt" {
+		t.Fatal("tool-result enrichment changed shared history")
 	}
 	if len(requests[0].Tools) != 1 || requests[0].Tools[0].Function.Name != "get_guidance" {
 		t.Fatalf("first request tools = %+v, want get_guidance", requests[0].Tools)
@@ -350,10 +365,11 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 			{tokens: []string{"done"}},
 		},
 	}
-	aggregator := NewUserContextAggregator(fix.TaskCtx, []Message{
+	pair := NewContextAggregatorPair(fix.TaskCtx, []Message{
 		{Role: "system", Content: "sales prompt"},
 		{Role: "user", Content: "hello?"},
 	}, "")
+	aggregator := pair.User()
 	llm := NewLLMProcessorWithClient(fix.TaskCtx, client)
 
 	started := make(chan string, 2)
@@ -381,10 +397,12 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
 	source.Link(aggregator)
 	aggregator.Link(llm)
-	llm.Link(sink)
+	llm.Link(pair.Assistant())
+	pair.Assistant().Link(sink)
 	source.Start(fix.RootCtx)
 	aggregator.Start(fix.RootCtx)
 	llm.Start(fix.RootCtx)
+	pair.Assistant().Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
 	source.QueueFrame(LLMMessagesAppendFrame{RunLLM: true}, Downstream)
@@ -403,7 +421,7 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if countFrames[TextFrame](sink.Captured()) >= 1 {
+		if len(client.Requests()) == 3 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -411,15 +429,15 @@ func TestLLM_ToolCallsStartInParallel(t *testing.T) {
 
 	source.QueueFrame(EndFrame{}, Downstream)
 	time.Sleep(50 * time.Millisecond)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, sink)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, aggregator, llm, pair.Assistant(), sink)
 
 	requests := client.Requests()
-	if len(requests) != 2 {
-		t.Fatalf("client requests = %+v, want two LLM calls", requests)
+	if len(requests) != 3 {
+		t.Fatalf("client requests = %+v, want initial call plus both explicit RunLLM requests", requests)
 	}
-	secondMessages := requests[1].Messages
-	if len(secondMessages) != 6 {
-		t.Fatalf("second request messages = %+v, want prompt + user + two assistant/tool pairs", secondMessages)
+	secondMessages := requests[2].Messages
+	if len(secondMessages) < 6 {
+		t.Fatalf("second request messages = %+v, want prompt + user + two assistant/tool pairs (and any earlier completed reply)", secondMessages)
 	}
 	if len(secondMessages[2].ToolCalls) != 1 || len(secondMessages[4].ToolCalls) != 1 {
 		t.Fatalf("assistant tool calls = %+v / %+v, want one call per assistant message", secondMessages[2].ToolCalls, secondMessages[4].ToolCalls)

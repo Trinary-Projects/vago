@@ -62,7 +62,7 @@ type stageTrackerEvaluation struct {
 	latestTranscript        string
 	fullTranscript          string
 	latestAssistantResponse string
-	continuationResponseID  int64
+	continueConversation    bool
 }
 
 // promptMetadataSetter is satisfied by *llmrouter.Router. The tracker
@@ -174,13 +174,7 @@ func (t *OnboardingStageTracker) OnLLMCallCompleted(completion voicepipelinecore
 		return
 	}
 	messages := pair.MessagesSnapshot()
-	latestMessages := messages
-	// Playback can commit before the generation callback is dispatched.
-	// Include the generated trigger exactly once in the classifier window.
-	if n := len(latestMessages); n > 0 && completion.ResponseID != 0 && latestMessages[n-1].ResponseID == completion.ResponseID {
-		latestMessages = latestMessages[:n-1]
-	}
-	latestTranscript := onboardingTranscript(latestMessages, stageTrackerTranscriptTurns-1)
+	latestTranscript := onboardingTranscript(messages, stageTrackerTranscriptTurns-1)
 	latestTranscript += "\ndisha: " + latestAssistantResponse
 	fullTranscript := onboardingTranscript(messages, transcriptAllTurns)
 	evaluation := stageTrackerEvaluation{
@@ -190,7 +184,7 @@ func (t *OnboardingStageTracker) OnLLMCallCompleted(completion voicepipelinecore
 		latestAssistantResponse: latestAssistantResponse,
 	}
 	if !strings.ContainsAny(latestAssistantResponse, "?？؟") && !completion.HasToolCalls {
-		evaluation.continuationResponseID = completion.ResponseID
+		evaluation.continueConversation = true
 	}
 
 	t.sendRTVI(fmt.Sprintf("%s Queued after LLM response for stage=%s", stageTrackerLogPrefix, stageName))
@@ -277,7 +271,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, evaluation stageTracke
 	case StageTransitionDecisionYes:
 		t.sendRTVI(fmt.Sprintf("%s Fuzzy matched %s => %s; skipping LLM",
 			stageTrackerLogPrefix, currentStageName, result.Output))
-		t.processOutput(ctx, result.Output, currentStageName, allowedNextStages, fullTranscript, evaluation.continuationResponseID)
+		t.processOutput(ctx, result.Output, currentStageName, allowedNextStages, fullTranscript, evaluation.continueConversation)
 	case StageTransitionDecisionNo:
 		t.sendRTVI(fmt.Sprintf("%s Fuzzy no transition for stage=%s; skipping LLM",
 			stageTrackerLogPrefix, currentStageName))
@@ -289,7 +283,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, evaluation stageTracke
 			t.reportRunError(ctx, currentStageName, llmErr)
 			return
 		}
-		t.processOutput(ctx, output, currentStageName, allowedNextStages, fullTranscript, evaluation.continuationResponseID)
+		t.processOutput(ctx, output, currentStageName, allowedNextStages, fullTranscript, evaluation.continueConversation)
 	}
 }
 
@@ -369,7 +363,7 @@ func (t *OnboardingStageTracker) logFuzzyResult(currentStageName string, result 
 }
 
 // processOutput mirrors _process_output.
-func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, startedStageName string, allowedNextStages []string, fullTranscript string, continuationResponseID int64) {
+func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, startedStageName string, allowedNextStages []string, fullTranscript string, continueConversation bool) {
 	if strings.ToLower(output) == "no" {
 		t.sendRTVI(fmt.Sprintf("%s No transition for stage=%s", stageTrackerLogPrefix, startedStageName))
 		return
@@ -411,19 +405,20 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 		return
 	}
 	t.sendRTVI(fmt.Sprintf("%s Transition complete %s => %s", stageTrackerLogPrefix, startedStageName, output))
-	t.queueContinuation(continuationResponseID)
+	if continueConversation {
+		t.queueContinuation()
+	}
 }
 
-// Core admits this request after generation context is ready and preserves queued speech.
-func (t *OnboardingStageTracker) queueContinuation(responseID int64) {
+// Pipecat message append requests inference immediately on the shared context.
+func (t *OnboardingStageTracker) queueContinuation() {
 	ctx, pair, _ := t.infrastructure()
-	if responseID == 0 || ctx == nil || ctx.Err() != nil || pair == nil {
+	if ctx == nil || ctx.Err() != nil || pair == nil {
 		return
 	}
 	frame := voicepipelinecore.NewLLMMessagesAppendFrame([]voicepipelinecore.Message{
 		{Role: "user", Content: stageContinuationInstruction},
 	}, true)
-	frame.AfterResponseID = responseID
 	pair.User().QueueFrame(frame, voicepipelinecore.Downstream)
 }
 

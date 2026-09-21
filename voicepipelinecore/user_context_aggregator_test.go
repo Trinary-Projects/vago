@@ -1,7 +1,6 @@
 package voicepipelinecore
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -11,7 +10,7 @@ func testInitialMessages() []Message {
 }
 
 // TestUserContextAggregator_FinalTranscriptEmitsLLMMessages verifies a
-// final transcript ending with <end> produces an LLMMessagesFrame
+// final transcript ending with <end> produces an LLMContextFrame
 // downstream.
 func TestUserContextAggregator_FinalTranscriptEmitsLLMMessages(t *testing.T) {
 	fix := newTestFixture(t)
@@ -26,18 +25,18 @@ func TestUserContextAggregator_FinalTranscriptEmitsLLMMessages(t *testing.T) {
 		sendEndFrame: true,
 	})
 
-	llmMsg, ok := findFrame[LLMMessagesFrame](down)
+	llmMsg, ok := findFrame[LLMContextFrame](down)
 	if !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
-	if len(llmMsg.Messages) == 0 {
-		t.Fatal("LLMMessagesFrame should contain messages")
+	if len(llmMsg.Context.GetMessages()) == 0 {
+		t.Fatal("LLMContextFrame should contain messages")
 	}
 	// First message is the system prompt; second is the user message.
-	if llmMsg.Messages[0].Role != "system" {
-		t.Errorf("first message should be system, got %q", llmMsg.Messages[0].Role)
+	if llmMsg.Context.GetMessages()[0].Role != "system" {
+		t.Errorf("first message should be system, got %q", llmMsg.Context.GetMessages()[0].Role)
 	}
-	last := llmMsg.Messages[len(llmMsg.Messages)-1]
+	last := llmMsg.Context.GetMessages()[len(llmMsg.Context.GetMessages())-1]
 	if last.Role != "user" {
 		t.Errorf("last message should be user, got %q", last.Role)
 	}
@@ -114,17 +113,17 @@ func TestUserContextAggregator_InitialMessagesSeedLLMContext(t *testing.T) {
 		sendEndFrame: true,
 	})
 
-	llmMsg, ok := findFrame[LLMMessagesFrame](down)
+	llmMsg, ok := findFrame[LLMContextFrame](down)
 	if !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
-	if len(llmMsg.Messages) != 3 {
-		t.Fatalf("message count = %d, want 3", len(llmMsg.Messages))
+	if len(llmMsg.Context.GetMessages()) != 3 {
+		t.Fatalf("message count = %d, want 3", len(llmMsg.Context.GetMessages()))
 	}
-	if llmMsg.Messages[0].Content != "seed context" {
-		t.Fatalf("first message content = %q, want seed context", llmMsg.Messages[0].Content)
+	if llmMsg.Context.GetMessages()[0].Content != "seed context" {
+		t.Fatalf("first message content = %q, want seed context", llmMsg.Context.GetMessages()[0].Content)
 	}
-	last := llmMsg.Messages[len(llmMsg.Messages)-1]
+	last := llmMsg.Context.GetMessages()[len(llmMsg.Context.GetMessages())-1]
 	if last.Role != "user" || last.Content != "new user" {
 		t.Fatalf("last message = %+v, want user new user", last)
 	}
@@ -146,15 +145,15 @@ func TestUserContextAggregator_AppendRunLLMEmitsFirstTurnFromInitialContext(t *t
 		sendEndFrame: true,
 	})
 
-	llmMsg, ok := findFrame[LLMMessagesFrame](down)
+	llmMsg, ok := findFrame[LLMContextFrame](down)
 	if !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
-	if len(llmMsg.Messages) != 2 {
-		t.Fatalf("message count = %d, want 2 (the initial context)", len(llmMsg.Messages))
+	if len(llmMsg.Context.GetMessages()) != 2 {
+		t.Fatalf("message count = %d, want 2 (the initial context)", len(llmMsg.Context.GetMessages()))
 	}
-	if llmMsg.Messages[0].Content != "sales prompt" {
-		t.Fatalf("first message = %q, want sales prompt", llmMsg.Messages[0].Content)
+	if llmMsg.Context.GetMessages()[0].Content != "sales prompt" {
+		t.Fatalf("first message = %q, want sales prompt", llmMsg.Context.GetMessages()[0].Content)
 	}
 	// The append frame itself must be consumed, not forwarded.
 	if _, forwarded := findFrame[LLMMessagesAppendFrame](down); forwarded {
@@ -177,207 +176,15 @@ func TestUserContextAggregator_AppendAddsMessages(t *testing.T) {
 		sendEndFrame: true,
 	})
 
-	llmMsg, ok := findFrame[LLMMessagesFrame](down)
+	llmMsg, ok := findFrame[LLMContextFrame](down)
 	if !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
-	if len(llmMsg.Messages) != 2 {
-		t.Fatalf("message count = %d, want 2 (prompt + appended)", len(llmMsg.Messages))
+	if len(llmMsg.Context.GetMessages()) != 2 {
+		t.Fatalf("message count = %d, want 2 (prompt + appended)", len(llmMsg.Context.GetMessages()))
 	}
-	if llmMsg.Messages[1].Content != "injected nudge" {
-		t.Fatalf("appended message = %q, want injected nudge", llmMsg.Messages[1].Content)
-	}
-}
-
-func TestUserContextAggregator_FunctionCallFramesUpdateContextAndRunLLM(t *testing.T) {
-	fix := newTestFixture(t)
-	a := NewUserContextAggregator(fix.TaskCtx, []Message{
-		{Role: "system", Content: "sales prompt"},
-	}, "")
-
-	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
-	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
-	source.Link(a)
-	a.Link(sink)
-	source.Start(fix.RootCtx)
-	a.Start(fix.RootCtx)
-	sink.Start(fix.RootCtx)
-
-	sink.QueueFrame(NewFunctionCallInProgressFrame("get_guidance", "call_1", map[string]any{"situation": "pain"}, `{"situation":"pain"}`, false), Upstream)
-	time.Sleep(20 * time.Millisecond)
-	sink.QueueFrame(NewFunctionCallResultFrame("get_guidance", "call_1", map[string]any{"situation": "pain"}, `{"situation":"pain"}`, "guidance text", true), Upstream)
-	time.Sleep(30 * time.Millisecond)
-
-	source.QueueFrame(EndFrame{}, Downstream)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
-
-	messages := a.messagesForTest()
-	if len(messages) != 3 {
-		t.Fatalf("context messages = %+v, want prompt + assistant tool call + tool result", messages)
-	}
-	assistant := messages[1]
-	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
-		t.Fatalf("assistant tool message = %+v, want one tool call", assistant)
-	}
-	if assistant.ToolCalls[0].ID != "call_1" || assistant.ToolCalls[0].Function.Name != "get_guidance" {
-		t.Fatalf("tool call = %+v, want call_1 get_guidance", assistant.ToolCalls[0])
-	}
-	if assistant.ToolCalls[0].Function.Arguments != `{"situation":"pain"}` {
-		t.Fatalf("tool arguments = %q, want raw JSON", assistant.ToolCalls[0].Function.Arguments)
-	}
-	tool := messages[2]
-	if tool.Role != "tool" || tool.ToolCallID != "call_1" || tool.Content != "guidance text" {
-		t.Fatalf("tool result message = %+v, want call_1 guidance text", tool)
-	}
-
-	if c := countFrames[FunctionCallInProgressFrame](source.Captured()); c != 1 {
-		t.Fatalf("expected FunctionCallInProgressFrame upstream once, got %d", c)
-	}
-	if c := countFrames[FunctionCallResultFrame](source.Captured()); c != 1 {
-		t.Fatalf("expected FunctionCallResultFrame upstream once, got %d", c)
-	}
-	llmMsg, ok := findFrame[LLMMessagesFrame](sink.Captured())
-	if !ok {
-		t.Fatalf("expected LLMMessagesFrame after tool result, got %s", describeFrameTypes(sink.Captured()))
-	}
-	if len(llmMsg.Messages) != 3 || llmMsg.Messages[2].Role != "tool" || llmMsg.Messages[2].Content != "guidance text" {
-		t.Fatalf("LLM context after tool result = %+v", llmMsg.Messages)
-	}
-}
-
-func TestUserContextAggregator_FunctionCallsUsePipecatAssistantToolPairs(t *testing.T) {
-	fix := newTestFixture(t)
-	a := NewUserContextAggregator(fix.TaskCtx, []Message{
-		{Role: "system", Content: "sales prompt"},
-	}, "")
-
-	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
-	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
-	source.Link(a)
-	a.Link(sink)
-	source.Start(fix.RootCtx)
-	a.Start(fix.RootCtx)
-	sink.Start(fix.RootCtx)
-
-	sink.QueueFrame(NewFunctionCallInProgressFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, false), Upstream)
-	sink.QueueFrame(NewFunctionCallInProgressFrame("lookup_plan", "call_2", nil, `{"plan":"starter"}`, false), Upstream)
-	time.Sleep(20 * time.Millisecond)
-	sink.QueueFrame(NewFunctionCallResultFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, "guidance text", false), Upstream)
-	sink.QueueFrame(NewFunctionCallResultFrame("lookup_plan", "call_2", nil, `{"plan":"starter"}`, "plan text", true), Upstream)
-	time.Sleep(30 * time.Millisecond)
-
-	source.QueueFrame(EndFrame{}, Downstream)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
-
-	messages := a.messagesForTest()
-	if len(messages) != 5 {
-		t.Fatalf("context messages = %+v, want prompt + two assistant/tool pairs", messages)
-	}
-	assistant := messages[1]
-	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
-		t.Fatalf("first assistant tool message = %+v, want one tool call", assistant)
-	}
-	if assistant.ToolCalls[0].Function.Name != "get_guidance" {
-		t.Fatalf("first tool call = %+v, want get_guidance", assistant.ToolCalls)
-	}
-	if messages[2].Role != "tool" || messages[2].ToolCallID != "call_1" || messages[2].Content != "guidance text" {
-		t.Fatalf("first tool result = %+v", messages[2])
-	}
-	assistant = messages[3]
-	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
-		t.Fatalf("second assistant tool message = %+v, want one tool call", assistant)
-	}
-	if assistant.ToolCalls[0].Function.Name != "lookup_plan" {
-		t.Fatalf("second tool call = %+v, want lookup_plan", assistant.ToolCalls)
-	}
-	if messages[4].Role != "tool" || messages[4].ToolCallID != "call_2" || messages[4].Content != "plan text" {
-		t.Fatalf("second tool result = %+v", messages[4])
-	}
-	llmMsg, ok := findFrame[LLMMessagesFrame](sink.Captured())
-	if !ok {
-		t.Fatalf("expected LLMMessagesFrame after final tool result, got %s", describeFrameTypes(sink.Captured()))
-	}
-	if len(llmMsg.Messages) != 5 || len(llmMsg.Messages[1].ToolCalls) != 1 || len(llmMsg.Messages[3].ToolCalls) != 1 {
-		t.Fatalf("LLM context after tool results = %+v", llmMsg.Messages)
-	}
-}
-
-func TestUserContextAggregator_EmptyFunctionResultPushesError(t *testing.T) {
-	fix := newTestFixture(t)
-	a := NewUserContextAggregator(fix.TaskCtx, []Message{
-		{Role: "system", Content: "sales prompt"},
-	}, "")
-
-	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
-	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
-	source.Link(a)
-	a.Link(sink)
-	source.Start(fix.RootCtx)
-	a.Start(fix.RootCtx)
-	sink.Start(fix.RootCtx)
-
-	sink.QueueFrame(NewFunctionCallInProgressFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, false), Upstream)
-	time.Sleep(20 * time.Millisecond)
-	sink.QueueFrame(NewFunctionCallResultFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, "", true), Upstream)
-	time.Sleep(30 * time.Millisecond)
-
-	source.QueueFrame(EndFrame{}, Downstream)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
-
-	if c := countFrames[ErrorFrame](source.Captured()); c != 1 {
-		t.Fatalf("expected one ErrorFrame for empty tool result, got %d in %s", c, describeFrameTypes(source.Captured()))
-	}
-	messages := a.messagesForTest()
-	if len(messages) != 3 {
-		t.Fatalf("context messages = %+v", messages)
-	}
-	tool := messages[2]
-	if tool.Role != "tool" || tool.ToolCallID != "call_1" || !strings.Contains(tool.Content, "empty tool result") {
-		t.Fatalf("tool result message = %+v, want explicit empty-result error", tool)
-	}
-}
-
-func TestUserContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
-	fix := newTestFixture(t)
-	var assistantToolCalls []Message
-	var toolResults []Message
-	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnToolResultCommitted: func(assistantToolCall Message, toolResult Message, at time.Time) {
-			assistantToolCalls = append(assistantToolCalls, assistantToolCall)
-			toolResults = append(toolResults, toolResult)
-		},
-	})
-	a := NewUserContextAggregator(fix.TaskCtx, []Message{{Role: "system", Content: "prompt"}}, "")
-
-	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
-	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
-	source.Link(a)
-	a.Link(sink)
-	source.Start(fix.RootCtx)
-	a.Start(fix.RootCtx)
-	sink.Start(fix.RootCtx)
-
-	sink.QueueFrame(NewFunctionCallInProgressFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, false), Upstream)
-	time.Sleep(20 * time.Millisecond)
-	sink.QueueFrame(NewFunctionCallResultFrame("get_guidance", "call_1", nil, `{"situation":"pain"}`, "guidance text", false), Upstream)
-	time.Sleep(30 * time.Millisecond)
-
-	source.QueueFrame(EndFrame{}, Downstream)
-	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
-	fix.TaskCtx.callEvents.stopAndDrain()
-
-	if len(assistantToolCalls) != 1 || len(toolResults) != 1 {
-		t.Fatalf("tool events = assistant:%+v tool:%+v", assistantToolCalls, toolResults)
-	}
-	if assistantToolCalls[0].Role != "assistant" ||
-		len(assistantToolCalls[0].ToolCalls) != 1 ||
-		assistantToolCalls[0].ToolCalls[0].ID != "call_1" ||
-		assistantToolCalls[0].ToolCalls[0].Function.Name != "get_guidance" ||
-		assistantToolCalls[0].ToolCalls[0].Function.Arguments != `{"situation":"pain"}` {
-		t.Fatalf("assistant tool event = %+v", assistantToolCalls[0])
-	}
-	if toolResults[0].Role != "tool" || toolResults[0].ToolCallID != "call_1" || toolResults[0].Content != "guidance text" {
-		t.Fatalf("tool result event = %+v", toolResults[0])
+	if llmMsg.Context.GetMessages()[1].Content != "injected nudge" {
+		t.Fatalf("appended message = %q, want injected nudge", llmMsg.Context.GetMessages()[1].Content)
 	}
 }
 
@@ -493,8 +300,8 @@ func TestUserContextAggregator_BackchannelDiscardedWhenBotFinishesFirst(t *testi
 	source.QueueFrame(EndFrame{}, Downstream)
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
-	if c := countFrames[LLMMessagesFrame](sink.Captured()); c != 0 {
-		t.Errorf("expected NO LLMMessagesFrame for back-channel speech, got %d in %s", c, describeFrameTypes(sink.Captured()))
+	if c := countFrames[LLMContextFrame](sink.Captured()); c != 0 {
+		t.Errorf("expected NO LLMContextFrame for back-channel speech, got %d in %s", c, describeFrameTypes(sink.Captured()))
 	}
 	if c := countFrames[InterruptFrame](sink.Captured()); c != 0 {
 		t.Errorf("did not expect InterruptFrame for sub-threshold speech, got %d", c)
@@ -534,8 +341,8 @@ func TestUserContextAggregator_BackchannelDiscardedWhileBotStillSpeaking(t *test
 	source.QueueFrame(EndFrame{}, Downstream)
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
 
-	if c := countFrames[LLMMessagesFrame](sink.Captured()); c != 0 {
-		t.Errorf("expected NO LLMMessagesFrame; in-progress discard should fire, got %d", c)
+	if c := countFrames[LLMContextFrame](sink.Captured()); c != 0 {
+		t.Errorf("expected NO LLMContextFrame; in-progress discard should fire, got %d", c)
 	}
 	for _, m := range a.messagesForTest() {
 		if m.Role == "user" {
@@ -567,7 +374,7 @@ func TestUserContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	// User says "I have a question" — 4 words → barge-in fires.
 	source.QueueFrame(TranscriptFrame{Text: "I have a question", IsFinal: false, ResponseID: 1}, Downstream)
 	time.Sleep(20 * time.Millisecond)
-	sink.QueueFrame(BotStoppedSpeakingFrame{Interrupted: true}, Upstream)
+	sink.QueueFrame(BotStoppedSpeakingFrame{}, Upstream)
 	time.Sleep(10 * time.Millisecond)
 	// Now final tokens + <end> arrive after barge-in.
 	source.QueueFrame(TranscriptFrame{Text: "I have a question", IsFinal: true, ResponseID: 1}, Downstream)
@@ -580,11 +387,11 @@ func TestUserContextAggregator_BargeInPreservesUserTranscript(t *testing.T) {
 	if c := countFrames[InterruptFrame](sink.Captured()); c != 1 {
 		t.Errorf("expected 1 InterruptFrame, got %d", c)
 	}
-	llmMsg, ok := findFrame[LLMMessagesFrame](sink.Captured())
+	llmMsg, ok := findFrame[LLMContextFrame](sink.Captured())
 	if !ok {
-		t.Fatalf("expected LLMMessagesFrame after barge-in, got %s", describeFrameTypes(sink.Captured()))
+		t.Fatalf("expected LLMContextFrame after barge-in, got %s", describeFrameTypes(sink.Captured()))
 	}
-	last := llmMsg.Messages[len(llmMsg.Messages)-1]
+	last := llmMsg.Context.GetMessages()[len(llmMsg.Context.GetMessages())-1]
 	if last.Role != "user" || last.Content != "I have a question" {
 		t.Errorf("user message: got %q=%q, want user='I have a question'", last.Role, last.Content)
 	}
@@ -630,7 +437,7 @@ func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testi
 		pair.User().QueueFrame(NewTranscriptFrame(text, true, i+1, false), Downstream)
 		pair.User().QueueFrame(NewTranscriptFrame("<end>", true, i+1, false), Downstream)
 		awaitSpeechCondition(t, "user request", func() bool {
-			return countFrames[LLMMessagesFrame](sink.Captured()) == i+1
+			return countFrames[LLMContextFrame](sink.Captured()) == i+1
 		})
 	}
 	down := sink.Captured()
@@ -640,18 +447,18 @@ func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testi
 		t.Fatalf("user turn events = %v, want [\"first\" \"first second\"]", users)
 	}
 
-	var llmFrames []LLMMessagesFrame
+	var llmFrames []LLMContextFrame
 	for _, frame := range down {
-		if llmFrame, ok := frame.(LLMMessagesFrame); ok {
+		if llmFrame, ok := frame.(LLMContextFrame); ok {
 			llmFrames = append(llmFrames, llmFrame)
 		}
 	}
 	if len(llmFrames) != 2 {
-		t.Fatalf("LLMMessagesFrame count = %d, want 2 in %s", len(llmFrames), describeFrameTypes(down))
+		t.Fatalf("LLMContextFrame count = %d, want 2 in %s", len(llmFrames), describeFrameTypes(down))
 	}
-	messages := llmFrames[len(llmFrames)-1].Messages
+	messages := llmFrames[len(llmFrames)-1].Context.GetMessages()
 	if len(messages) == 0 {
-		t.Fatal("last LLMMessagesFrame has no messages")
+		t.Fatal("last LLMContextFrame has no messages")
 	}
 	userMessages := 0
 	for _, message := range messages {

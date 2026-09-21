@@ -24,7 +24,6 @@ const (
 type Envelope struct {
 	Frame     Frame
 	Direction Direction
-	epoch     uint64
 }
 
 // Processor is the interface every pipeline node implements. Concrete
@@ -75,9 +74,9 @@ const (
 //   - processLoop drains procCh, invoking ProcessFrame one frame at a
 //     time. On InterruptFrame the base cancels procCtx (stopping any
 //     in-flight ProcessFrame work that respects ctx), waits for the
-//     processLoop goroutine to exit, purges old interruptible frames in
-//     both data queues, handles the interruption, and restarts processLoop
-//     with a fresh procCtx. Frames enqueued after the interrupt survive.
+//     processLoop goroutine to exit, purges procCh keeping frames where
+//     IsInterruptible() is false, and restarts processLoop with a fresh
+//     procCtx.
 //
 // EndFrame is not a per-processor cancellation signal in the base. It
 // travels downstream in normal frame order and final task cleanup stops
@@ -112,17 +111,17 @@ type BaseProcessor struct {
 
 	// Per-processor cancellation tree:
 	//   taskCtx.Ctx  ->  ctx (per-processor)  ->  procCtx (per-interrupt)
-	ctx        context.Context
-	cancel     context.CancelFunc
-	procCtx    context.Context
-	procCancel context.CancelFunc
-	procMu     sync.Mutex // guards procCtx/procCancel swap on interrupt
+	ctx         context.Context
+	cancel      context.CancelFunc
+	procCtx     context.Context
+	procCancel  context.CancelFunc
+	procCurrent Frame      // Pipecat __process_current_frame; guarded by procMu.
+	procMu      sync.Mutex // guards procCtx/procCancel swap on interrupt
 
 	procWG sync.WaitGroup // tracks processLoop only, for cancel-and-recreate
 
 	cancelling atomic.Bool
 	started    atomic.Bool
-	epoch      atomic.Uint64
 }
 
 // NewBaseProcessor constructs a BaseProcessor. The self parameter must
@@ -193,16 +192,12 @@ func (b *BaseProcessor) QueueFrame(frame Frame, dir Direction) {
 	if b.cancelling.Load() {
 		return
 	}
-	epoch := b.epoch.Load()
-	if _, interrupt := frame.(InterruptFrame); interrupt {
-		epoch = b.epoch.Add(1)
-	}
 	target := b.inputDataCh
 	if frame.IsSystem() {
 		target = b.inputSysCh
 	}
 	select {
-	case target <- Envelope{Frame: frame, Direction: dir, epoch: epoch}:
+	case target <- Envelope{Frame: frame, Direction: dir}:
 	case <-b.ctx.Done():
 	}
 }
@@ -292,25 +287,13 @@ func (b *BaseProcessor) Stop() {
 // data frames; data frames are forwarded to procCh for the processLoop
 // to handle one at a time.
 func (b *BaseProcessor) inputLoop() {
-	var handledEpoch uint64
-	handleSystem := func(env Envelope) {
-		// Concurrent senders can enqueue an older interruption after a newer
-		// one. The newer interruption already invalidated that older work.
-		if _, interrupted := env.Frame.(InterruptFrame); interrupted && env.epoch < handledEpoch {
-			return
-		}
-		b.handleSystem(env)
-		if _, interrupted := env.Frame.(InterruptFrame); interrupted {
-			handledEpoch = env.epoch
-		}
-	}
 	for {
 		// Priority pass: try the system channel first.
 		select {
 		case <-b.ctx.Done():
 			return
 		case env := <-b.inputSysCh:
-			handleSystem(env)
+			b.handleSystem(env)
 			continue
 		default:
 		}
@@ -319,21 +302,8 @@ func (b *BaseProcessor) inputLoop() {
 		case <-b.ctx.Done():
 			return
 		case env := <-b.inputSysCh:
-			handleSystem(env)
+			b.handleSystem(env)
 		case env := <-b.inputDataCh:
-			// A fair select can pick new data while its preceding interrupt
-			// is also ready. Apply that interrupt before assigning a procCtx.
-			for env.epoch > handledEpoch {
-				select {
-				case sys := <-b.inputSysCh:
-					handleSystem(sys)
-				case <-b.ctx.Done():
-					return
-				}
-			}
-			if env.Frame.IsInterruptible() && env.epoch < b.epoch.Load() {
-				continue
-			}
 			select {
 			case b.procCh <- env:
 			case <-b.ctx.Done():
@@ -381,10 +351,17 @@ func (b *BaseProcessor) processLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case env := <-b.procCh:
-			if env.Frame.IsInterruptible() && env.epoch < b.epoch.Load() {
-				continue
+			b.procMu.Lock()
+			if ctx.Err() != nil {
+				b.procMu.Unlock()
+				return
 			}
+			b.procCurrent = env.Frame
+			b.procMu.Unlock()
 			b.self.ProcessFrame(ctx, env.Frame, env.Direction)
+			b.procMu.Lock()
+			b.procCurrent = nil
+			b.procMu.Unlock()
 		}
 	}
 }
@@ -392,53 +369,53 @@ func (b *BaseProcessor) processLoop(ctx context.Context) {
 // handleSystem dispatches a system frame. For InterruptFrame, it
 // performs the cancel-and-recreate dance so that any in-flight
 // ProcessFrame work that respects ctx is cancelled, procCh is purged of
-// old interruptible frames. A fresh procCtx is wired up after the user's
-// InterruptFrame handler forwards the interruption.
+// interruptible frames, and a fresh procCtx is wired up before the
+// user's InterruptFrame handler runs.
 func (b *BaseProcessor) handleSystem(env Envelope) {
 	if _, isInterrupt := env.Frame.(InterruptFrame); isInterrupt {
-		b.interruptProcessLoop(env.epoch)
-		b.self.ProcessFrame(b.ctx, env.Frame, env.Direction)
-		b.startProcessLoop()
-		return
+		b.interruptProcessLoop()
 	}
 	b.self.ProcessFrame(b.ctx, env.Frame, env.Direction)
 }
 
 // interruptProcessLoop cancels the current procCtx, waits for the
 // processLoop goroutine to exit (bounded), purges procCh of
-// old interruptible frames. The caller then restarts processLoop. After this
+// interruptible frames, then starts a fresh processLoop. After this
 // returns, no in-flight ProcessFrame call is running and procCh holds
-// only uninterruptible frames and frames enqueued after this interrupt.
-func (b *BaseProcessor) interruptProcessLoop(epoch uint64) {
+// only frames marked !IsInterruptible.
+func (b *BaseProcessor) interruptProcessLoop() {
 	b.procMu.Lock()
+	// Pipecat preserves an in-flight UninterruptibleFrame and only resets
+	// queued work in that case (frame_processor.py::_start_interruption).
+	preserveCurrent := b.procCurrent != nil && !b.procCurrent.IsInterruptible()
 	cancel := b.procCancel
-	b.procMu.Unlock()
-	if cancel != nil {
+	if !preserveCurrent && cancel != nil {
 		cancel()
 	}
-
-	// Bounded wait for the cancelled processLoop to exit so the next
-	// startProcessLoop sees a clean WaitGroup.
-	done := make(chan struct{})
-	go func() {
-		b.procWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(procLoopExitTimeout):
-		if b.taskCtx != nil && b.taskCtx.Logger != nil {
-			b.taskCtx.Logger.Printf("%s: processLoop did not exit within %s after interrupt; continuing anyway", b.name, procLoopExitTimeout)
+	b.procMu.Unlock()
+	if !preserveCurrent {
+		// Bounded wait for the cancelled processLoop to exit so the next
+		// startProcessLoop sees a clean WaitGroup.
+		done := make(chan struct{})
+		go func() {
+			b.procWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(procLoopExitTimeout):
+			if b.taskCtx != nil && b.taskCtx.Logger != nil {
+				b.taskCtx.Logger.Printf("%s: processLoop did not exit within %s after interrupt; continuing anyway", b.name, procLoopExitTimeout)
+			}
 		}
 	}
-
 	// Drain procCh, keeping frames that must survive an interrupt.
 	var keep []Envelope
 drain:
 	for {
 		select {
 		case env := <-b.procCh:
-			if !env.Frame.IsInterruptible() || env.epoch >= epoch {
+			if !env.Frame.IsInterruptible() {
 				keep = append(keep, env)
 			}
 		default:
@@ -446,8 +423,10 @@ drain:
 		}
 	}
 
-	// Restore surviving frames before the handler forwards the interruption.
-	// handleSystem starts the new process loop only after that handler returns.
+	// Restart only when the current process task was cancelled.
+	if !preserveCurrent {
+		b.startProcessLoop()
+	}
 	for _, env := range keep {
 		select {
 		case b.procCh <- env:

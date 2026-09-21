@@ -47,7 +47,7 @@ func TestReplaceSystemMessageInsertsWhenNoSystemMessage(t *testing.T) {
 
 // The stage tracker replaces the system message from a background
 // goroutine while the user aggregator is running LLM turns. This drives
-// real transcript → LLMMessagesFrame traffic through the aggregator
+// real transcript → LLMContextFrame traffic through the aggregator
 // while hammering ReplaceSystemMessage; the race detector fails the
 // build if the shared-state lock does not cover both sides.
 func TestReplaceSystemMessageConcurrentWithLLMRuns(t *testing.T) {
@@ -74,8 +74,8 @@ func TestReplaceSystemMessageConcurrentWithLLMRuns(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if _, ok := findFrame[LLMMessagesFrame](down); !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+	if _, ok := findFrame[LLMContextFrame](down); !ok {
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
 	messages := pair.User().messagesForTest()
 	if messages[0].Role != "system" || messages[0].Content != "prompt revision" {
@@ -177,8 +177,8 @@ func TestMessagesSnapshotConcurrentWithReplaceSystemMessage(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if _, ok := findFrame[LLMMessagesFrame](down); !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+	if _, ok := findFrame[LLMContextFrame](down); !ok {
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
 	messages := pair.MessagesSnapshot()
 	if messages[0].Role != "system" || messages[0].Content != "prompt revision" {
@@ -194,12 +194,9 @@ func runContextOnlyTurns(t *testing.T, fix *testFixture, pair *ContextAggregator
 	for i := 0; i < 20; i++ {
 		pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "hello", IsFinal: true}, Downstream)
 		pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
-		end := NewLLMResponseEndFrame()
-		end.ResponseID = pair.user.state.responseID
-		pair.User().ProcessFrame(fix.RootCtx, end, Upstream)
 	}
 	deadline := time.Now().Add(time.Second)
-	for countFrames[LLMMessagesFrame](sink.Captured()) < 20 && time.Now().Before(deadline) {
+	for countFrames[LLMContextFrame](sink.Captured()) < 20 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	stopProcessorsAndWait(t, fix, time.Second, sink)

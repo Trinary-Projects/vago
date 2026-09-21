@@ -101,6 +101,11 @@ const (
 	STTConnect
 	FunctionCallInProgress
 	FunctionCallResult
+	LLMAssistantPushAggregation
+	LLMContextType
+	TTSStarted
+	FunctionCallCancel
+	FunctionCallsStarted
 )
 
 type AudioFrame struct {
@@ -144,8 +149,7 @@ func (f InterruptFrame) Clone() Frame          { return NewInterruptFrame() }
 
 type LLMResponseStartFrame struct {
 	FrameBase
-	StartedAt  time.Time
-	ResponseID int64
+	StartedAt time.Time
 }
 
 func NewLLMResponseStartFrame(startedAt time.Time) LLMResponseStartFrame {
@@ -158,10 +162,6 @@ func (f LLMResponseStartFrame) IsInterruptible() bool { return true }
 
 type LLMResponseEndFrame struct {
 	FrameBase
-	ResponseID int64
-	// Text is generated context for the next inference, reconciled with played
-	// words by the assistant aggregator. It is never a transcript notification.
-	Text string
 }
 
 func NewLLMResponseEndFrame() LLMResponseEndFrame {
@@ -215,9 +215,8 @@ func (f EndFrame) IsInterruptible() bool { return false }
 
 type WordTimestampFrame struct {
 	FrameBase
-	Words      []string
-	ResponseID int64
-	played     bool
+	Words     []string
+	ContextID string
 }
 
 func NewWordTimestampFrame(words []string) WordTimestampFrame {
@@ -226,14 +225,13 @@ func NewWordTimestampFrame(words []string) WordTimestampFrame {
 
 func (f WordTimestampFrame) FrameType() FrameType { return WordTimestamp }
 
-// Pending words stay ordered with audio. Playback promotes a copy to an
-// urgent, non-interruptible notification only after its audio was written.
-func (f WordTimestampFrame) IsSystem() bool        { return f.played }
-func (f WordTimestampFrame) IsInterruptible() bool { return !f.played }
+// Word text stays on the ordinary ordered queue before and after output.
+func (f WordTimestampFrame) IsSystem() bool        { return false }
+func (f WordTimestampFrame) IsInterruptible() bool { return true }
 
 type TTSDoneFrame struct {
 	FrameBase
-	played bool
+	ContextID string
 }
 
 func NewTTSDoneFrame() TTSDoneFrame {
@@ -242,9 +240,9 @@ func NewTTSDoneFrame() TTSDoneFrame {
 
 func (f TTSDoneFrame) FrameType() FrameType { return TTSDone }
 
-// Synthesis completion is ordered behind audio; only the played copy is urgent.
-func (f TTSDoneFrame) IsSystem() bool        { return f.played }
-func (f TTSDoneFrame) IsInterruptible() bool { return !f.played }
+// TTS completion stays ordered behind audio, like Pipecat TTSStoppedFrame.
+func (f TTSDoneFrame) IsSystem() bool        { return false }
+func (f TTSDoneFrame) IsInterruptible() bool { return true }
 
 type TTSSpeakFrame struct {
 	FrameBase
@@ -261,7 +259,6 @@ func (f TTSSpeakFrame) IsInterruptible() bool { return true }
 
 type BotStartedSpeakingFrame struct {
 	FrameBase
-	ResponseID int64
 }
 
 func NewBotStartedSpeakingFrame() BotStartedSpeakingFrame {
@@ -274,15 +271,11 @@ func (f BotStartedSpeakingFrame) FrameType() FrameType { return BotStartedSpeaki
 func (f BotStartedSpeakingFrame) IsSystem() bool        { return true }
 func (f BotStartedSpeakingFrame) IsInterruptible() bool { return false }
 func (f BotStartedSpeakingFrame) Clone() Frame {
-	clone := NewBotStartedSpeakingFrame()
-	clone.ResponseID = f.ResponseID
-	return clone
+	return NewBotStartedSpeakingFrame()
 }
 
 type BotStoppedSpeakingFrame struct {
 	FrameBase
-	ResponseID  int64
-	Interrupted bool
 }
 
 func NewBotStoppedSpeakingFrame() BotStoppedSpeakingFrame {
@@ -291,17 +284,14 @@ func NewBotStoppedSpeakingFrame() BotStoppedSpeakingFrame {
 
 func (f BotStoppedSpeakingFrame) FrameType() FrameType { return BotStoppedSpeaking }
 
-// Pipecat models bot-speaking notifications as SystemFrame. This also keeps
-// assistant commit timing ordered relative to played word timestamps.
+// Pipecat models bot-speaking notifications as SystemFrame.
 func (f BotStoppedSpeakingFrame) IsSystem() bool        { return true }
 func (f BotStoppedSpeakingFrame) IsInterruptible() bool { return false }
 func (f BotStoppedSpeakingFrame) Clone() Frame {
-	clone := NewBotStoppedSpeakingFrame()
-	clone.ResponseID = f.ResponseID
-	clone.Interrupted = f.Interrupted
-	return clone
+	return NewBotStoppedSpeakingFrame()
 }
 
+// LLMMessagesFrame is retained for legacy callers; aggregators use LLMContextFrame.
 type LLMMessagesFrame struct {
 	FrameBase
 	Messages []Message
@@ -346,16 +336,13 @@ func (f ErrorFrame) IsInterruptible() bool { return false }
 // LLMMessagesAppendFrame appends messages to the conversation context and
 // optionally runs the LLM. Mirrors Pipecat's LLMMessagesAppendFrame.
 // UserContextAggregator handles it: it appends Messages (if any) to its
-// context, and when RunLLM is set it emits an LLMMessagesFrame for the
+// context, and when RunLLM is set it emits an LLMContextFrame for the
 // current context. Pushing one with no Messages and RunLLM=true is how
 // the bot takes the first turn (greet-first) from the initial context.
 type LLMMessagesAppendFrame struct {
 	FrameBase
 	Messages []Message
 	RunLLM   bool
-	// Nonzero restricts this request to the originating response. The core
-	// admits it after generation context is available, without waiting for audio.
-	AfterResponseID int64
 }
 
 func NewLLMMessagesAppendFrame(messages []Message, runLLM bool) LLMMessagesAppendFrame {
@@ -396,7 +383,6 @@ func (f STTConnectFrame) IsInterruptible() bool { return false }
 
 type FunctionCallInProgressFrame struct {
 	FrameBase
-	ResponseID           int64
 	FunctionName         string
 	ToolCallID           string
 	Arguments            map[string]any
@@ -421,7 +407,6 @@ func (f FunctionCallInProgressFrame) IsInterruptible() bool { return false }
 
 type FunctionCallResultFrame struct {
 	FrameBase
-	ResponseID   int64
 	FunctionName string
 	ToolCallID   string
 	Arguments    map[string]any
@@ -445,3 +430,74 @@ func NewFunctionCallResultFrame(functionName, toolCallID string, arguments map[s
 func (f FunctionCallResultFrame) FrameType() FrameType  { return FunctionCallResult }
 func (f FunctionCallResultFrame) IsSystem() bool        { return false }
 func (f FunctionCallResultFrame) IsInterruptible() bool { return false }
+
+// LLMContextFrame carries the same mutable context object as Pipecat's frame.
+// The LLM reads it when processing this frame, not when it is enqueued.
+type LLMContextFrame struct {
+	FrameBase
+	Context *LLMContext
+}
+
+func NewLLMContextFrame(context *LLMContext) LLMContextFrame {
+	return LLMContextFrame{FrameBase: FrameBase{Meta: newFrameMeta("LLMContextFrame")}, Context: context}
+}
+func (f LLMContextFrame) FrameType() FrameType  { return LLMContextType }
+func (f LLMContextFrame) IsSystem() bool        { return false }
+func (f LLMContextFrame) IsInterruptible() bool { return true }
+
+type TTSStartedFrame struct {
+	FrameBase
+	ContextID string
+}
+
+func NewTTSStartedFrame(contextID string) TTSStartedFrame {
+	return TTSStartedFrame{FrameBase: FrameBase{Meta: newFrameMeta("TTSStartedFrame")}, ContextID: contextID}
+}
+func (f TTSStartedFrame) FrameType() FrameType  { return TTSStarted }
+func (f TTSStartedFrame) IsSystem() bool        { return false }
+func (f TTSStartedFrame) IsInterruptible() bool { return true }
+
+type FunctionCallsStartedFrame struct {
+	FrameBase
+	ToolCalls []ToolCall
+}
+
+func NewFunctionCallsStartedFrame(calls []ToolCall) FunctionCallsStartedFrame {
+	return FunctionCallsStartedFrame{FrameBase: FrameBase{Meta: newFrameMeta("FunctionCallsStartedFrame")}, ToolCalls: calls}
+}
+func (f FunctionCallsStartedFrame) FrameType() FrameType  { return FunctionCallsStarted }
+func (f FunctionCallsStartedFrame) IsSystem() bool        { return true }
+func (f FunctionCallsStartedFrame) IsInterruptible() bool { return false }
+func (f FunctionCallsStartedFrame) Clone() Frame          { return NewFunctionCallsStartedFrame(f.ToolCalls) }
+
+type FunctionCallCancelFrame struct {
+	FrameBase
+	FunctionName, ToolCallID string
+}
+
+func NewFunctionCallCancelFrame(name, id string) FunctionCallCancelFrame {
+	return FunctionCallCancelFrame{FrameBase: FrameBase{Meta: newFrameMeta("FunctionCallCancelFrame")}, FunctionName: name, ToolCallID: id}
+}
+func (f FunctionCallCancelFrame) FrameType() FrameType  { return FunctionCallCancel }
+func (f FunctionCallCancelFrame) IsSystem() bool        { return true }
+func (f FunctionCallCancelFrame) IsInterruptible() bool { return false }
+func (f FunctionCallCancelFrame) Clone() Frame {
+	return NewFunctionCallCancelFrame(f.FunctionName, f.ToolCallID)
+}
+func (f FunctionCallInProgressFrame) Clone() Frame {
+	return NewFunctionCallInProgressFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments, f.CancelOnInterruption)
+}
+func (f FunctionCallResultFrame) Clone() Frame {
+	return NewFunctionCallResultFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments, f.Result, f.RunLLM)
+}
+
+// LLMAssistantPushAggregationFrame flushes standalone speech into context,
+// matching Pipecat's TTSService outside an active LLM response.
+type LLMAssistantPushAggregationFrame struct{ FrameBase }
+
+func NewLLMAssistantPushAggregationFrame() LLMAssistantPushAggregationFrame {
+	return LLMAssistantPushAggregationFrame{FrameBase: FrameBase{Meta: newFrameMeta("LLMAssistantPushAggregationFrame")}}
+}
+func (f LLMAssistantPushAggregationFrame) FrameType() FrameType  { return LLMAssistantPushAggregation }
+func (f LLMAssistantPushAggregationFrame) IsSystem() bool        { return false }
+func (f LLMAssistantPushAggregationFrame) IsInterruptible() bool { return true }

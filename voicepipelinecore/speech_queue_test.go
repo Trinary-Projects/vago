@@ -42,40 +42,21 @@ func TestPlaybackIngressPreservesPendingAudioWordAndEndOrder(t *testing.T) {
 	}
 }
 
-func TestInterruptDropsOldIngressAndPreservesNewFrames(t *testing.T) {
+func TestInterruptionDoesNotAddAnInputQueueEpoch(t *testing.T) {
 	fix := newTestFixture(t)
 	p := newPassThroughProcessor(fix.TaskCtx, "ingress")
-	// Both input queues are backlogged before any worker starts.
-	p.QueueFrame(NewTextFrame("old"), Downstream)
+	// Pipecat resets the process queue, not its priority input queue.
+	p.QueueFrame(NewTextFrame("still in input queue"), Downstream)
 	p.QueueFrame(NewInterruptFrame(), Downstream)
-	p.QueueFrame(NewTextFrame("new"), Downstream)
-	p.QueueFrame(NewEndFrame(""), Downstream)
 	p.Start(fix.RootCtx)
 	defer stopProcessorsAndWait(t, fix, time.Second, p)
-	awaitSpeechCondition(t, "new frames after interrupt", func() bool { return len(p.Received()) == 3 })
+	awaitSpeechCondition(t, "input processed after interruption", func() bool { return len(p.Received()) == 2 })
 	got := p.Received()
 	if _, ok := got[0].frame.(InterruptFrame); !ok {
-		t.Fatalf("new processing started before interruption: %T", got[0].frame)
+		t.Fatalf("system frame lost priority: %T", got[0].frame)
 	}
-	if f, ok := got[1].frame.(TextFrame); !ok || f.Text != "new" || !got[1].ctxAlive {
-		t.Fatalf("new frame lost or assigned an old context: %+v", got[1])
-	}
-}
-
-func TestConcurrentInterruptEnqueueDoesNotStrandNewData(t *testing.T) {
-	fix := newTestFixture(t)
-	p := newPassThroughProcessor(fix.TaskCtx, "ingress")
-	// Model sender 1 pausing after assigning its epoch while sender 2 enqueues.
-	p.epoch.Store(2)
-	p.inputSysCh <- Envelope{Frame: NewInterruptFrame(), epoch: 2}
-	p.inputSysCh <- Envelope{Frame: NewInterruptFrame(), epoch: 1}
-	p.QueueFrame(NewTextFrame("new"), Downstream)
-	p.Start(fix.RootCtx)
-	defer stopProcessorsAndWait(t, fix, time.Second, p)
-	awaitSpeechCondition(t, "new data after concurrent interruptions", func() bool { return len(p.Received()) == 2 })
-	got := p.Received()[1]
-	if f, ok := got.frame.(TextFrame); !ok || f.Text != "new" || !got.ctxAlive {
-		t.Fatalf("latest input was lost: %+v", got)
+	if f, ok := got[1].frame.(TextFrame); !ok || f.Text != "still in input queue" {
+		t.Fatalf("input frame was invalidated: %+v", got[1])
 	}
 }
 
@@ -134,9 +115,7 @@ func TestSpeechContextsSynthesizeIndependentlyAndEmitInOrder(t *testing.T) {
 			tts.Start(fix.RootCtx)
 			defer stopProcessorsAndWait(t, fix, time.Second, tts, sink)
 			a := NewLLMResponseStartFrame(time.Now())
-			a.ResponseID = 10
 			b := NewLLMResponseStartFrame(time.Now())
-			b.ResponseID = 20
 			tts.QueueFrame(a, Downstream)
 			tts.QueueFrame(NewTextFrame("alpha."), Downstream)
 			if direct {
@@ -235,7 +214,7 @@ func TestSpeechInterruptionCancelsAllContextsAndRejectsLateAudio(t *testing.T) {
 	}
 }
 
-func TestContinuationGeneratesAheadAndInterruptionReconcilesHistory(t *testing.T) {
+func TestContinuationGeneratesAheadWithoutSpeculativeHistory(t *testing.T) {
 	fix := newTestFixture(t)
 	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
 	fs := newFakeCartesiaServer(t)
@@ -257,8 +236,10 @@ func TestContinuationGeneratesAheadAndInterruptionReconcilesHistory(t *testing.T
 	awaitSpeechCondition(t, "B generation before any A audio", func() bool { return len(client.Requests()) == 2 })
 	bID := collectSpeechRequests(t, fc, 1)["queued beta."]
 	second := client.Requests()[1].Messages
-	if second[len(second)-2].Content != "alpha unheard." {
-		t.Fatalf("B did not see A's generated context: %+v", second)
+	for _, m := range second {
+		if m.Role == "assistant" {
+			t.Fatalf("B saw unplayed generated text: %+v", second)
+		}
 	}
 	// Queue B first at the provider, then start long A. Only A may play.
 	sendSpeechAudio(t, fc, bID, 2, 1)
@@ -287,9 +268,20 @@ func TestContinuationGeneratesAheadAndInterruptionReconcilesHistory(t *testing.T
 			keptInstruction = true
 		}
 	}
-	if !reflect.DeepEqual(assistants, []string{"alpha"}) {
-		t.Fatalf("unheard speech remained in history: %+v", third)
+	// Pipecat does not wait for assistant history before replacement inference.
+	for _, text := range assistants {
+		if text != "alpha" {
+			t.Fatalf("unheard speech in inference: %+v", third)
+		}
 	}
+	awaitSpeechCondition(t, "played history committed after interruption", func() bool {
+		for _, m := range pair.MessagesSnapshot() {
+			if m.Role == "assistant" {
+				return m.Content == "alpha"
+			}
+		}
+		return false
+	})
 	if !keptInstruction || !strings.Contains(third[len(third)-1].Content, "change the topic") {
 		t.Fatalf("user messages were lost: %+v", third)
 	}
@@ -321,14 +313,46 @@ func TestLLMRequestsQueueWithoutCancellingEarlierGeneration(t *testing.T) {
 	}
 }
 
-func TestMetricsStayWithTheirResponseDuringQueuedPlayback(t *testing.T) {
+// Processor measurements are best-effort at chunk commit, not response-correlated.
+func TestProcessorMetricsUseLatestMeasurement(t *testing.T) {
 	m := &perTurnMetrics{}
-	for id := int64(1); id <= 2; id++ {
-		f := NewMetricsFrame([]MetricsData{{Processor: "tts", Label: MetricTTFB, ValueMs: float64(id * 10)}})
-		f.ResponseID = id
-		m.absorb(f)
+	for _, value := range []float64{10, 20} {
+		m.absorb(NewMetricsFrame([]MetricsData{{Processor: "tts", Label: MetricTTFB, ValueMs: value}}))
 	}
-	if a, b := m.snapshotAndReset(1), m.snapshotAndReset(2); a.TTSTTFBMs != 10 || b.TTSTTFBMs != 20 {
-		t.Fatalf("metrics crossed responses: A=%+v B=%+v", a, b)
+	if got := m.snapshotAndReset(); got.TTSTTFBMs != 20 {
+		t.Fatalf("latest metrics=%+v", got)
+	}
+	if got := m.snapshotAndReset(); got != (TurnMetrics{}) {
+		t.Fatalf("metrics not reset: %+v", got)
+	}
+}
+
+func TestStandaloneSpeechFlushesThroughNativeAggregationFrame(t *testing.T) {
+	fix := newTestFixture(t)
+	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
+	server := newFakeCartesiaServer(t)
+	withTTSDialURL(t, server.URL)
+	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
+	tts := NewTTSProcessor(fix.TaskCtx, nil, "")
+	playback := NewPlaybackSinkProcessor(fix.TaskCtx)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	processors := []Processor{tts, playback, pair.Assistant(), sink}
+	NewPipeline(processors).Start(fix.RootCtx)
+	defer stopProcessorsAndWait(t, fix, time.Second, processors...)
+	tts.QueueFrame(NewTTSSpeakFrame("Hello?"), Downstream)
+	conn := server.conn(t, 0)
+	id := collectSpeechRequests(t, conn, 1)["Hello?"]
+	sendSpeechWords(t, conn, id, []string{"Hello?"}, []float64{0})
+	sendSpeechAudio(t, conn, id, 1, 1)
+	conn.sendDone(id)
+	awaitSpeechCondition(t, "standalone aggregation frame after speech", func() bool {
+		return countFrames[LLMAssistantPushAggregationFrame](sink.Captured()) == 1
+	})
+	messages := pair.MessagesSnapshot()
+	if messages[len(messages)-1].Role != "assistant" || messages[len(messages)-1].Content != "Hello?" {
+		t.Fatalf("standalone speech context=%+v", messages)
+	}
+	if countFrames[LLMResponseStartFrame](sink.Captured()) != 0 {
+		t.Fatal("direct speech invented an LLM response")
 	}
 }

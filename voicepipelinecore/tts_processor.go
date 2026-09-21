@@ -96,8 +96,6 @@ type ttsProviderErrorWindow struct {
 // responses may arrive out of order; output is released in creation order.
 type ttsContext struct {
 	id              string
-	responseID      int64
-	metrics         *ProcessorMetrics
 	aggregation     string
 	firstText       bool
 	firstSentence   bool
@@ -124,6 +122,7 @@ type ttsOutputItem struct {
 type TTSProcessor struct {
 	*BaseProcessor
 	taskCtx          *TaskContext
+	metrics          *ProcessorMetrics
 	phonetic         *phoneticFilter
 	modelID          string
 	outputSampleRate int
@@ -191,6 +190,7 @@ func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string, model
 		modelID = defaultCartesiaModelID
 	}
 	t := &TTSProcessor{
+		metrics:              NewProcessorMetrics("tts"),
 		taskCtx:              taskCtx,
 		contextsByID:         make(map[string]*ttsContext),
 		phonetic:             newPhoneticFilter(phoneticDict),
@@ -348,7 +348,8 @@ func (t *TTSProcessor) orchestrator() {
 				}
 			case LLMResponseStartFrame:
 				if pendingEnd == nil {
-					t.turn = t.newContext(f, f.ResponseID)
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: f})
+					t.turn = t.newContext()
 				}
 			case TextFrame:
 				if pendingEnd == nil {
@@ -357,18 +358,23 @@ func (t *TTSProcessor) orchestrator() {
 			case LLMResponseEndFrame:
 				if pendingEnd == nil {
 					t.closeTurn()
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: f})
+					t.drainOutput()
 				}
 			case TTSSpeakFrame:
 				if pendingEnd != nil {
 					continue
 				}
-				c := t.newContext(f, f.ID())
-				// Generated context is provisional; only playback persists a transcript.
-				t.PushFrame(NewLLMMessagesAppendFrame([]Message{{Role: "assistant", Content: f.Text, ResponseID: c.responseID, pendingPlayback: true}}, false), Upstream)
+				pushAggregation := t.turn == nil
+				c := t.newContext()
 				c.firstSentence = true
-				c.metrics.Start(MetricTTFB)
+				t.metrics.Start(MetricTTFB)
 				c.sent = t.sendTextToTTS(c, f.Text)
 				t.closeContext(c)
+				if pushAggregation {
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: NewLLMAssistantPushAggregationFrame()})
+					t.drainOutput()
+				}
 			default:
 				if pendingEnd == nil {
 					// Pipecat's serialization queue also orders ordinary control
@@ -421,17 +427,16 @@ func (t *TTSProcessor) orchestrator() {
 	}
 }
 
-func (t *TTSProcessor) newContext(start Frame, responseID int64) *ttsContext {
-	c := &ttsContext{id: uuid.NewString(), responseID: responseID, metrics: NewProcessorMetrics("tts")}
+func (t *TTSProcessor) newContext() *ttsContext {
+	c := &ttsContext{id: uuid.NewString()}
 	t.outputQueue = append(t.outputQueue, ttsOutputItem{context: c})
 	t.contextsByID[c.id] = c
-	t.emit(c, start)
+	t.emit(c, NewTTSStartedFrame(c.id))
 	return c
 }
 
 func (t *TTSProcessor) emit(c *ttsContext, frame Frame) {
 	if mf, ok := frame.(MetricsFrame); ok {
-		mf.ResponseID = c.responseID
 		t.PushFrame(mf, Downstream)
 		return
 	}
@@ -466,7 +471,7 @@ func (t *TTSProcessor) addText(text string) {
 	}
 	if !c.firstText {
 		c.firstText = true
-		c.metrics.Start(MetricTextAggregation)
+		t.metrics.Start(MetricTextAggregation)
 	}
 	c.aggregation += text
 	if endsWithPunctuation(c.aggregation) {
@@ -481,10 +486,10 @@ func (t *TTSProcessor) flushText(c *ttsContext) {
 	}
 	if !c.firstSentence {
 		c.firstSentence = true
-		if mf := c.metrics.Stop(MetricTextAggregation); mf != nil {
+		if mf := t.metrics.Stop(MetricTextAggregation); mf != nil {
 			t.emit(c, *mf)
 		}
-		c.metrics.Start(MetricTTFB)
+		t.metrics.Start(MetricTTFB)
 	}
 	if t.sendTextToTTS(c, c.aggregation) {
 		c.sent = true
@@ -517,12 +522,15 @@ func (t *TTSProcessor) finishContext(c *ttsContext) {
 		return
 	}
 	t.pushRemainingAudioFrames(c)
-	t.emit(c, NewTTSDoneFrame())
+	done := NewTTSDoneFrame()
+	done.ContextID = c.id
+	t.emit(c, done)
 	c.done = true
 	t.drainOutput()
 }
 
 func (t *TTSProcessor) cancelContexts() {
+	t.metrics.Reset()
 	for _, c := range t.contextsByID {
 		if !c.done {
 			t.CancelTTSContext(c)
@@ -654,7 +662,7 @@ func (t *TTSProcessor) handleTTSEvent(event ttsEvent) {
 	case ttsEventAudioChunk:
 		if !c.firstAudio {
 			c.firstAudio = true
-			if mf := c.metrics.Stop(MetricTTFB); mf != nil {
+			if mf := t.metrics.Stop(MetricTTFB); mf != nil {
 				t.emit(c, *mf)
 			}
 		}
@@ -674,7 +682,7 @@ func (t *TTSProcessor) handleTTSEvent(event ttsEvent) {
 
 func (t *TTSProcessor) emitWord(c *ttsContext, word string) {
 	f := NewWordTimestampFrame([]string{word})
-	f.ResponseID = c.responseID
+	f.ContextID = c.id
 	t.emit(c, f)
 }
 

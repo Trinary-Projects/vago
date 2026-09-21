@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage verifies
+// TestAssistantContextAggregator_ResponseEndCommitsAssistantMessage verifies
 // the Pipecat shape: played words flow downstream out of playback, and
-// BotStoppedSpeakingFrame flushes them into shared assistant history.
-func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing.T) {
+// LLMResponseEndFrame flushes them into shared assistant history.
+func TestAssistantContextAggregator_ResponseEndCommitsAssistantMessage(t *testing.T) {
 	fix := newTestFixture(t)
 	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
 	user := pair.User()
@@ -33,7 +33,7 @@ func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing
 
 	mid.QueueFrame(playedWordsFrame([]string{"hi"}), Downstream)
 	mid.QueueFrame(playedWordsFrame([]string{"there"}), Downstream)
-	mid.QueueFrame(NewBotStoppedSpeakingFrame(), Downstream)
+	mid.QueueFrame(NewLLMResponseEndFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
@@ -49,7 +49,7 @@ func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing
 		}
 	}
 	if !sawAssistant {
-		t.Error("expected an assistant message after BotStoppedSpeakingFrame")
+		t.Error("expected an assistant message after LLMResponseEndFrame")
 	}
 }
 
@@ -101,6 +101,11 @@ func TestAssistantContextAggregator_InterruptCommitsPlayedAssistantText(t *testi
 	sink.Start(fix.RootCtx)
 
 	source.QueueFrame(playedWordsFrame([]string{"partial"}), Downstream)
+	awaitSpeechCondition(t, "text reached assistant before interruption", func() bool {
+		assistant.mu.Lock()
+		defer assistant.mu.Unlock()
+		return len(assistant.playedWords) > 0
+	})
 	source.QueueFrame(NewInterruptFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, assistant, sink)

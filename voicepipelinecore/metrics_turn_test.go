@@ -12,7 +12,7 @@ func TestPerTurnMetricsAbsorbSnapshotAndReset(t *testing.T) {
 		{Processor: "playback", Label: MetricE2ELatency, ValueMs: 55},
 	}))
 
-	got := m.snapshotAndReset(0)
+	got := m.snapshotAndReset()
 	if got.LLMTTFBMs != 11 ||
 		got.LLMProcessingMs != 22 ||
 		got.TTSTextAggregationMs != 33 ||
@@ -21,7 +21,7 @@ func TestPerTurnMetricsAbsorbSnapshotAndReset(t *testing.T) {
 		t.Fatalf("unexpected turn metrics: %+v", got)
 	}
 
-	if got := m.snapshotAndReset(0); got != (TurnMetrics{}) {
+	if got := m.snapshotAndReset(); got != (TurnMetrics{}) {
 		t.Fatalf("metrics should reset after snapshot, got %+v", got)
 	}
 }

@@ -13,16 +13,16 @@ const continuationTestStatement = "ab hum agle mudde par baat karenge"
 
 type stageContinuationSink struct {
 	*voicepipelinecore.BaseProcessor
-	requests chan voicepipelinecore.LLMMessagesFrame
+	requests chan voicepipelinecore.LLMContextFrame
 }
 
 func (s *stageContinuationSink) ProcessFrame(_ context.Context, frame voicepipelinecore.Frame, _ voicepipelinecore.Direction) {
-	if request, ok := frame.(voicepipelinecore.LLMMessagesFrame); ok {
+	if request, ok := frame.(voicepipelinecore.LLMContextFrame); ok {
 		s.requests <- request
 	}
 }
 
-func newStageContinuationHarness(t *testing.T) (*stageMachineHarness, *stageContinuationSink, voicepipelinecore.LLMMessagesFrame) {
+func newStageContinuationHarness(t *testing.T) (*stageMachineHarness, *stageContinuationSink, voicepipelinecore.LLMContextFrame) {
 	t.Helper()
 	h := newStageMachineHarness(t, &stubStageClassifier{output: stageTestNextStage})
 	stage := &StageConfig{Name: "continuation_intro", Prompt: PromptConfig{Name: "obtest/continuation", Version: 1}, NextStages: []string{stageTestNextStage}}
@@ -44,7 +44,7 @@ func newStageContinuationHarness(t *testing.T) (*stageMachineHarness, *stageCont
 	h.pair = pair
 	h.manager.SetInfrastructure(pair, h.routerMeta, h.ui)
 	h.tracker.SetInfrastructure(ctx, pair, h.ui)
-	sink := &stageContinuationSink{requests: make(chan voicepipelinecore.LLMMessagesFrame, 10)}
+	sink := &stageContinuationSink{requests: make(chan voicepipelinecore.LLMContextFrame, 10)}
 	sink.BaseProcessor = voicepipelinecore.NewBaseProcessor("continuation-test-sink", sink, taskCtx)
 	task.SetPipeline(nil, voicepipelinecore.NewPipeline([]voicepipelinecore.Processor{pair.User(), sink}))
 	task.Start()
@@ -60,14 +60,14 @@ func newStageContinuationHarness(t *testing.T) (*stageMachineHarness, *stageCont
 	return h, sink, awaitContinuationRequest(t, sink)
 }
 
-func awaitContinuationRequest(t *testing.T, sink *stageContinuationSink) voicepipelinecore.LLMMessagesFrame {
+func awaitContinuationRequest(t *testing.T, sink *stageContinuationSink) voicepipelinecore.LLMContextFrame {
 	t.Helper()
 	select {
 	case request := <-sink.requests:
 		return request
 	case <-time.After(2 * time.Second):
 		t.Fatal("no LLM continuation request")
-		return voicepipelinecore.LLMMessagesFrame{}
+		return voicepipelinecore.LLMContextFrame{}
 	}
 }
 
@@ -75,26 +75,14 @@ func noContinuationRequest(t *testing.T, sink *stageContinuationSink) {
 	t.Helper()
 	select {
 	case request := <-sink.requests:
-		t.Fatalf("unexpected LLM continuation: %+v", request.Messages)
+		t.Fatalf("unexpected LLM continuation: %+v", request.Context.GetMessages())
 	case <-time.After(50 * time.Millisecond):
 	}
 }
 
-func finishContinuationGeneration(h *stageMachineHarness, id int64) {
-	end := voicepipelinecore.NewLLMResponseEndFrame()
-	end.ResponseID, end.Text = id, continuationTestStatement
-	h.pair.User().ProcessFrame(context.Background(), end, voicepipelinecore.Upstream)
-}
-
-func finishContinuationPlayback(h *stageMachineHarness, id int64) {
-	finishContinuationGeneration(h, id)
-	// Played text deliberately differs from the generated trigger. Matching
-	// stays on generated text while the next request contains what was heard.
+func finishContinuationPlayback(h *stageMachineHarness) {
 	h.pair.Assistant().ProcessFrame(context.Background(), voicepipelinecore.NewWordTimestampFrame([]string{"played", "trigger"}), voicepipelinecore.Downstream)
-	stopped := voicepipelinecore.NewBotStoppedSpeakingFrame()
-	stopped.ResponseID = id
-	h.pair.Assistant().ProcessFrame(context.Background(), stopped, voicepipelinecore.Downstream)
-
+	h.pair.Assistant().ProcessFrame(context.Background(), voicepipelinecore.NewLLMResponseEndFrame(), voicepipelinecore.Downstream)
 }
 
 func TestStageContinuationBothCompletionOrders(t *testing.T) {
@@ -107,15 +95,12 @@ func TestStageContinuationBothCompletionOrders(t *testing.T) {
 			h, sink, request := newStageContinuationHarness(t)
 			id := request.ID()
 			if playbackFirst {
-				finishContinuationPlayback(h, id)
+				finishContinuationPlayback(h)
 				noContinuationRequest(t, sink)
 			}
-			h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{ResponseID: id, Text: continuationTestStatement})
-			if !playbackFirst {
-				finishContinuationGeneration(h, id)
-			}
+			h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: continuationTestStatement})
 			next := awaitContinuationRequest(t, sink)
-			messages := next.Messages
+			messages := next.Context.GetMessages()
 			if !strings.Contains(messages[0].Content, "<problem_discovery_and_exploration>") {
 				t.Fatal("continuation used the old stage prompt")
 			}
@@ -123,12 +108,13 @@ func TestStageContinuationBothCompletionOrders(t *testing.T) {
 			if last.Role != "user" || last.Content != stageContinuationInstruction {
 				t.Fatalf("continuation instruction = %+v", last)
 			}
-			wantPrevious := continuationTestStatement
-			if playbackFirst {
-				wantPrevious = "played trigger"
+			if playbackFirst && messages[len(messages)-2].Content != "played trigger" {
+				t.Fatalf("played text missing: %+v", messages)
 			}
-			if messages[len(messages)-2].Content != wantPrevious {
-				t.Fatalf("previous response = %q, want %q", messages[len(messages)-2].Content, wantPrevious)
+			for _, m := range messages {
+				if m.Role == "assistant" && m.Content == continuationTestStatement {
+					t.Fatal("unplayed generated text entered context")
+				}
 			}
 			if next.ID() == id {
 				t.Fatal("continuation reused the old response identity")
@@ -136,7 +122,7 @@ func TestStageContinuationBothCompletionOrders(t *testing.T) {
 			if !strings.Contains(onboardingTranscript(messages, transcriptAllTurns), "patient: "+stageContinuationInstruction) {
 				t.Fatal("continuation instruction missing from patient transcript")
 			}
-			// A duplicate completion event cannot run the same continuation twice.
+			// There is only one successful transition callback here.
 
 			noContinuationRequest(t, sink)
 		})
@@ -153,9 +139,9 @@ func TestStageContinuationQuestionsAndToolsDoNotAutoRun(t *testing.T) {
 		{"tool call", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, sink, request := newStageContinuationHarness(t)
-			finishContinuationPlayback(h, request.ID())
-			h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{ResponseID: request.ID(), Text: continuationTestStatement + tc.suffix, HasToolCalls: tc.tools})
+			h, sink, _ := newStageContinuationHarness(t)
+			finishContinuationPlayback(h)
+			h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: continuationTestStatement + tc.suffix, HasToolCalls: tc.tools})
 			h.waitForRTVI("Transition complete continuation_intro => " + stageTestNextStage)
 			noContinuationRequest(t, sink)
 		})
@@ -166,9 +152,8 @@ func TestStageContinuationInterruptedAndEmptyGeneration(t *testing.T) {
 	for _, completion := range []voicepipelinecore.LLMCallCompletion{
 		{Text: continuationTestStatement, Interrupted: true}, {Text: "   "},
 	} {
-		h, sink, request := newStageContinuationHarness(t)
-		finishContinuationPlayback(h, request.ID())
-		completion.ResponseID = request.ID()
+		h, sink, _ := newStageContinuationHarness(t)
+		finishContinuationPlayback(h)
 		h.tracker.OnLLMCallCompleted(completion)
 		noContinuationRequest(t, sink)
 		if h.state.CurrentStage().Name != "continuation_intro" {
@@ -177,32 +162,12 @@ func TestStageContinuationInterruptedAndEmptyGeneration(t *testing.T) {
 	}
 }
 
-func TestStageContinuationInterruptionAndShutdownWhileTransitionPending(t *testing.T) {
-	for _, reason := range []voicepipelinecore.AssistantTurnEndReason{voicepipelinecore.AssistantTurnInterrupted, voicepipelinecore.AssistantTurnEnding} {
-		t.Run(string(reason), func(t *testing.T) {
-			h, sink, request := newStageContinuationHarness(t)
-			id := request.ID()
-			h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", id)
-			var frame voicepipelinecore.Frame = voicepipelinecore.NewInterruptFrame()
-			if reason == voicepipelinecore.AssistantTurnEnding {
-				frame = voicepipelinecore.NewEndFrame("done")
-			}
-			h.pair.User().ProcessFrame(context.Background(), frame, voicepipelinecore.Downstream)
-			h.pair.Assistant().ProcessFrame(context.Background(), frame, voicepipelinecore.Downstream)
-			// Even a late success callback cannot resurrect the invalidated turn.
-			finishContinuationPlayback(h, id)
-			h.tracker.queueContinuation(id)
-			noContinuationRequest(t, sink)
-		})
-	}
-}
-
 func TestStageContinuationFailedCompileAfterAdvanceDoesNotRun(t *testing.T) {
-	h, sink, request := newStageContinuationHarness(t)
-	finishContinuationPlayback(h, request.ID())
+	h, sink, _ := newStageContinuationHarness(t)
+	finishContinuationPlayback(h)
 	target := h.config.ResolveStage(stageTestNextStage, nil)
 	target.Prompt = PromptConfig{Name: "missing/continuation-test-document"}
-	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", request.ID())
+	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", true)
 	if h.state.CurrentStage().Name != stageTestNextStage {
 		t.Fatal("test did not reach compile-after-advance failure")
 	}
@@ -213,18 +178,18 @@ func TestStageContinuationFailedCompileAfterAdvanceDoesNotRun(t *testing.T) {
 }
 
 func TestStageContinuationStaleResultDoesNotRun(t *testing.T) {
-	h, sink, request := newStageContinuationHarness(t)
-	finishContinuationPlayback(h, request.ID())
+	h, sink, _ := newStageContinuationHarness(t)
+	finishContinuationPlayback(h)
 	h.state.AdvanceStage(h.config.ResolveStage(stageTestNextStage, nil))
-	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", request.ID())
+	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", true)
 	if !h.hasRTVI("Stale output ignored") {
 		t.Fatal("expected stale result rejection")
 	}
 	noContinuationRequest(t, sink)
 }
 
-func TestStageContinuationDelayedClassifierCannotSupersedeUserInput(t *testing.T) {
-	h, sink, request := newStageContinuationHarness(t)
+func TestStageContinuationDelayedClassifierUsesNativeAppend(t *testing.T) {
+	h, sink, _ := newStageContinuationHarness(t)
 	installMaybeStage(t, h)
 	entered, release := make(chan struct{}), make(chan struct{})
 	classifier := &stubStageClassifier{output: stageTestNextStage, onCall: func() {
@@ -232,41 +197,32 @@ func TestStageContinuationDelayedClassifierCannotSupersedeUserInput(t *testing.T
 		<-release
 	}}
 	h.tracker.classifier = classifier
-	finishContinuationPlayback(h, request.ID())
-	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{ResponseID: request.ID(), Text: "alpha beta gamma"})
+	finishContinuationPlayback(h)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "alpha beta gamma"})
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
 		close(release)
 		t.Fatal("classifier did not start")
 	}
-	// A new utterance invalidates continuation even before a final transcript.
+	// Native append has no originating-response guard: a late classifier can still request inference.
 	h.pair.User().ProcessFrame(context.Background(), voicepipelinecore.TranscriptFrame{Text: "actually", ResponseID: 1}, voicepipelinecore.Downstream)
 	close(release)
 	h.waitForRTVI("Transition complete intro_maybe => " + stageTestNextStage)
-	noContinuationRequest(t, sink)
+	awaitContinuationRequest(t, sink)
 }
 
 func TestStageContinuationCanContinueConsecutiveStages(t *testing.T) {
-	h, sink, request := newStageContinuationHarness(t)
-	finishContinuationPlayback(h, request.ID())
-	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", request.ID())
+	h, sink, _ := newStageContinuationHarness(t)
+	finishContinuationPlayback(h)
+	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", true)
 	next := awaitContinuationRequest(t, sink)
-	finishContinuationPlayback(h, next.ID())
-	h.tracker.processOutput(context.Background(), "introduction", stageTestNextStage, []string{"introduction"}, "transcript", next.ID())
+	finishContinuationPlayback(h)
+	h.tracker.processOutput(context.Background(), "introduction", stageTestNextStage, []string{"introduction"}, "transcript", true)
 	third := awaitContinuationRequest(t, sink)
-	if third.ID() <= next.ID() || !strings.Contains(third.Messages[0].Content, "<introduction_and_call_overview>") {
+	if third.ID() <= next.ID() || !strings.Contains(third.Context.GetMessages()[0].Content, "<introduction_and_call_overview>") {
 		t.Fatal("consecutive stage continuation did not use the latest prompt and response identity")
 	}
-}
-
-func TestStageContinuationCannotUseIdleNudgeCompletion(t *testing.T) {
-	h, sink, request := newStageContinuationHarness(t)
-	h.tracker.processOutput(context.Background(), stageTestNextStage, "continuation_intro", []string{stageTestNextStage}, "transcript", request.ID())
-	finishContinuationPlayback(h, 0)
-	noContinuationRequest(t, sink)
-	finishContinuationPlayback(h, request.ID())
-	awaitContinuationRequest(t, sink)
 }
 
 func TestOnboardingTranscriptIncludesContinuationInstructionInWindow(t *testing.T) {

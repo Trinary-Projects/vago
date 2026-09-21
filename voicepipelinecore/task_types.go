@@ -10,9 +10,6 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
-	// ResponseID correlates generated context, tool history, and played speech.
-	ResponseID      int64 `json:"-"`
-	pendingPlayback bool
 }
 
 // ToolDefinition is an OpenAI-format function tool definition.
@@ -99,7 +96,7 @@ type CallEvents struct {
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the
 	// generated response text (not the played text) and whether the call
-	// was cut short (barge-in/EndFrame cancellation or a stream error).
+	// was cut short (interruption/Stop or a stream error without text).
 	// Mirrors Python CustomOpenAILLMService's on_llm_call_complete event
 	// (is_interrupted = not completed); the onboarding stage-transition
 	// tracker consumes it.
@@ -107,10 +104,8 @@ type CallEvents struct {
 	OnCallEnded        func(reason EndReason, stats CallStats)
 }
 
-// ResponseID is the originating LLMMessagesFrame ID, preserved through playback.
-// The two completion callbacks can arrive in either order.
+// LLMCallCompletion reports generated text to application integrations.
 type LLMCallCompletion struct {
-	ResponseID   int64
 	Text         string
 	Interrupted  bool
 	HasToolCalls bool
@@ -125,8 +120,7 @@ const (
 )
 
 type AssistantTurnCompletion struct {
-	ResponseID int64
-	Reason     AssistantTurnEndReason
+	Reason AssistantTurnEndReason
 }
 
 // TurnMetrics is a per-assistant-turn snapshot assembled from the
