@@ -210,7 +210,17 @@ func (o *Outbox) Enqueue(ctx context.Context, item *OutboxItem) error {
 	if err != nil {
 		return fmt.Errorf("disha: marshal outbox item: %w", err)
 	}
-	return o.store.EnqueueOutboxItem(ctx, item.ID, payload, item.NextAttemptAt)
+	if err := o.store.EnqueueOutboxItem(ctx, item.ID, payload, item.NextAttemptAt); err != nil {
+		return err
+	}
+	// Log the assigned id so a call's persisted work can be found in
+	// Redis (GET vago_outbox:item:{id}) from the app log alone.
+	// TODO: remove this when merging PR
+	if o.logger != nil {
+		o.logger.Printf("disha: outbox enqueued operation=%s id=%s redis_key=%s idempotency_key=%s conversation=%s\n",
+			item.Operation, item.ID, outboxItemKey(item.ID), item.IdempotencyKey, item.SentryTags["conversation_id"])
+	}
+	return nil
 }
 
 // Complete removes a finished item.
