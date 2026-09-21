@@ -44,6 +44,7 @@ type PlaybackSinkProcessor struct {
 	interrupted     bool
 	playbackStarted bool
 	playbackQueue   []Frame
+	responseID      int64
 }
 
 func loadBackgroundPCM(path string, targetSampleRate int, logger interface{ Printf(string, ...interface{}) }) []int16 {
@@ -212,11 +213,13 @@ func (p *PlaybackSinkProcessor) handleQueueFrame(f Frame) {
 		}
 		p.playbackQueue = append(p.playbackQueue, v)
 	case LLMResponseStartFrame:
+		p.responseID = v.ResponseID
 		p.interrupted = false
 		p.playbackStarted = false
 		p.playbackQueue = nil
 		p.metrics.StartAt(MetricE2ELatency, v.StartedAt)
 	case TTSSpeakFrame:
+		p.responseID = 0 // Idle nudges are not an LLM response.
 		p.interrupted = false
 		p.playbackStarted = false
 		p.playbackQueue = nil
@@ -283,7 +286,9 @@ func (p *PlaybackSinkProcessor) tick() bool {
 			// the bot finished speaking; downstream tells the assistant
 			// context aggregator to commit the played words before EndFrame
 			// can reach PipelineSink.
-			p.Broadcast(NewBotStoppedSpeakingFrame())
+			stopped := NewBotStoppedSpeakingFrame()
+			stopped.ResponseID = p.responseID
+			p.Broadcast(stopped)
 			p.playbackQueue = p.playbackQueue[1:]
 		case EndFrame:
 			p.playbackQueue = p.playbackQueue[1:]

@@ -29,7 +29,7 @@ type MessagesEnricher func(ctx context.Context, messages []Message) []Message
 // llm_ttfb_ms on every persisted turn. Here it finishes first and reports its
 // own MetricContextEnrich instead.
 //
-// No new frame type: it consumes LLMMessagesFrame and emits a fresh one.
+// It enriches LLMMessagesFrame while preserving its response identity.
 type ContextEnricherProcessor struct {
 	*BaseProcessor
 
@@ -90,5 +90,7 @@ func (p *ContextEnricherProcessor) enrichFrame(ctx context.Context, frame LLMMes
 	if len(enriched) == 0 {
 		return frame
 	}
-	return NewLLMMessagesFrame(enriched)
+	// Enrichment must preserve the response identity assigned by the aggregator.
+	frame.Messages = enriched
+	return frame
 }

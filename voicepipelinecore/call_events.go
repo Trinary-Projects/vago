@@ -28,9 +28,9 @@ type callEventDispatcher struct {
 	onBotFirstSpeech         func(time.Time)
 	onFirstUserAudio         func(time.Time)
 	onUserTurnCommitted      func(text string, at time.Time, promptKey string)
-	onAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
+	onAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string, turn AssistantTurnCompletion)
 	onToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
-	onLLMCallCompleted       func(text string, interrupted bool)
+	onLLMCallCompleted       func(LLMCallCompletion)
 
 	botJoinedOnce       sync.Once
 	userJoinedOnce      sync.Once
@@ -117,11 +117,11 @@ func (l *callEventDispatcher) fireUserTurnCommitted(text string, at time.Time, p
 	l.dispatch("OnUserTurnCommitted", func() { l.onUserTurnCommitted(text, at, promptKey) })
 }
 
-func (l *callEventDispatcher) fireAssistantTurnCommitted(text string, at time.Time, metrics TurnMetrics, promptKey string) {
+func (l *callEventDispatcher) fireAssistantTurnCommitted(text string, at time.Time, metrics TurnMetrics, promptKey string, turn AssistantTurnCompletion) {
 	if l == nil || l.onAssistantTurnCommitted == nil {
 		return
 	}
-	l.dispatch("OnAssistantTurnCommitted", func() { l.onAssistantTurnCommitted(text, at, metrics, promptKey) })
+	l.dispatch("OnAssistantTurnCommitted", func() { l.onAssistantTurnCommitted(text, at, metrics, promptKey, turn) })
 }
 
 func (l *callEventDispatcher) fireToolResultCommitted(assistantToolCall Message, toolResult Message, at time.Time) {
@@ -131,11 +131,11 @@ func (l *callEventDispatcher) fireToolResultCommitted(assistantToolCall Message,
 	l.dispatch("OnToolResultCommitted", func() { l.onToolResultCommitted(assistantToolCall, toolResult, at) })
 }
 
-func (l *callEventDispatcher) fireLLMCallCompleted(text string, interrupted bool) {
+func (l *callEventDispatcher) fireLLMCallCompleted(completion LLMCallCompletion) {
 	if l == nil || l.onLLMCallCompleted == nil {
 		return
 	}
-	l.dispatch("OnLLMCallCompleted", func() { l.onLLMCallCompleted(text, interrupted) })
+	l.dispatch("OnLLMCallCompleted", func() { l.onLLMCallCompleted(completion) })
 }
 
 func (l *callEventDispatcher) dispatch(name string, fn func()) {

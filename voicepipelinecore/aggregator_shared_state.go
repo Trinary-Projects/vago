@@ -15,6 +15,9 @@ type aggregatorSharedState struct {
 	mu                               sync.Mutex
 	messages                         []Message
 	mainAgentSystemPromptLangfuseKey string
+	responseID                       int64
+	completedResponseID              int64
+	ending                           bool
 }
 
 func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *aggregatorSharedState {

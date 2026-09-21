@@ -144,7 +144,8 @@ func (f InterruptFrame) Clone() Frame          { return NewInterruptFrame() }
 
 type LLMResponseStartFrame struct {
 	FrameBase
-	StartedAt time.Time
+	StartedAt  time.Time
+	ResponseID int64
 }
 
 func NewLLMResponseStartFrame(startedAt time.Time) LLMResponseStartFrame {
@@ -272,6 +273,7 @@ func (f BotStartedSpeakingFrame) Clone() Frame          { return NewBotStartedSp
 
 type BotStoppedSpeakingFrame struct {
 	FrameBase
+	ResponseID int64
 }
 
 func NewBotStoppedSpeakingFrame() BotStoppedSpeakingFrame {
@@ -284,7 +286,11 @@ func (f BotStoppedSpeakingFrame) FrameType() FrameType { return BotStoppedSpeaki
 // assistant commit timing ordered relative to played word timestamps.
 func (f BotStoppedSpeakingFrame) IsSystem() bool        { return true }
 func (f BotStoppedSpeakingFrame) IsInterruptible() bool { return false }
-func (f BotStoppedSpeakingFrame) Clone() Frame          { return NewBotStoppedSpeakingFrame() }
+func (f BotStoppedSpeakingFrame) Clone() Frame {
+	clone := NewBotStoppedSpeakingFrame()
+	clone.ResponseID = f.ResponseID
+	return clone
+}
 
 type LLMMessagesFrame struct {
 	FrameBase
@@ -337,6 +343,9 @@ type LLMMessagesAppendFrame struct {
 	FrameBase
 	Messages []Message
 	RunLLM   bool
+	// Nonzero restricts injection to this response's clean playback completion.
+	// The user aggregator checks again when consuming the frame, after queueing.
+	AfterResponseID int64
 }
 
 func NewLLMMessagesAppendFrame(messages []Message, runLLM bool) LLMMessagesAppendFrame {

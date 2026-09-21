@@ -91,16 +91,6 @@ func (a *UserContextAggregator) updateFinalTranscript(f TranscriptFrame) (string
 	return "", false
 }
 
-func (a *UserContextAggregator) appendMessages(messages []Message) {
-	added := messagesFromInitial(messages)
-	if len(added) == 0 {
-		return
-	}
-	a.state.mu.Lock()
-	a.state.messages = append(a.state.messages, added...)
-	a.state.mu.Unlock()
-}
-
 func (a *UserContextAggregator) snapshotMessages() []Message {
 	a.state.mu.Lock()
 	defer a.state.mu.Unlock()
@@ -111,7 +101,9 @@ func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Messa
 	a.state.mu.Lock()
 	defer a.state.mu.Unlock()
 
-	if len(a.state.messages) > 0 && a.state.messages[len(a.state.messages)-1].Role == "user" {
+	a.state.responseID = 0
+	a.state.completedResponseID = 0
+	if len(a.state.messages) > 0 && a.state.messages[len(a.state.messages)-1].Role == "user" && !a.state.messages[len(a.state.messages)-1].Synthetic {
 		last := &a.state.messages[len(a.state.messages)-1]
 		last.Content += " " + text
 		concatenated = last.Content
@@ -234,7 +226,46 @@ func (a *UserContextAggregator) submitUserMessage(text string) {
 	a.interruptSent = false
 	a.resetInterimTranscript()
 	a.resetFinalTranscript()
-	a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
+	a.pushLLMMessages(messages)
+}
+
+// Called under a.mu, so response admission and incoming user/interrupt/end
+// frames are serialized. Assistant playback readiness uses the shared lock.
+func (a *UserContextAggregator) pushLLMMessages(messages []Message) {
+	frame := NewLLMMessagesFrame(messages)
+	a.state.mu.Lock()
+	if a.state.ending {
+		a.state.mu.Unlock()
+		return
+	}
+	a.state.responseID = frame.ID()
+	a.state.completedResponseID = 0
+	a.state.mu.Unlock()
+	a.PushFrame(frame, Downstream)
+}
+
+func (a *UserContextAggregator) invalidateResponse() {
+	a.state.mu.Lock()
+	a.state.responseID = 0
+	a.state.completedResponseID = 0
+	a.state.mu.Unlock()
+}
+
+func (a *UserContextAggregator) handleMessagesAppend(f LLMMessagesAppendFrame) {
+	a.state.mu.Lock()
+	if a.state.ending || (a.taskCtx.Ctx != nil && a.taskCtx.Ctx.Err() != nil) ||
+		(f.AfterResponseID != 0 && (a.state.responseID != f.AfterResponseID ||
+			a.state.completedResponseID != f.AfterResponseID)) {
+		a.state.mu.Unlock()
+		return
+	}
+	a.state.messages = append(a.state.messages, messagesFromInitial(f.Messages)...)
+	messages := cloneMessages(a.state.messages)
+	a.state.mu.Unlock()
+	if f.RunLLM && len(messages) > 0 {
+		a.taskCtx.Logger.Println("Running LLM turn from appended context (greet-first / injected)")
+		a.pushLLMMessages(messages)
+	}
 }
 
 func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
@@ -243,6 +274,11 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 
 	switch f := frame.(type) {
 	case EndFrame:
+		a.state.mu.Lock()
+		a.state.ending = true
+		a.state.responseID = 0
+		a.state.completedResponseID = 0
+		a.state.mu.Unlock()
 		a.taskCtx.Logger.Printf("EndFrame at UserContextAggregator: reason=%q\n", f.Reason)
 		a.PushFrame(f, dir)
 	case LLMMessagesAppendFrame:
@@ -251,19 +287,12 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 		// messages + RunLLM to make the bot greet first from the initial
 		// context (system prompt + "hello?" for a fresh call, or prior
 		// chunks + resume note). Consumed here, not forwarded.
-		if len(f.Messages) > 0 {
-			a.appendMessages(f.Messages)
-		}
-		if f.RunLLM {
-			messages := a.snapshotMessages()
-			if len(messages) == 0 {
-				a.taskCtx.Logger.Println("LLMMessagesAppend run skipped: empty context")
-				return
-			}
-			a.taskCtx.Logger.Println("Running LLM turn from appended context (greet-first / injected)")
-			a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
-		}
+		a.handleMessagesAppend(f)
+	case InterruptFrame, TTSSpeakFrame:
+		a.invalidateResponse()
+		a.PushFrame(f, dir)
 	case FunctionCallInProgressFrame:
+		a.invalidateResponse()
 		a.taskCtx.Logger.Printf("Function call in progress: %s tool_call_id=%s\n", f.FunctionName, f.ToolCallID)
 		a.addFunctionCallInProgress(f)
 		a.PushFrame(f, Upstream)
@@ -275,15 +304,27 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 		}
 		a.PushFrame(f, Upstream)
 		if f.RunLLM {
-			a.PushFrame(NewLLMMessagesFrame(a.snapshotMessages()), Downstream)
+			a.pushLLMMessages(a.snapshotMessages())
 		}
 	case TranscriptFrame:
+		// Once playback has finished, even partial new input supersedes a
+		// delayed continuation. During playback, short backchannels keep
+		// their existing behavior; an actual barge-in invalidates below.
+		if f.Text != "<end>" && strings.TrimSpace(f.Text) != "" {
+			a.state.mu.Lock()
+			if !a.botSpeaking || (a.state.responseID != 0 && a.state.completedResponseID == a.state.responseID) {
+				a.state.responseID = 0
+				a.state.completedResponseID = 0
+			}
+			a.state.mu.Unlock()
+		}
 		interimTranscript := a.updateInterimTranscript(f)
 
 		// Barge-in uses the latest non-final response snapshot only.
 		// Turn-taking waits for final tokens ending with <end>.
 		if a.botSpeaking && !a.interruptSent && !f.IsFinal {
 			if len(strings.Fields(interimTranscript)) >= minBargeInWords {
+				a.invalidateResponse()
 				a.taskCtx.Logger.Println("Barge-in detected")
 				a.taskCtx.UIEvents.ServerMessage("Interruption received while bot is speaking", time.Now())
 				// Mirrors Pipecat's MinWordsUserTurnStartStrategy firing

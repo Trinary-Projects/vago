@@ -10,6 +10,9 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	// Synthetic instructions participate in LLM context, but are not user speech.
+	Synthetic  bool  `json:"-"`
+	ResponseID int64 `json:"-"`
 }
 
 // ToolDefinition is an OpenAI-format function tool definition.
@@ -92,7 +95,7 @@ type CallEvents struct {
 	OnBotFirstSpeech         func(time.Time)
 	OnFirstUserAudio         func(time.Time)
 	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
-	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
+	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string, turn AssistantTurnCompletion)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the
 	// generated response text (not the played text) and whether the call
@@ -100,8 +103,30 @@ type CallEvents struct {
 	// Mirrors Python CustomOpenAILLMService's on_llm_call_complete event
 	// (is_interrupted = not completed); the onboarding stage-transition
 	// tracker consumes it.
-	OnLLMCallCompleted func(text string, interrupted bool)
+	OnLLMCallCompleted func(LLMCallCompletion)
 	OnCallEnded        func(reason EndReason, stats CallStats)
+}
+
+// ResponseID is the originating LLMMessagesFrame ID, preserved through playback.
+// The two completion callbacks can arrive in either order.
+type LLMCallCompletion struct {
+	ResponseID   int64
+	Text         string
+	Interrupted  bool
+	HasToolCalls bool
+}
+
+type AssistantTurnEndReason string
+
+const (
+	AssistantTurnPlaybackCompleted AssistantTurnEndReason = "playback_completed"
+	AssistantTurnInterrupted       AssistantTurnEndReason = "interrupted"
+	AssistantTurnEnding            AssistantTurnEndReason = "ending"
+)
+
+type AssistantTurnCompletion struct {
+	ResponseID int64
+	Reason     AssistantTurnEndReason
 }
 
 // TurnMetrics is a per-assistant-turn snapshot assembled from the

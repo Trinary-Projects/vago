@@ -373,8 +373,11 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	// delegating) so the mapping below stays the plain Events() used by
 	// sales/follow-up.
 	pl.Callbacks.SetLLMCallCompletedHandler(stageTracker.OnLLMCallCompleted)
-	pl.Callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time) {
-		thresholdMonitor.OnAssistantTurnCommitted()
+	pl.Callbacks.SetAssistantTurnCommittedHandler(func(text string, _ time.Time, turn voicepipelinecore.AssistantTurnCompletion) {
+		if text != "" {
+			thresholdMonitor.OnAssistantTurnCommitted()
+		}
+		stageTracker.OnAssistantTurnCommitted(turn)
 	})
 
 	task, err := voicepipelinecore.NewPipelineTask(ctx, voicepipelinecore.TaskConfig{

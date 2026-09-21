@@ -145,7 +145,8 @@ func TestLLM_FiresOnLLMCallCompleted(t *testing.T) {
 		var mu sync.Mutex
 		var events []completedEvent
 		fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-			OnLLMCallCompleted: func(text string, interrupted bool) {
+			OnLLMCallCompleted: func(completion LLMCallCompletion) {
+				text, interrupted := completion.Text, completion.Interrupted
 				mu.Lock()
 				events = append(events, completedEvent{text, interrupted})
 				mu.Unlock()

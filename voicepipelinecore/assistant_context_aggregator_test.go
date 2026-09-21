@@ -121,7 +121,7 @@ func TestAssistantContextAggregator_EmitsCommittedTurnCallEventsWithMetrics(t *t
 	var metrics []TurnMetrics
 	var assistantPromptKeys []string
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnAssistantTurnCommitted: func(text string, at time.Time, m TurnMetrics, promptKey string) {
+		OnAssistantTurnCommitted: func(text string, at time.Time, m TurnMetrics, promptKey string, turn AssistantTurnCompletion) {
 			assistants = append(assistants, text)
 			metrics = append(metrics, m)
 			assistantPromptKeys = append(assistantPromptKeys, promptKey)
@@ -136,7 +136,7 @@ func TestAssistantContextAggregator_EmitsCommittedTurnCallEventsWithMetrics(t *t
 		{Processor: "tts", Label: MetricTTFB, ValueMs: 34},
 	}))
 	assistant.appendPlayedAssistantWords([]string{"hi", "there"})
-	assistant.commitPlayedAssistantText(false)
+	assistant.commitPlayedAssistantText(AssistantTurnCompletion{Reason: AssistantTurnPlaybackCompleted})
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(assistants) != 1 || assistants[0] != "hi there" {

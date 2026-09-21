@@ -148,7 +148,7 @@ func (p *LLMProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direct
 		}
 		p.cancelLLM = cancel
 		p.cancelMu.Unlock()
-		p.Go(func() { p.runLLM(runCtx, f.Messages) })
+		p.Go(func() { p.runLLM(runCtx, f.Messages, f.ID()) })
 	case InterruptFrame:
 		// Base has already cancelled the previous procCtx, which cancels any
 		// in-flight runLLM transitively. A persistent client also needs an
@@ -194,11 +194,13 @@ func (p *LLMProcessor) cancelInFlight() {
 	}
 }
 
-func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
+func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message, responseID int64) {
 	p.metrics.Start(MetricTTFB)
 	p.metrics.Start(MetricProcessing)
 	startedAt := time.Now()
-	p.PushFrame(NewLLMResponseStartFrame(startedAt), Downstream)
+	start := NewLLMResponseStartFrame(startedAt)
+	start.ResponseID = responseID
+	p.PushFrame(start, Downstream)
 
 	var ttfbMs *float64
 	var responseText strings.Builder
@@ -235,7 +237,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	// frames here (they'd be processed after the reset).
 	if ctx.Err() != nil || (result.Interrupted && errors.Is(err, context.Canceled)) {
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
-		p.fireLLMCallCompleted(responseText.String(), true)
+		p.fireLLMCallCompleted(LLMCallCompletion{ResponseID: responseID, Text: responseText.String(), Interrupted: true})
 		return
 	}
 	if err != nil {
@@ -282,7 +284,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// cancellation (barge-in, EndFrame) is handled above and keeps
 		// Python's skip, because the model usually generates past what
 		// the user actually heard.
-		p.fireLLMCallCompleted(responseText.String(), responseText.Len() == 0)
+		p.fireLLMCallCompleted(LLMCallCompletion{ResponseID: responseID, Text: responseText.String(), Interrupted: responseText.Len() == 0, HasToolCalls: len(result.ToolCalls) > 0})
 		return
 	}
 
@@ -292,7 +294,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	}
 	p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 	p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "completed")
-	p.fireLLMCallCompleted(responseText.String(), false)
+	p.fireLLMCallCompleted(LLMCallCompletion{ResponseID: responseID, Text: responseText.String(), HasToolCalls: len(result.ToolCalls) > 0})
 	if len(result.ToolCalls) > 0 {
 		p.Go(func() { p.executeToolCalls(ctx, result.ToolCalls) })
 	}
@@ -449,11 +451,11 @@ func (p *LLMProcessor) reportToolResultError(functionName, toolCallID string, er
 // fireLLMCallCompleted forwards the finished call's generated text to
 // the OnLLMCallCompleted call event (Python's on_llm_call_complete with
 // is_interrupted = not completed).
-func (p *LLMProcessor) fireLLMCallCompleted(text string, interrupted bool) {
+func (p *LLMProcessor) fireLLMCallCompleted(completion LLMCallCompletion) {
 	if p.taskCtx == nil || p.taskCtx.callEvents == nil {
 		return
 	}
-	p.taskCtx.callEvents.fireLLMCallCompleted(text, interrupted)
+	p.taskCtx.callEvents.fireLLMCallCompleted(completion)
 }
 
 // emitLLMCallResult publishes the Python-compatible RTVI server-message
