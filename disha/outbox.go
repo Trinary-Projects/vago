@@ -34,7 +34,7 @@ const (
 	// outboxItemTTL is a leak backstop only. The drainer deletes items
 	// on success and parks them on exhaustion; this TTL just guarantees
 	// nothing survives forever if both paths are somehow missed.
-	outboxItemTTL = 48 * time.Hour
+	outboxItemTTL = 2 * time.Hour
 
 	// outboxDeadListCap bounds the parked-item list so a sustained
 	// outage cannot grow it without limit.
