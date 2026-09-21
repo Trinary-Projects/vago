@@ -88,10 +88,12 @@ func (d *OutboxDrainer) Stop() {
 }
 
 func (d *OutboxDrainer) run(ctx context.Context) {
-	defer close(d.done)
-	if d.logger != nil {
-		d.logger.Printf("disha: outbox drainer started (interval=%s lease=%s batch=%d)\n", d.interval, d.lease, d.batch)
-	}
+	defer func() {
+		outboxLogf(d.logger, "drainer stopped")
+		close(d.done)
+	}()
+	outboxLogf(d.logger, "drainer started interval=%s lease=%s batch=%d workers=%d due_key=%s",
+		d.interval, d.lease, d.batch, d.workers, outboxDueKey())
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,8 +121,13 @@ func (d *OutboxDrainer) drainOnce(ctx context.Context) {
 		return
 	}
 	if len(records) == 0 {
+		// Deliberately silent: an idle queue is the normal state and a
+		// line here would be ~17k entries a day per pod saying nothing.
 		return
 	}
+	// TODO: remove this when merging PR
+	outboxLogf(d.logger, "claimed n=%d lease=%s (leased until %s)",
+		len(records), d.lease, time.Now().Add(d.lease).Format(time.RFC3339))
 
 	work := make(chan OutboxRecord)
 	var wg sync.WaitGroup
@@ -156,17 +163,22 @@ func (d *OutboxDrainer) processRecord(ctx context.Context, rec OutboxRecord) {
 	item.ID = rec.ID
 	item.Attempts++
 
+	// TODO: remove this when merging PR
+	outboxLogf(d.logger, "attempt operation=%s id=%s attempt=%d/%d source=drainer %s %s queued_for=%s",
+		item.Operation, item.ID, item.Attempts, outboxMaxAttempts, item.Method, item.Path,
+		outboxQueuedFor(&item))
+
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultAPITimeout)
+	start := time.Now()
 	err := d.attempter.attemptOutbox(attemptCtx, &item)
 	cancel()
+	logOutboxAttempt(d.logger, &item, "drainer", time.Since(start), err)
 
 	if err == nil {
 		if cerr := d.outbox.Complete(ctx, item.ID); cerr != nil && d.logger != nil {
 			d.logger.Printf("disha: outbox complete failed operation=%s id=%s: %v\n", item.Operation, item.ID, cerr)
 		}
-		if d.logger != nil {
-			d.logger.Printf("disha: outbox delivered operation=%s id=%s attempts=%d\n", item.Operation, item.ID, item.Attempts)
-		}
+		outboxLogf(d.logger, "delivered operation=%s id=%s attempts=%d source=drainer", item.Operation, item.ID, item.Attempts)
 		return
 	}
 
@@ -184,10 +196,15 @@ func (d *OutboxDrainer) processRecord(ctx context.Context, rec OutboxRecord) {
 	if rerr := d.outbox.Retry(ctx, &item, err); rerr != nil && d.logger != nil {
 		d.logger.Printf("disha: outbox reschedule failed operation=%s id=%s: %v\n", item.Operation, item.ID, rerr)
 	}
-	if d.logger != nil {
-		d.logger.Printf("disha: outbox retry operation=%s id=%s attempt=%d/%d next=%s: %v\n",
-			item.Operation, item.ID, item.Attempts, outboxMaxAttempts, item.NextAttemptAt.Format(time.RFC3339), err)
+}
+
+// outboxQueuedFor is how long this item has been failing, which is the
+// number that says whether a backlog is draining or stuck.
+func outboxQueuedFor(item *OutboxItem) string {
+	if item.FirstFailedAt.IsZero() {
+		return "0s"
 	}
+	return time.Since(item.FirstFailedAt).Truncate(time.Second).String()
 }
 
 // giveUp parks the item and reports it exactly once. The Sentry hub is
@@ -197,10 +214,8 @@ func (d *OutboxDrainer) giveUp(ctx context.Context, item *OutboxItem, cause erro
 	if perr := d.outbox.Park(ctx, item, cause); perr != nil && d.logger != nil {
 		d.logger.Printf("disha: outbox park failed operation=%s id=%s: %v\n", item.Operation, item.ID, perr)
 	}
-	if d.logger != nil {
-		d.logger.Printf("disha: outbox GAVE UP operation=%s id=%s attempts=%d reason=%s: %v\n",
-			item.Operation, item.ID, item.Attempts, reason, cause)
-	}
+	outboxLogf(d.logger, "GAVE UP operation=%s id=%s attempts=%d reason=%s source=drainer queued_for=%s: %v",
+		item.Operation, item.ID, item.Attempts, reason, outboxQueuedFor(item), cause)
 
 	details := map[string]any{
 		"item_id":  item.ID,

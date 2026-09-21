@@ -321,6 +321,10 @@ func (c *redisClient) writeOutboxItem(ctx context.Context, id string, payload []
 		return err
 	}); err != nil {
 		wrapped := fmt.Errorf("disha: redis outbox %s %s failed: %w", operation, itemKey, err)
+		// TODO: remove this when merging PR — Sentry is rate-limited to
+		// one event a minute, so the log is the only place the real
+		// frequency of a Redis outage shows up.
+		outboxLogf(c.logger, "redis %s FAILED key=%s: %v", operation, itemKey, err)
 		captureOutboxRedisFailure(wrapped, "OUTBOX_"+operation, itemKey)
 		return wrapped
 	}
@@ -350,6 +354,7 @@ func (c *redisClient) ClaimOutboxItems(ctx context.Context, now time.Time, lease
 		return nil
 	}); err != nil {
 		wrapped := fmt.Errorf("disha: redis outbox CLAIM failed: %w", err)
+		outboxLogf(c.logger, "redis CLAIM FAILED key=%s: %v", outboxDueKey(), err)
 		captureOutboxRedisFailure(wrapped, "OUTBOX_CLAIM", outboxDueKey())
 		return nil, wrapped
 	}
@@ -380,6 +385,7 @@ func (c *redisClient) DeleteOutboxItem(ctx context.Context, id string) error {
 		return err
 	}); err != nil {
 		wrapped := fmt.Errorf("disha: redis outbox DELETE %s failed: %w", itemKey, err)
+		outboxLogf(c.logger, "redis DELETE FAILED key=%s: %v", itemKey, err)
 		captureOutboxRedisFailure(wrapped, "OUTBOX_DELETE", itemKey)
 		return wrapped
 	}
@@ -399,6 +405,7 @@ func (c *redisClient) ParkOutboxItem(ctx context.Context, id string, payload []b
 		return err
 	}); err != nil {
 		wrapped := fmt.Errorf("disha: redis outbox PARK %s failed: %w", id, err)
+		outboxLogf(c.logger, "redis PARK FAILED id=%s key=%s: %v", id, deadKey, err)
 		captureOutboxRedisFailure(wrapped, "OUTBOX_PARK", deadKey)
 		return wrapped
 	}

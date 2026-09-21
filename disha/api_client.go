@@ -126,6 +126,8 @@ func (c *APIClient) EnqueueJobDurable(ctx context.Context, operation string, req
 // operation, which the backend idempotency key absorbs.
 func (c *APIClient) durable(ctx context.Context, operation, method, path string, body any, oc OutboxContext) error {
 	if !c.outbox.Enabled() {
+		// TODO: remove this when merging PR
+		outboxLogf(c.logger, "disabled operation=%s direct_send=%s %s idempotency_key=%s", operation, method, path, oc.IdempotencyKey)
 		return c.send(ctx, method, path, body, oc.IdempotencyKey)
 	}
 
@@ -154,29 +156,41 @@ func (c *APIClient) durable(ctx context.Context, operation, method, path string,
 		if c.logger != nil {
 			c.logger.Printf("disha: outbox enqueue failed operation=%s, attempting inline: %v\n", operation, err)
 		}
+		start := time.Now()
 		sendErr := c.send(ctx, method, path, body, oc.IdempotencyKey)
 		if sendErr != nil {
+			outboxLogf(c.logger, "DROPPED operation=%s attempt=1/1 source=inline_no_outbox duration_ms=%d reason=not_durable: %v",
+				operation, time.Since(start).Milliseconds(), sendErr)
 			c.reportDropped(operation, item, sendErr, "not_durable")
+			return sendErr
 		}
-		return sendErr
+		outboxLogf(c.logger, "delivered operation=%s attempts=1 source=inline_no_outbox duration_ms=%d (no durable copy)",
+			operation, time.Since(start).Milliseconds())
+		return nil
 	}
 
 	item.Attempts = 1
-	if err := c.sendRaw(ctx, method, path, payload, oc.IdempotencyKey); err != nil {
-		if !outboxRetryable(err) {
+	// TODO: remove this when merging PR
+	outboxLogf(c.logger, "attempt operation=%s id=%s attempt=%d/%d source=inline %s %s",
+		operation, item.ID, item.Attempts, outboxMaxAttempts, method, path)
+	start := time.Now()
+	sendErr := c.sendRaw(ctx, method, path, payload, oc.IdempotencyKey)
+	logOutboxAttempt(c.logger, item, "inline", time.Since(start), sendErr)
+	if sendErr != nil {
+		if !outboxRetryable(sendErr) {
 			// A permanent client error will never succeed, so retrying
 			// it eight times only delays the alert. Terminal.
-			_ = c.outbox.Park(ctx, item, err)
-			c.reportDropped(operation, item, err, "permanent")
-			return err
+			_ = c.outbox.Park(ctx, item, sendErr)
+			outboxLogf(c.logger, "GAVE UP operation=%s id=%s attempts=%d reason=permanent source=inline: %v",
+				operation, item.ID, item.Attempts, sendErr)
+			c.reportDropped(operation, item, sendErr, "permanent")
+			return sendErr
 		}
 		// Durably queued — the drainer owns it from here, so this is
-		// not a failure from the caller's point of view.
-		if rerr := c.outbox.Retry(ctx, item, err); rerr != nil && c.logger != nil {
+		// not a failure from the caller's point of view. Outbox.Retry
+		// logs when it comes due.
+		if rerr := c.outbox.Retry(ctx, item, sendErr); rerr != nil && c.logger != nil {
 			c.logger.Printf("disha: outbox reschedule failed operation=%s id=%s: %v\n", operation, item.ID, rerr)
-		}
-		if c.logger != nil {
-			c.logger.Printf("disha: %s failed, queued for retry id=%s key=%s: %v\n", operation, item.ID, oc.IdempotencyKey, err)
 		}
 		return nil
 	}
@@ -184,6 +198,7 @@ func (c *APIClient) durable(ctx context.Context, operation, method, path string,
 	if err := c.outbox.Complete(ctx, item.ID); err != nil && c.logger != nil {
 		c.logger.Printf("disha: outbox complete failed operation=%s id=%s: %v\n", operation, item.ID, err)
 	}
+	outboxLogf(c.logger, "delivered operation=%s id=%s attempts=%d source=inline", operation, item.ID, item.Attempts)
 	return nil
 }
 
@@ -222,7 +237,6 @@ func (c *APIClient) send(ctx context.Context, method, path string, body any, ide
 }
 
 // sendRaw performs exactly one HTTP attempt.
-//
 // It deliberately does NOT capture to Sentry. It used to, which is what
 // made VAGO-6 and VAGO-7 fire on every transient blip — including ones
 // the fallback then recovered from — and collapsed nine unrelated job

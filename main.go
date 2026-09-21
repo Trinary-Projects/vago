@@ -177,6 +177,11 @@ func newDishaDeps() disha.Deps {
 	// behaviour without a redeploy of anything else.
 	outbox := disha.NewOutbox(redis, logger, outboxEnabledFromEnv())
 	api.SetOutbox(outbox)
+	if outbox.Enabled() {
+		logger.Printf("disha: outbox ENABLED — Disha API calls are persisted before sending\n")
+	} else {
+		logger.Printf("disha: outbox DISABLED (VAGO_OUTBOX_ENABLED) — Disha API calls are one-shot\n")
+	}
 	return disha.Deps{
 		Logger:       logger,
 		Redis:        redis,
@@ -209,6 +214,7 @@ func outboxEnabledFromEnv() bool {
 	case "0", "false", "no", "off":
 		return false
 	default:
+		log.Println("VAGO Outbox is enabled")
 		return true
 	}
 }

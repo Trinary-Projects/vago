@@ -174,6 +174,35 @@ func outboxBackoff(attempts int) time.Duration {
 	return time.Duration(rand.Int64N(int64(base))) + base/2
 }
 
+// outboxLogf writes one outbox lifecycle line. Every event in an item's
+// life — enqueue, each attempt, reschedule, delivery, park — goes
+// through this one prefix, so `grep "id=<uuid>" app.log` reads as a
+// single timeline whichever pod or path produced the line.
+//
+// TODO: remove this when merging PR — these lines exist to watch the
+// outbox behave in staging. Deleting this helper and its call sites
+// (grep outboxLogf / logOutboxAttempt) removes the whole verbose layer;
+// the error logs that predate it do not go through here.
+func outboxLogf(logger *log.Logger, format string, v ...any) {
+	if logger == nil {
+		return
+	}
+	logger.Printf("disha: outbox "+format+"\n", v...)
+}
+
+// logOutboxAttempt renders the outcome of one delivery attempt. The
+// producer's inline try and the drainer's retries share this vocabulary
+// so attempt numbering reads continuously across both.
+func logOutboxAttempt(logger *log.Logger, item *OutboxItem, source string, dur time.Duration, err error) {
+	if err == nil {
+		outboxLogf(logger, "attempt ok operation=%s id=%s attempt=%d/%d source=%s duration_ms=%d",
+			item.Operation, item.ID, item.Attempts, outboxMaxAttempts, source, dur.Milliseconds())
+		return
+	}
+	outboxLogf(logger, "attempt failed operation=%s id=%s attempt=%d/%d source=%s duration_ms=%d retryable=%t: %v",
+		item.Operation, item.ID, item.Attempts, outboxMaxAttempts, source, dur.Milliseconds(), outboxRetryable(err), err)
+}
+
 // Outbox owns persistence. It is a thin policy layer over the Redis
 // primitives so the drainer and the API client share one notion of
 // "queued", "done" and "parked".
@@ -213,13 +242,13 @@ func (o *Outbox) Enqueue(ctx context.Context, item *OutboxItem) error {
 	if err := o.store.EnqueueOutboxItem(ctx, item.ID, payload, item.NextAttemptAt); err != nil {
 		return err
 	}
-	// Log the assigned id so a call's persisted work can be found in
-	// Redis (GET vago_outbox:item:{id}) from the app log alone.
+	// The assigned id is the handle for everything that follows: the
+	// Redis key to GET, and the token to grep this item's attempts by.
 	// TODO: remove this when merging PR
-	if o.logger != nil {
-		o.logger.Printf("disha: outbox enqueued operation=%s id=%s redis_key=%s idempotency_key=%s conversation=%s\n",
-			item.Operation, item.ID, outboxItemKey(item.ID), item.IdempotencyKey, item.SentryTags["conversation_id"])
-	}
+	outboxLogf(o.logger, "enqueued operation=%s id=%s redis_key=%s kind=%s %s %s bytes=%d idempotency_key=%s conversation=%s run_at=%s",
+		item.Operation, item.ID, outboxItemKey(item.ID), item.Kind, item.Method, item.Path,
+		len(item.Payload), item.IdempotencyKey, item.SentryTags["conversation_id"],
+		item.NextAttemptAt.Format(time.RFC3339))
 	return nil
 }
 
@@ -228,7 +257,11 @@ func (o *Outbox) Complete(ctx context.Context, id string) error {
 	if !o.Enabled() {
 		return nil
 	}
-	return o.store.DeleteOutboxItem(ctx, id)
+	if err := o.store.DeleteOutboxItem(ctx, id); err != nil {
+		return err
+	}
+	outboxLogf(o.logger, "removed id=%s redis_key=%s", id, outboxItemKey(id))
+	return nil
 }
 
 // Retry records the failure and reschedules the item for its next
@@ -243,12 +276,21 @@ func (o *Outbox) Retry(ctx context.Context, item *OutboxItem, cause error) error
 	if cause != nil {
 		item.LastError = truncateOutboxError(cause.Error())
 	}
-	item.NextAttemptAt = time.Now().Add(outboxBackoff(item.Attempts))
+	delay := outboxBackoff(item.Attempts)
+	item.NextAttemptAt = time.Now().Add(delay)
 	payload, err := json.Marshal(item)
 	if err != nil {
 		return fmt.Errorf("disha: marshal outbox item: %w", err)
 	}
-	return o.store.RescheduleOutboxItem(ctx, item.ID, payload, item.NextAttemptAt)
+	if err := o.store.RescheduleOutboxItem(ctx, item.ID, payload, item.NextAttemptAt); err != nil {
+		return err
+	}
+	// When it is next due and how much budget is left, so a stuck
+	// operation is visible without reading it back out of Redis.
+	outboxLogf(o.logger, "scheduled operation=%s id=%s attempt=%d/%d next=%s delay_ms=%d last_error=%q",
+		item.Operation, item.ID, item.Attempts, outboxMaxAttempts,
+		item.NextAttemptAt.Format(time.RFC3339), delay.Milliseconds(), item.LastError)
+	return nil
 }
 
 // Park moves an exhausted or permanently-failed item to the dead list so
@@ -264,7 +306,12 @@ func (o *Outbox) Park(ctx context.Context, item *OutboxItem, cause error) error 
 	if err != nil {
 		return fmt.Errorf("disha: marshal outbox item: %w", err)
 	}
-	return o.store.ParkOutboxItem(ctx, item.ID, payload)
+	if err := o.store.ParkOutboxItem(ctx, item.ID, payload); err != nil {
+		return err
+	}
+	outboxLogf(o.logger, "parked operation=%s id=%s attempts=%d dead_key=%s last_error=%q",
+		item.Operation, item.ID, item.Attempts, outboxDeadKey(), item.LastError)
+	return nil
 }
 
 func truncateOutboxError(s string) string {
