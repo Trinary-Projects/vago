@@ -482,7 +482,7 @@ func onboardingEndCallTool() voicepipelinecore.ToolDefinition {
 		Type: "function",
 		Function: voicepipelinecore.ToolFunction{
 			Name:        endCallToolName,
-			Description: "End the call when the onboarding consultation is complete or the patient asks to end the call.",
+			Description: "Used to disconnect the call.",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
