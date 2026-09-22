@@ -143,7 +143,11 @@ func (s scriptedCacheRedis) AcquireLock(context.Context, string, time.Duration) 
 	return false, errors.New("unused")
 }
 
-func (s scriptedCacheRedis) AppendChunk(context.Context, string, string, ConversationChunk) error {
+func (s scriptedCacheRedis) AppendChunk(context.Context, string, string, ConversationChunk) (int64, error) {
+	return 0, errors.New("unused")
+}
+
+func (s scriptedCacheRedis) SetChunk(context.Context, string, string, int64, ConversationChunk) error {
 	return errors.New("unused")
 }
 

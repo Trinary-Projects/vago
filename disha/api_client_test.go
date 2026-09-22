@@ -124,6 +124,63 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 	}
 }
 
+// Durability moved to disha-backend: each operation makes exactly one
+// attempt and a failure surfaces to the caller. Nothing may fall back to
+// a /common/enqueue_job retry any more, so a failing route must produce
+// exactly one request.
+func TestAPIClientFailureDoesNotQueueFallbackJob(t *testing.T) {
+	requests := make(chan capturedAPIRequest, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("db down"))
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, 10*time.Second, nil)
+	at := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
+	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{
+		ConversationID: "conv-1",
+		BotJoinedAt:    &at,
+	}, IdempotencyContext{})
+	if err == nil {
+		t.Fatal("expected the 500 to surface to the caller")
+	}
+
+	first := <-requests
+	if first.Method != http.MethodPatch || first.Path != "/bot/update_conversation" {
+		t.Fatalf("request = %s %s, want PATCH /bot/update_conversation", first.Method, first.Path)
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("unexpected second request %s %s; vago must not retry or queue a fallback job", extra.Method, extra.Path)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// ended_at must keep sub-second precision on the wire; run_post_call_
+// operations is matched against this same value backend-side.
+func TestAPIClientUpdateConversationSendsNanosecondEndedAt(t *testing.T) {
+	server, requests := captureAPIRequest(t, http.StatusOK)
+	client := NewAPIClient(server.URL, 10*time.Second, nil)
+	endedAt := time.Date(2026, 5, 22, 1, 9, 3, 123456789, time.UTC)
+
+	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{
+		ConversationID: "conv-1",
+		EndedAt:        &endedAt,
+	}, IdempotencyContext{})
+	if err != nil {
+		t.Fatalf("UpdateConversation: %v", err)
+	}
+	got := <-requests
+	if got.Body["ended_at"] != endedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("ended_at = %#v, want %s", got.Body["ended_at"], endedAt.Format(time.RFC3339Nano))
+	}
+	if _, ok := got.Body["user_joined_at"]; ok {
+		t.Fatalf("nil fields should be omitted: %+v", got.Body)
+	}
+}
+
 func TestAPIClientEnqueueJob(t *testing.T) {
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, 10*time.Second, nil)

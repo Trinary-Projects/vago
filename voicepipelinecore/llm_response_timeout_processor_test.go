@@ -82,6 +82,28 @@ func TestLLMResponseTimeout_InterruptCancelsTimer(t *testing.T) {
 	}
 }
 
+func TestLLMResponseTimeout_EndFrameCancelsTimer(t *testing.T) {
+	fix := newTestFixture(t)
+	p := NewLLMResponseTimeoutProcessorWithTimeout(fix.TaskCtx, 20*time.Millisecond)
+
+	down, up := runProcessorTest(t, fix, runConfig{
+		processor: p,
+		framesToSend: []Frame{
+			NewLLMResponseStartFrame(time.Now()),
+			SleepFrame{Duration: 5 * time.Millisecond},
+			NewEndFrame(string(EndReasonUnspecified)),
+		},
+		settleDelay: 40 * time.Millisecond,
+	})
+
+	if c := countFrames[InterruptFrame](down); c != 0 {
+		t.Fatalf("downstream InterruptFrame count = %d, want 0 in %s", c, describeFrameTypes(down))
+	}
+	if c := countFrames[LLMMessagesAppendFrame](up); c != 0 {
+		t.Fatalf("upstream retry count = %d, want 0 in %s", c, describeFrameTypes(up))
+	}
+}
+
 func TestLLMResponseTimeout_ResponseStartResetsTimer(t *testing.T) {
 	fix := newTestFixture(t)
 	p := NewLLMResponseTimeoutProcessorWithTimeout(fix.TaskCtx, 40*time.Millisecond)

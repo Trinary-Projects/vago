@@ -117,7 +117,7 @@ func TestCallEndedUploadsDebugLogsAndQueuesDailyMetrics(t *testing.T) {
 		uploaded = append(uploaded, entries...)
 		return "debug_log_data/conv-1/log_data.json", nil
 	})
-	endedAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
+	endedAt := time.Date(2026, 5, 22, 1, 2, 3, 123456789, time.UTC)
 	callbacks.OnCallEnded(voicepipelinecore.EndReasonClientDisconnect, voicepipelinecore.CallStats{
 		TotalUserDurationSec: 12.9,
 		EndedAt:              endedAt,
@@ -140,27 +140,82 @@ func TestCallEndedUploadsDebugLogsAndQueuesDailyMetrics(t *testing.T) {
 	if len(requests) != 3 {
 		t.Fatalf("request count = %d, want 3: %+v", len(requests), requests)
 	}
-	assertRequest(t, requests[0], http.MethodPost, "/bot/run_post_call_operations")
-	if requests[0].Body["log_data_s3_key"] != "debug_log_data/conv-1/log_data.json" {
-		t.Fatalf("post-call log key mismatch: %+v", requests[0].Body)
+	// ended_at is written via update_conversation first (Disha enqueues the
+	// chunk sync from that write); the debug-log upload goes to the S3
+	// uploader, not Disha, so it is not in the HTTP sequence.
+	assertRequest(t, requests[0], http.MethodPatch, "/bot/update_conversation")
+	if requests[0].Body["conversation_id"] != "conv-1" ||
+		requests[0].Body["ended_at"] != endedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("ended_at update mismatch: %+v", requests[0].Body)
 	}
-	assertRequest(t, requests[1], http.MethodPost, "/common/enqueue_job")
-	if requests[1].Body["module_name"] != "bots.webhooks" ||
-		requests[1].Body["func_name"] != "fetch_and_store_daily_metrics" ||
-		requests[1].Body["sqs_queue"] != "p1-fast-l1" {
-		t.Fatalf("Daily metrics enqueue mismatch: %+v", requests[1].Body)
+	for _, key := range []string{"bot_joined_at", "user_joined_at", "user_first_speech_at", "bot_first_speech_at"} {
+		if _, ok := requests[0].Body[key]; ok {
+			t.Fatalf("%s should be omitted from the ended_at update: %+v", key, requests[0].Body)
+		}
 	}
-	kwargs, ok := requests[1].Body["kwargs"].(map[string]any)
+	assertRequest(t, requests[1], http.MethodPost, "/bot/run_post_call_operations")
+	if requests[1].Body["log_data_s3_key"] != "debug_log_data/conv-1/log_data.json" {
+		t.Fatalf("post-call log key mismatch: %+v", requests[1].Body)
+	}
+	if requests[1].Body["ended_at"] != requests[0].Body["ended_at"] {
+		t.Fatalf("post-call ended_at = %v, want %v (same as update_conversation)", requests[1].Body["ended_at"], requests[0].Body["ended_at"])
+	}
+	assertRequest(t, requests[2], http.MethodPost, "/common/enqueue_job")
+	if requests[2].Body["module_name"] != "bots.webhooks" ||
+		requests[2].Body["func_name"] != "fetch_and_store_daily_metrics" ||
+		requests[2].Body["sqs_queue"] != "p1-fast-l1" {
+		t.Fatalf("Daily metrics enqueue mismatch: %+v", requests[2].Body)
+	}
+	kwargs, ok := requests[2].Body["kwargs"].(map[string]any)
 	if !ok ||
 		kwargs["conversation_id"] != "conv-1" ||
 		kwargs["meeting_id"] != "meeting-1" ||
 		kwargs["bot_session_id"] != "bot-session-1" ||
 		kwargs["user_session_id"] != "user-session-1" {
-		t.Fatalf("Daily metrics kwargs mismatch: %+v", requests[1].Body["kwargs"])
+		t.Fatalf("Daily metrics kwargs mismatch: %+v", requests[2].Body["kwargs"])
 	}
-	assertRequest(t, requests[2], http.MethodPost, "/common/enqueue_job")
-	if requests[2].Body["module_name"] != "services.conversation_chunk_manager" {
-		t.Fatalf("chunk sync enqueue mismatch: %+v", requests[2].Body)
+	assertNoChunkSyncEnqueue(t, requests)
+}
+
+func TestCallEndedZeroEndedAtSendsSameFallbackTimestamp(t *testing.T) {
+	apiServer, apiRecorder := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1",
+		UserID:         "user-1",
+		BotType:        SalesCallBotType,
+		Logger:         log.New(io.Discard, "", 0),
+	}, nil, api, nil)
+	before := time.Now()
+	callbacks.OnCallEnded(voicepipelinecore.EndReasonClientDisconnect, voicepipelinecore.CallStats{})
+
+	requests := apiRecorder.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2: %+v", len(requests), requests)
+	}
+	assertRequest(t, requests[0], http.MethodPatch, "/bot/update_conversation")
+	assertRequest(t, requests[1], http.MethodPost, "/bot/run_post_call_operations")
+	raw, ok := requests[0].Body["ended_at"].(string)
+	if !ok {
+		t.Fatalf("ended_at = %#v, want timestamp string", requests[0].Body["ended_at"])
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || parsed.Before(before) {
+		t.Fatalf("ended_at = %q (err=%v), want fallback to now (>= %s)", raw, err, before)
+	}
+	if requests[1].Body["ended_at"] != raw {
+		t.Fatalf("post-call ended_at = %v, want %q (same as update_conversation)", requests[1].Body["ended_at"], raw)
+	}
+	assertNoChunkSyncEnqueue(t, requests)
+}
+
+func assertNoChunkSyncEnqueue(t *testing.T, requests []callAPIRequest) {
+	t.Helper()
+	for _, req := range requests {
+		if req.Body["func_name"] == "sync_conversation_chunks_to_db" ||
+			req.Body["module_name"] == "services.conversation_chunk_manager" {
+			t.Fatalf("worker must not enqueue the chunk sync: %+v", req.Body)
+		}
 	}
 }
 
@@ -347,26 +402,22 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 	if requests[0].Body["conversation_id"] != conversationID || requests[0].Body["bot_joined_at"] != eventAt.Format(time.RFC3339) {
 		t.Fatalf("bot joined body mismatch: %+v", requests[0].Body)
 	}
-	assertRequest(t, requests[4], http.MethodPost, "/bot/run_post_call_operations")
-	if value, ok := requests[4].Body["end_reason"]; !ok || value != nil {
+	assertRequest(t, requests[4], http.MethodPatch, "/bot/update_conversation")
+	wantEndedAt := eventAt.Add(5 * time.Second).Format(time.RFC3339Nano)
+	if requests[4].Body["conversation_id"] != conversationID || requests[4].Body["ended_at"] != wantEndedAt {
+		t.Fatalf("ended_at update mismatch: %+v", requests[4].Body)
+	}
+	assertRequest(t, requests[5], http.MethodPost, "/bot/run_post_call_operations")
+	if value, ok := requests[5].Body["end_reason"]; !ok || value != nil {
 		t.Fatalf("end_reason = %v (present=%v), want explicit null", value, ok)
 	}
-	if requests[4].Body["total_user_duration"] != float64(12) || requests[4].Body["log_data_s3_key"] != "" {
-		t.Fatalf("post-call body mismatch: %+v", requests[4].Body)
+	if requests[5].Body["total_user_duration"] != float64(12) || requests[5].Body["log_data_s3_key"] != "" {
+		t.Fatalf("post-call body mismatch: %+v", requests[5].Body)
 	}
-	assertRequest(t, requests[5], http.MethodPost, "/common/enqueue_job")
-	kwargs, ok := requests[5].Body["kwargs"].(map[string]any)
-	if !ok {
-		t.Fatalf("kwargs = %#v, want object", requests[5].Body["kwargs"])
+	if requests[5].Body["ended_at"] != requests[4].Body["ended_at"] {
+		t.Fatalf("post-call ended_at = %v, want %v (same as update_conversation)", requests[5].Body["ended_at"], requests[4].Body["ended_at"])
 	}
-	if requests[5].Body["module_name"] != "services.conversation_chunk_manager" ||
-		requests[5].Body["func_name"] != "sync_conversation_chunks_to_db" ||
-		requests[5].Body["sqs_queue"] != "p1-fast-l1" ||
-		kwargs["user_id"] != userID ||
-		kwargs["conversation_id"] != conversationID ||
-		kwargs["bot_type"] != SalesCallBotType {
-		t.Fatalf("enqueue body mismatch: %+v", requests[5].Body)
-	}
+	assertNoChunkSyncEnqueue(t, requests)
 }
 
 func assertRequest(t *testing.T, got callAPIRequest, method, path string) {

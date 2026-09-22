@@ -33,8 +33,10 @@ type UserProfileData struct {
 	Phone                             string         `json:"phone"`
 	RemainingSalesCallTalktimeSeconds *float64       `json:"remaining_sales_call_talktime_seconds"`
 	CampaignPricingExperimentFlag     *string        `json:"campaign_pricing_experiment_flag"`
+	CallTTSVariantFlag                *string        `json:"call_tts_variant_flag"`
 	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
 	OnboardingCallVariant             *string        `json:"onboarding_call_variant"`
+	EDPeRXVariant                     *string        `json:"ed_pe_rx_variant"`
 	ActiveChatContext                 *string        `json:"active_chat_context"`
 	Recent1HrTranscript               *string        `json:"recent_1hr_transcript"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
@@ -44,6 +46,7 @@ type UserProfileData struct {
 	MembershipExpiryDate              *string        `json:"membership_expiry_date"`
 	SubscriptionStatus                *string        `json:"subscription_status"`
 	SubscriptionAmount                *float64       `json:"subscription_amount"`
+	TrialAmount                       *float64       `json:"trial_amount"`
 	NextPaymentDueDate                *string        `json:"next_payment_due_date"`
 	PaymentOverdue                    *bool          `json:"payment_overdue"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
@@ -124,6 +127,7 @@ type UpdateConversationRequest struct {
 	UserJoinedAt      *time.Time `json:"user_joined_at,omitempty"`
 	UserFirstSpeechAt *time.Time `json:"user_first_speech_at,omitempty"`
 	BotFirstSpeechAt  *time.Time `json:"bot_first_speech_at,omitempty"`
+	EndedAt           *time.Time `json:"ended_at,omitempty"`
 }
 
 // PostCallOperationsRequest mirrors VoiceBotAPIService.run_post_call_

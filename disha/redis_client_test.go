@@ -95,8 +95,12 @@ func TestRedisClientAppendChunk(t *testing.T) {
 		IsDebugLog:     false,
 	}
 
-	if err := client.AppendChunk(context.Background(), "user-1", "conv-1", chunk); err != nil {
+	index, err := client.AppendChunk(context.Background(), "user-1", "conv-1", chunk)
+	if err != nil {
 		t.Fatalf("AppendChunk: %v", err)
+	}
+	if index != 0 {
+		t.Fatalf("AppendChunk index = %d, want 0", index)
 	}
 
 	items, err := server.List(conversationChunksKey("user-1", "conv-1"))
@@ -115,6 +119,53 @@ func TestRedisClientAppendChunk(t *testing.T) {
 	}
 	if got.LLMTTFBMs == nil || *got.LLMTTFBMs != llmTTFB {
 		t.Fatalf("LLMTTFBMs = %+v, want %.1f", got.LLMTTFBMs, llmTTFB)
+	}
+}
+
+func TestRedisClientSetChunk(t *testing.T) {
+	server, client := newRedisTestClient(t)
+	first := ConversationChunk{ID: "chunk-1", Text: "first", Role: "user"}
+	second := ConversationChunk{ID: "chunk-2", Text: "second", Role: "assistant"}
+
+	firstIndex, err := client.AppendChunk(context.Background(), "user-1", "conv-1", first)
+	if err != nil {
+		t.Fatalf("AppendChunk first: %v", err)
+	}
+	if firstIndex != 0 {
+		t.Fatalf("first index = %d, want 0", firstIndex)
+	}
+	secondIndex, err := client.AppendChunk(context.Background(), "user-1", "conv-1", second)
+	if err != nil {
+		t.Fatalf("AppendChunk second: %v", err)
+	}
+	if secondIndex != 1 {
+		t.Fatalf("second index = %d, want 1", secondIndex)
+	}
+
+	first.Text = "first updated"
+	if err := client.SetChunk(context.Background(), "user-1", "conv-1", firstIndex, first); err != nil {
+		t.Fatalf("SetChunk: %v", err)
+	}
+
+	items, err := server.List(conversationChunksKey("user-1", "conv-1"))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("list length = %d, want 2", len(items))
+	}
+	var gotFirst, gotSecond ConversationChunk
+	if err := json.Unmarshal([]byte(items[0]), &gotFirst); err != nil {
+		t.Fatalf("Unmarshal first chunk: %v", err)
+	}
+	if err := json.Unmarshal([]byte(items[1]), &gotSecond); err != nil {
+		t.Fatalf("Unmarshal second chunk: %v", err)
+	}
+	if gotFirst.Text != "first updated" {
+		t.Fatalf("first chunk text = %q, want %q", gotFirst.Text, "first updated")
+	}
+	if gotSecond.ID != second.ID || gotSecond.Text != second.Text || gotSecond.Role != second.Role {
+		t.Fatalf("second chunk changed: %+v", gotSecond)
 	}
 }
 

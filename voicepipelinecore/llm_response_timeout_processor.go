@@ -46,6 +46,9 @@ func (p *LLMResponseTimeoutProcessor) ProcessFrame(ctx context.Context, frame Fr
 	case InterruptFrame:
 		p.cancelTimer()
 		p.PushFrame(f, dir)
+	case EndFrame:
+		p.cancelTimer()
+		p.PushFrame(f, dir)
 	default:
 		p.PushFrame(frame, dir)
 	}

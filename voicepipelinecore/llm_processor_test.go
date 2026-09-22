@@ -337,5 +337,61 @@ func TestLLM_HandlesClientError(t *testing.T) {
 	}
 }
 
+type lifecycleLLMClient struct {
+	*stubLLMClient
+	mu             sync.Mutex
+	interruptCalls int
+	closeCalls     int
+}
+
+func (c *lifecycleLLMClient) Interrupt() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.interruptCalls++
+}
+
+func (c *lifecycleLLMClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeCalls++
+	return nil
+}
+
+func TestLLM_NotifiesPersistentClientOnInterruptAndEnd(t *testing.T) {
+	fix := newTestFixture(t)
+	client := &lifecycleLLMClient{stubLLMClient: &stubLLMClient{model: "test-model"}}
+	p := NewLLMProcessorWithClient(fix.TaskCtx, client)
+
+	runProcessorTest(t, fix, runConfig{
+		processor:    p,
+		framesToSend: []Frame{NewInterruptFrame()},
+		settleDelay:  50 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.interruptCalls != 1 {
+		t.Fatalf("Interrupt calls = %d, want 1", client.interruptCalls)
+	}
+	if client.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", client.closeCalls)
+	}
+}
+
+func TestLLM_StopClosesPersistentClientWithoutEndFrame(t *testing.T) {
+	fix := newTestFixture(t)
+	client := &lifecycleLLMClient{stubLLMClient: &stubLLMClient{model: "test-model"}}
+	p := NewLLMProcessorWithClient(fix.TaskCtx, client)
+
+	runProcessorTest(t, fix, runConfig{processor: p})
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want one teardown close", client.closeCalls)
+	}
+}
+
 // Suppress unused-warning for stubLogger when not invoked.
 var _ = stubLogger{}

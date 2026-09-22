@@ -611,6 +611,57 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	}
 }
 
+func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testing.T) {
+	fix := newTestFixture(t)
+	var users []string
+	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+			users = append(users, text)
+		},
+	})
+	a := NewUserContextAggregator(fix.TaskCtx, testInitialMessages(), "")
+
+	down, _ := runProcessorTest(t, fix, runConfig{
+		processor: a,
+		framesToSend: []Frame{
+			TranscriptFrame{Text: "first", IsFinal: true},
+			TranscriptFrame{Text: "<end>", IsFinal: true},
+			TranscriptFrame{Text: "second", IsFinal: true},
+			TranscriptFrame{Text: "<end>", IsFinal: true},
+		},
+		sendEndFrame: true,
+	})
+	fix.TaskCtx.callEvents.stopAndDrain()
+
+	if len(users) != 2 || users[0] != "first" || users[1] != "first second" {
+		t.Fatalf("user turn events = %v, want [\"first\" \"first second\"]", users)
+	}
+
+	var llmFrames []LLMMessagesFrame
+	for _, frame := range down {
+		if llmFrame, ok := frame.(LLMMessagesFrame); ok {
+			llmFrames = append(llmFrames, llmFrame)
+		}
+	}
+	if len(llmFrames) != 2 {
+		t.Fatalf("LLMMessagesFrame count = %d, want 2 in %s", len(llmFrames), describeFrameTypes(down))
+	}
+	messages := llmFrames[len(llmFrames)-1].Messages
+	if len(messages) == 0 {
+		t.Fatal("last LLMMessagesFrame has no messages")
+	}
+	userMessages := 0
+	for _, message := range messages {
+		if message.Role == "user" {
+			userMessages++
+		}
+	}
+	last := messages[len(messages)-1]
+	if userMessages != 1 || last.Role != "user" || last.Content != "first second" {
+		t.Fatalf("last LLM messages = %+v, want one user message ending with content %q", messages, "first second")
+	}
+}
+
 func TestUserContextAggregator_UserFirstSpeechLifecycleFiresOnce(t *testing.T) {
 	fix := newTestFixture(t)
 	calls := make(chan time.Time, 2)

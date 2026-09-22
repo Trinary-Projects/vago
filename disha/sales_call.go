@@ -167,7 +167,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	llm := voicepipelinecore.NewLLMProcessorWithClient(taskCtx, llmClient)
 	registerSalesTools(llm, task, pl)
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
-	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
+	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict, resolveCartesiaModel(pl.Startup.Data.UserProfile.CallTTSVariantFlag, taskCtx.Logger))
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 
@@ -242,7 +242,7 @@ func registerSalesTools(llm *voicepipelinecore.LLMProcessor, task *voicepipeline
 func newSalesLLMClient(deps Deps, pl *salesCallPlan) (voicepipelinecore.LLMClient, error) {
 	startup := pl.Startup
 	logger := startup.Logger
-	router, err := llmrouter.New(llmrouter.Config{
+	router, err := llmrouter.NewClient(llmrouter.Config{
 		Group:          salesModelGroup,
 		Region:         "us",
 		Redis:          deps.Redis,

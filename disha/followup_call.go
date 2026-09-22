@@ -220,7 +220,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	registerFollowUpTools(llm, task, deps, pl)
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
-	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
+	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict, resolveCartesiaModel(pl.Startup.Data.UserProfile.CallTTSVariantFlag, taskCtx.Logger))
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 
@@ -355,6 +355,7 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"membership_expiry_date": user.MembershipExpiryDate,
 		"subscription_status":    user.SubscriptionStatus,
 		"subscription_amount":    user.SubscriptionAmount,
+		"trial_amount":           user.TrialAmount,
 		"next_payment_due_date":  user.NextPaymentDueDate,
 		"payment_overdue":        user.PaymentOverdue,
 	}
@@ -424,7 +425,7 @@ func downloadCompiledCallFlow(ctx context.Context, s3 S3GetClient, key string) (
 }
 
 func newFollowUpLLMClient(deps Deps, pl *followUpPlan) (voicepipelinecore.LLMClient, error) {
-	return llmrouter.New(llmrouter.Config{
+	return llmrouter.NewClient(llmrouter.Config{
 		Group:          pl.ModelGroup,
 		Region:         "us",
 		Redis:          deps.Redis,

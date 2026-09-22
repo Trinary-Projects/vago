@@ -30,7 +30,7 @@ import (
 // completes without timing out.
 func TestTTS_ForwardsEndFrameWhenIdle(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	// Don't actually send EndFrame through the helper — that would wait
 	// on the orchestrator's command channel forever. Instead, just run
@@ -52,7 +52,7 @@ func TestTTS_ForwardsEndFrameWhenIdle(t *testing.T) {
 // playback even if the orchestrator is busy.
 func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -78,7 +78,7 @@ func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
 // orchestrator.
 func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -114,7 +114,7 @@ func TestTTS_PassesThroughUpstreamFrames(t *testing.T) {
 
 func TestTTS_CloseConnectionKeepsUpstreamPassThroughAlive(t *testing.T) {
 	fix := newTestFixture(t)
-	p := NewTTSProcessor(fix.TaskCtx, nil)
+	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
 	source := newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
@@ -277,16 +277,13 @@ func (fs *fakeCartesiaServer) conn(t *testing.T, index int) *fakeCartesiaConn {
 }
 
 // drainAndCloseAll repeatedly closes every connection accepted so far,
-// including ones that appear during the window. Only needed AFTER the
-// processor under test has been Stop()'d (see stopTTSTestAndWait):
-// TTSProcessor.closeTTSConnection is guarded by a one-shot sync.Once,
-// so a reconnect that races the orchestrator's own end-of-call close
-// can leave the reader blocked on a connection the client side will
-// never close again. Once the processor's ctx is cancelled, connect()
-// refuses to dial further, so closing whatever the reader is currently
-// blocked on from the server side is enough to let it observe ctx
-// cancellation and exit. This is a test-side workaround for that
-// pre-existing quirk, not something these tests are asserting about.
+// including ones that appear during the window. Only used AFTER the
+// processor under test has been Stop()'d (see stopTTSTestAndWait). It
+// was a workaround for a former one-shot sync.Once close that could
+// leave a reconnected socket unclosable; closeTTSConnection now closes
+// the current connection and stops reconnects itself (covered by
+// TestTTS_ReaderDoesNotReconnectAfterIntentionalClose), so this is only
+// belt-and-braces cleanup for the fake server.
 func (fs *fakeCartesiaServer) drainAndCloseAll(d time.Duration) {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
@@ -372,7 +369,13 @@ func stopTTSTestAndWait(t *testing.T, fix *testFixture, fs *fakeCartesiaServer, 
 // (mirroring the manual-wiring pattern used by the interrupt/pass-
 // through tests above) and starts all three.
 func newTTSPipelineForTest(fix *testFixture) (source, sink *QueueProcessor, p *TTSProcessor) {
-	p = NewTTSProcessor(fix.TaskCtx, nil)
+	return newTTSPipelineForTestWithModel(fix, "")
+}
+
+// newTTSPipelineForTestWithModel is newTTSPipelineForTest with an explicit
+// modelID, for tests asserting on the Cartesia model_id sent on the wire.
+func newTTSPipelineForTestWithModel(fix *testFixture, modelID string) (source, sink *QueueProcessor, p *TTSProcessor) {
+	p = NewTTSProcessor(fix.TaskCtx, nil, modelID)
 	source = newQueueProcessor(fix.TaskCtx, "source", Upstream)
 	sink = newQueueProcessor(fix.TaskCtx, "sink", Downstream)
 	source.Link(p)
@@ -381,6 +384,103 @@ func newTTSPipelineForTest(fix *testFixture) (source, sink *QueueProcessor, p *T
 	p.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 	return source, sink, p
+}
+
+// readInboundUntil drains fc.inbound until a message matching pred arrives,
+// returning that message. Used to inspect specific Cartesia-bound payloads
+// (e.g. the initial generation vs. the continue:false reset) rather than
+// just the context id waitForContinueFalse returns.
+func readInboundUntil(t *testing.T, fc *fakeCartesiaConn, timeout time.Duration, pred func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case msg, ok := <-fc.inbound:
+			if !ok {
+				t.Fatalf("readInboundUntil: connection closed before a matching message arrived")
+			}
+			if pred(msg) {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("readInboundUntil: timed out waiting for a matching message")
+		}
+	}
+}
+
+// TestTTS_SendsConfiguredModelID verifies that a processor constructed with
+// an explicit Cartesia model id sends it in both the initial generation
+// payload (continue:true) and the reset payload (continue:false) — the two
+// call sites in sendTextToTTS/ResetTTSContext that used to hardcode
+// "sonic-3".
+func TestTTS_SendsConfiguredModelID(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTestWithModel(fix, "sonic-3.5")
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+
+	genMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && cont
+	})
+	if got, _ := genMsg["model_id"].(string); got != "sonic-3.5" {
+		t.Errorf("generation payload model_id = %q, want sonic-3.5", got)
+	}
+
+	resetMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && !cont
+	})
+	if got, _ := resetMsg["model_id"].(string); got != "sonic-3.5" {
+		t.Errorf("reset payload model_id = %q, want sonic-3.5", got)
+	}
+	contextID, _ := resetMsg["context_id"].(string)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
+}
+
+// TestTTS_EmptyModelIDDefaultsToSonic3 verifies that an empty modelID falls
+// back to the pre-A/B-test default "sonic-3" in both payload sites.
+func TestTTS_EmptyModelIDDefaultsToSonic3(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTestWithModel(fix, "")
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+
+	genMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && cont
+	})
+	if got, _ := genMsg["model_id"].(string); got != "sonic-3" {
+		t.Errorf("generation payload model_id = %q, want sonic-3", got)
+	}
+
+	resetMsg := readInboundUntil(t, conn, 2*time.Second, func(m map[string]any) bool {
+		cont, ok := m["continue"].(bool)
+		return ok && !cont
+	})
+	if got, _ := resetMsg["model_id"].(string); got != "sonic-3" {
+		t.Errorf("reset payload model_id = %q, want sonic-3", got)
+	}
+	contextID, _ := resetMsg["context_id"].(string)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	stopTTSTestAndWait(t, fix, fs, 5*time.Second, source, p, sink)
 }
 
 // TestTTS_PendingEndForwardsAfterCartesiaDone is the baseline happy
@@ -505,7 +605,7 @@ func TestTTS_InvalidContextIDErrorRemainsSuppressed(t *testing.T) {
 }
 
 func TestTTS_ProviderErrorRateLimitResetsAfterWindow(t *testing.T) {
-	p := NewTTSProcessor(newTestFixture(t).TaskCtx, nil)
+	p := NewTTSProcessor(newTestFixture(t).TaskCtx, nil, "")
 	startedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < ttsProviderErrorReportLimit; i++ {
@@ -622,15 +722,10 @@ func TestTTS_ReconnectMidSynthesisEmitsTTSDone(t *testing.T) {
 		t.Errorf("expected no EndFrame (none was queued), got %d", c)
 	}
 
-	// Drive shutdown through a real EndFrame rather than a bare Stop():
-	// closeTTSConnection's read of t.websocketConn is only synchronized
-	// against the reader's reconnect write when its first call happens
-	// on the orchestrator goroutine as a continuation of processing a
-	// channel event (the reconnect event here). A bare Stop() from the
-	// test goroutine would be the first ever call in this scenario, with
-	// no happens-before edge back to the reconnect — a real (if
-	// pre-existing and out of scope) race between the reader and
-	// whichever goroutine first calls closeTTSConnection.
+	// Drive shutdown through a real EndFrame to also cover the
+	// forward-then-close path after a reconnect. (websocketConn is now
+	// guarded by connMu, so a bare Stop() would be race-free too; see
+	// TestTTS_StopClosesReconnectedConnection.)
 	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
 	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
 
@@ -664,9 +759,8 @@ func TestTTS_ReconnectIdleEmitsNoFrames(t *testing.T) {
 		t.Errorf("expected no EndFrame, got %d", c)
 	}
 
-	// Drive shutdown through a real EndFrame rather than a bare Stop() —
-	// see the comment in TestTTS_ReconnectMidSynthesisEmitsTTSDone for
-	// why a bare Stop() here would race against the reader's reconnect.
+	// Drive shutdown through a real EndFrame, as in
+	// TestTTS_ReconnectMidSynthesisEmitsTTSDone.
 	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
 	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
 
@@ -674,5 +768,77 @@ func TestTTS_ReconnectIdleEmitsNoFrames(t *testing.T) {
 
 	if c := countFrames[TTSDoneFrame](sink.Captured()); c != 0 {
 		t.Errorf("expected no TTSDoneFrame ever, got %d in %s", c, describeFrameTypes(sink.Captured()))
+	}
+}
+
+// connCount returns how many connections the fake server has accepted.
+func (fs *fakeCartesiaServer) connCount() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return len(fs.conns)
+}
+
+// TestTTS_ReaderDoesNotReconnectAfterIntentionalClose covers the
+// end-of-call stall: forwarding a deferred EndFrame closes the Cartesia
+// socket while the task is still running. The reader must treat that
+// read error as an intentional close and exit, not reconnect — a
+// reconnected socket would keep the reader blocked in ReadMessage until
+// PipelineTask's 10s WaitGroup bound gives up. The test deliberately
+// does NOT mop up server-side connections (no drainAndCloseAll): the
+// processor must release everything on its own.
+func TestTTS_ReaderDoesNotReconnectAfterIntentionalClose(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+	withTTSPendingEndTimeout(t, 30*time.Second)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	source.QueueFrame(NewTTSSpeakFrame("hello there"), Downstream)
+	conn := fs.conn(t, 0)
+	contextID := conn.waitForContinueFalse(t, 2*time.Second)
+
+	source.QueueFrame(NewEndFrame("test_reason"), Downstream)
+	time.Sleep(50 * time.Millisecond) // let handleEnd defer it
+	conn.sendDone(contextID)
+	waitForFrameType[EndFrame](t, sink.Captured, 3*time.Second)
+
+	// Give a would-be reconnect time to dial the fake server.
+	time.Sleep(300 * time.Millisecond)
+	if n := fs.connCount(); n != 1 {
+		t.Fatalf("expected no reconnect after intentional close, server accepted %d connections", n)
+	}
+
+	for _, proc := range []Processor{source, p, sink} {
+		proc.Stop()
+	}
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("goroutines did not exit promptly after intentional close: %v", err)
+	}
+}
+
+// TestTTS_StopClosesReconnectedConnection verifies that a genuine
+// mid-call drop still reconnects, and that a later bare Stop closes the
+// reconnected socket (not just the original one) so the reader exits
+// without any server-side help.
+func TestTTS_StopClosesReconnectedConnection(t *testing.T) {
+	fs := newFakeCartesiaServer(t)
+	withTTSDialURL(t, fs.URL)
+
+	fix := newTestFixture(t)
+	source, sink, p := newTTSPipelineForTest(fix)
+
+	fs.conn(t, 0).conn.Close() // server-initiated drop mid-call
+	fs.conn(t, 1)              // reader reconnected
+	time.Sleep(50 * time.Millisecond)
+
+	for _, proc := range []Processor{source, p, sink} {
+		proc.Stop()
+	}
+	if err := waitForWG(fix.WG, time.Second); err != nil {
+		t.Fatalf("goroutines did not exit promptly after Stop: %v", err)
+	}
+	if n := fs.connCount(); n != 2 {
+		t.Errorf("expected exactly 2 connections (original + one reconnect), got %d", n)
 	}
 }

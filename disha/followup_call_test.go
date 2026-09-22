@@ -392,12 +392,14 @@ var followUpProtocolVariables = []string{
 	"membership_expiry_date",
 	"subscription_status",
 	"subscription_amount",
+	"trial_amount",
 	"next_payment_due_date",
 	"payment_overdue",
 }
 
 func TestFollowUpPromptVariablesCarryEveryProtocolVariable(t *testing.T) {
 	amount := 1499.0
+	trial := 3.0
 	overdue := true
 	status := "active"
 	expiry := "14 Aug 2026"
@@ -410,6 +412,7 @@ func TestFollowUpPromptVariablesCarryEveryProtocolVariable(t *testing.T) {
 			MembershipExpiryDate: &expiry,
 			SubscriptionStatus:   &subStatus,
 			SubscriptionAmount:   &amount,
+			TrialAmount:          &trial,
 			NextPaymentDueDate:   &nextCharge,
 			PaymentOverdue:       &overdue,
 		},
@@ -425,6 +428,9 @@ func TestFollowUpPromptVariablesCarryEveryProtocolVariable(t *testing.T) {
 	}
 	if got := vars["subscription_amount"]; got != &amount {
 		t.Errorf("subscription_amount = %#v, want the resolved pointer", got)
+	}
+	if got := vars["trial_amount"]; got != &trial {
+		t.Errorf("trial_amount = %#v, want the resolved pointer", got)
 	}
 }
 

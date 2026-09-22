@@ -215,7 +215,10 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		docs:        deps.Documents,
 		config:      config,
 		patientInfo: startup.Data.Conversation.PatientInfo,
-		profileVars: map[string]any{"gender": startup.Data.UserProfile.Gender},
+		profileVars: map[string]any{
+			"gender":           startup.Data.UserProfile.Gender,
+			"ed_pe_rx_variant": derefString(startup.Data.UserProfile.EDPeRXVariant),
+		},
 	}
 	compiled, err := compiler.CompileSystemPrompt(ctx, stage, state.VariableStoreSnapshot())
 	if err != nil {
@@ -440,7 +443,7 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 
 	llmResponseTimeout := voicepipelinecore.NewLLMResponseTimeoutProcessor(taskCtx)
 	llmOutputFilter := voicepipelinecore.NewLLMOutputFilterProcessor(taskCtx)
-	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict)
+	tts := voicepipelinecore.NewTTSProcessor(taskCtx, pl.PhoneticDict, resolveCartesiaModel(pl.Startup.Data.UserProfile.CallTTSVariantFlag, taskCtx.Logger))
 	playback := voicepipelinecore.NewPlaybackSinkProcessor(taskCtx)
 	sink := voicepipelinecore.NewPipelineSinkProcessor(taskCtx, task.CompleteEnd)
 
@@ -495,14 +498,12 @@ func registerOnboardingTools(llm *voicepipelinecore.LLMProcessor, task *voicepip
 	}
 }
 
-// newOnboardingLLMClient builds the health-based router on the variant
-// config's model group (student_test: grok-4.1-fast). Temperature stays
-// the router default 0, matching Python's InputParams(temperature=0).
-// It returns the concrete *llmrouter.Router (not the LLMClient
-// interface) because the stage manager refreshes its prompt metadata via
-// SetPromptMetadata after every stage transition.
-func newOnboardingLLMClient(deps Deps, pl *onboardingCallPlan) (*llmrouter.Router, error) {
-	return llmrouter.New(llmrouter.Config{
+// newOnboardingLLMClient builds the transport selected by the variant's model
+// group (student_test currently uses the health-ranked grok-4.1-fast group).
+// Returning llmrouter.Client preserves SetPromptMetadata for stage transitions
+// while allowing a Responses WebSocket model group to be selected by config.
+func newOnboardingLLMClient(deps Deps, pl *onboardingCallPlan) (llmrouter.Client, error) {
+	return llmrouter.NewClient(llmrouter.Config{
 		Group:          pl.Config.Model,
 		Region:         "us",
 		Redis:          deps.Redis,

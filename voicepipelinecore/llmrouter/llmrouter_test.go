@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -115,6 +116,42 @@ func TestSelectionPicksFastest(t *testing.T) {
 	}
 	if sel.UsingFallback {
 		t.Error("did not expect fallback")
+	}
+}
+
+func TestGPT56LunaNonReasoningGroupMirrorsDishaTargets(t *testing.T) {
+	if GroupGPT56LunaNonReasoning != "gpt-5.6-luna-non-reasoning" {
+		t.Fatalf("group name = %q, want dashed model-group convention", GroupGPT56LunaNonReasoning)
+	}
+	want := []string{
+		"azure_gpt_5_6_luna_non_reasoning_eastus",
+		"azure_gpt_5_6_luna_non_reasoning_eastus2",
+		"azure_gpt_5_6_luna_non_reasoning_westus",
+		"azure_gpt_5_6_luna_non_reasoning_northcentralus",
+		"openai_gpt_5_6_luna_non_reasoning",
+	}
+	group, ok := responsesWebSocketGroups[GroupGPT56LunaNonReasoning]
+	if !ok {
+		t.Fatalf("missing model group %q", GroupGPT56LunaNonReasoning)
+	}
+	if !slices.Equal(group.Configs, want) {
+		t.Fatalf("configs = %v, want %v", group.Configs, want)
+	}
+	if group.Fallback != "openai_gpt_5_6_luna_non_reasoning" {
+		t.Fatalf("fallback = %q, want direct OpenAI", group.Fallback)
+	}
+	for _, key := range group.Configs {
+		cfg := endpointConfigs[key]
+		if cfg.Model != "gpt-5.6-luna" || cfg.APIMode != apiModeResponsesWebSocket || cfg.ReasoningEffort != "none" {
+			t.Fatalf("config %q = %+v, want Luna Responses WebSocket with reasoning none", key, cfg)
+		}
+	}
+}
+
+func TestChatRouterRejectsGPT56LunaResponsesWebSocketGroup(t *testing.T) {
+	_, err := New(Config{Group: GroupGPT56LunaNonReasoning, Redis: newFakeRedis()})
+	if err == nil || !strings.Contains(err.Error(), "requires the Responses WebSocket client") {
+		t.Fatalf("New error = %v, want Responses WebSocket client guard", err)
 	}
 }
 

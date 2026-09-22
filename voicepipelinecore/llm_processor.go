@@ -25,7 +25,7 @@ type LLMResult struct {
 	ToolCalls   []ToolCall
 }
 
-// LLMClient performs one streaming chat completion. It must invoke
+// LLMClient performs one streaming model response. It must invoke
 // onToken for every non-empty text delta as it arrives, and return the
 // model that served the request. The implementation owns provider and
 // transport concerns (endpoint selection, auth, health write-backs);
@@ -38,6 +38,17 @@ type LLMResult struct {
 // the pipeline package stays free of any business/transport dependency.
 type LLMClient interface {
 	Stream(ctx context.Context, req LLMRequest, onToken func(string)) (LLMResult, error)
+}
+
+// These optional transport lifecycle surfaces let a persistent client react
+// after generation has already completed but assistant audio is still playing.
+// Ordinary request-scoped clients need neither method and remain unchanged.
+type interruptibleLLMClient interface {
+	Interrupt()
+}
+
+type closeableLLMClient interface {
+	Close() error
 }
 
 type ToolCallRequest struct {
@@ -72,6 +83,7 @@ type LLMProcessor struct {
 	metrics   *ProcessorMetrics
 	cancelMu  sync.Mutex
 	cancelLLM context.CancelFunc
+	closeOnce sync.Once
 
 	tools      []ToolDefinition
 	toolChoice any
@@ -125,6 +137,7 @@ func (p *LLMProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direct
 	case EndFrame:
 		p.taskCtx.Logger.Printf("EndFrame at LLMProcessor, cancelling LLM: reason=%q\n", f.Reason)
 		p.cancelInFlight()
+		p.closeClient("end")
 		p.metrics.Reset()
 		p.PushFrame(f, dir)
 	case LLMMessagesFrame:
@@ -138,14 +151,38 @@ func (p *LLMProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direct
 		p.Go(func() { p.runLLM(runCtx, f.Messages) })
 	case InterruptFrame:
 		// Base has already cancelled the previous procCtx, which cancels any
-		// in-flight runLLM transitively. Clearing the stored cancel func is
-		// just bookkeeping.
+		// in-flight runLLM transitively. A persistent client also needs an
+		// explicit response-chain reset here because barge-in can arrive after
+		// generation completed while its audio is still playing. The client
+		// decides whether its transport also needs to be closed.
 		p.cancelInFlight()
+		if client, ok := p.client.(interruptibleLLMClient); ok {
+			client.Interrupt()
+		}
 		p.metrics.Reset()
 		p.PushFrame(frame, dir)
 	default:
 		p.PushFrame(frame, dir)
 	}
+}
+
+// Stop mirrors the persistent STT/TTS processors: cancel processor work first,
+// then close the transport so any blocked WebSocket read is released. EndFrame
+// also closes eagerly, while this path covers aborts and root-context teardown.
+func (p *LLMProcessor) Stop() {
+	p.BaseProcessor.Stop()
+	p.cancelInFlight()
+	p.closeClient("stop")
+}
+
+func (p *LLMProcessor) closeClient(reason string) {
+	p.closeOnce.Do(func() {
+		if client, ok := p.client.(closeableLLMClient); ok {
+			if err := client.Close(); err != nil && p.taskCtx != nil && p.taskCtx.Logger != nil {
+				p.taskCtx.Logger.Printf("Close persistent LLM client on %s: %v\n", reason, err)
+			}
+		}
+	})
 }
 
 func (p *LLMProcessor) cancelInFlight() {
@@ -196,7 +233,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	// Cancellation (barge-in / EndFrame) takes precedence: the interrupt/
 	// end path already reset TTS + playback, so we must NOT emit terminal
 	// frames here (they'd be processed after the reset).
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || (result.Interrupted && errors.Is(err, context.Canceled)) {
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		p.fireLLMCallCompleted(responseText.String(), true)
 		return
@@ -212,7 +249,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// PlaybackSink turns into BotStoppedSpeaking so UserIdleProcessor
 		// arms its prompt loop. Otherwise the caller sits in silence
 		// until the 120s watchdog.
-		p.taskCtx.Logger.Println("LLM stream failed:", err)
+		p.taskCtx.Logger.Printf("LLM stream failed: %v (text_chars=%d)\n", err, responseText.Len())
 		// Python parity: pipecat logs the failed call at ERROR level and
 		// the bots' loguru sentry_sink forwards every ERROR to Sentry, so
 		// a live LLM failure always raises a Sentry issue there. Capture
@@ -233,7 +270,19 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		})
 		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
-		p.fireLLMCallCompleted(responseText.String(), true)
+		// A transport failure is not a user interruption. Whatever text
+		// arrived before the stream broke was already aggregated, spoken
+		// and committed, so the call event must report a completed turn:
+		// Azure's Responses WebSocket routinely finishes a response and
+		// then withholds its terminal event past the 4s read deadline,
+		// and reporting those turns as interrupted made the onboarding
+		// stage tracker skip a fully delivered assistant utterance (a
+		// stage could then never advance). A failure that produced no
+		// text has nothing to evaluate and stays interrupted. Real
+		// cancellation (barge-in, EndFrame) is handled above and keeps
+		// Python's skip, because the model usually generates past what
+		// the user actually heard.
+		p.fireLLMCallCompleted(responseText.String(), responseText.Len() == 0)
 		return
 	}
 

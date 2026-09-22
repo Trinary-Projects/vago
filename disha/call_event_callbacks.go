@@ -15,6 +15,14 @@ const (
 	chunkWriteTimeout       = 5 * time.Second
 )
 
+type lastPersistedChunk struct {
+	role    string
+	id      string
+	created string
+	index   int64
+	valid   bool
+}
+
 type CallEventCallbacks struct {
 	redis            RedisClient
 	api              *APIClient
@@ -24,6 +32,11 @@ type CallEventCallbacks struct {
 	conversationID string
 	userID         string
 	botType        string
+
+	// lastChunk is read and written only by CallEvents.On* methods on the
+	// dispatcher's single FIFO goroutine, so it needs no locking. Direct
+	// AppendDebugLogChunk calls never read or update it.
+	lastChunk lastPersistedChunk
 
 	// llmCallCompleted receives each finished LLM generation (Python's
 	// OnboardingPipelineManager.on_llm_call_complete delegating to the
@@ -156,6 +169,10 @@ func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
 
 func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string) {
+	if c.lastChunk.valid && c.lastChunk.role == "user" {
+		c.rewriteLastUserChunk(text, at, promptKey)
+		return
+	}
 	c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
 }
 
@@ -185,11 +202,38 @@ func (c *CallEventCallbacks) OnToolResultCommitted(assistantToolCall voicepipeli
 	)
 }
 
+// OnCallEnded runs after PipelineTask has stop-and-drained CallEvents, so
+// no further committed-turn chunks can be written. It first writes ended_at
+// through PATCH /bot/update_conversation (falling back to the
+// voice_bot_operations.update_conversation SQS job on failure); Disha
+// enqueues the conversation-chunk sync itself when ended_at is first
+// written, so the sync is not delayed by the debug-log upload and post-call
+// HTTP round trips. The worker no longer enqueues the chunk sync. The same
+// ended_at value is then sent to run_post_call_operations, followed by the
+// Daily metrics enqueue.
 func (c *CallEventCallbacks) OnCallEnded(reason voicepipelinecore.EndReason, stats voicepipelinecore.CallStats) {
+	// Resolve once so update_conversation and run_post_call_operations send
+	// an identical ended_at (the zero-value fallback calls time.Now()).
+	stats.EndedAt = resolveEndedAt(stats)
+	endedAt := stats.EndedAt
+	c.updateConversation("ended", UpdateConversationRequest{
+		ConversationID: c.conversationID,
+		EndedAt:        &endedAt,
+	})
 	logDataS3Key := uploadDebugLogs(c.logger, c.debugLogUploader, stats.DebugLogs)
 	c.runPostCallOperations(reason, stats, logDataS3Key)
 	c.enqueueDailyMetrics(stats)
-	c.enqueueChunkSync()
+}
+
+// resolveEndedAt returns the call's end time, falling back to now when the
+// pipeline did not record one. OnCallEnded resolves it once and stores it
+// back on stats so update_conversation and run_post_call_operations send an
+// identical value; it is idempotent for an already-resolved stats.
+func resolveEndedAt(stats voicepipelinecore.CallStats) time.Time {
+	if stats.EndedAt.IsZero() {
+		return time.Now()
+	}
+	return stats.EndedAt
 }
 
 // updateConversation fires four times per call with different fields, so
@@ -247,12 +291,39 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 	if c == nil || c.redis == nil {
 		return
 	}
+	chunk := c.buildChunk(text, role, at, metrics, promptKey, additionalData, isDebugLog, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
+	defer cancel()
+	index, err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, *chunk)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
+		}
+		return
+	}
+	if !isDebugLog {
+		c.lastChunk = lastPersistedChunk{
+			role:    chunk.Role,
+			id:      chunk.ID,
+			created: chunk.Created,
+			index:   index,
+			valid:   true,
+		}
+	}
+}
+
+func (c *CallEventCallbacks) buildChunk(text, role string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, additionalData any, isDebugLog bool, chunkID, created string) *ConversationChunk {
 	var promptKeyPtr *string
 	if promptKey != "" {
 		promptKeyPtr = &promptKey
 	}
-	chunkID := uuid.NewString()
-	chunk := ConversationChunk{
+	if chunkID == "" {
+		chunkID = uuid.NewString()
+	}
+	if created == "" {
+		created = at.Format(time.RFC3339Nano)
+	}
+	chunk := &ConversationChunk{
 		ID:                               chunkID,
 		Text:                             text,
 		Role:                             role,
@@ -263,18 +334,36 @@ func (c *CallEventCallbacks) appendChunk(text, role string, at time.Time, metric
 		TTSTTFBMs:                        assistantMetricSeconds(role, metrics.TTSTTFBMs),
 		V2VLatencyMs:                     assistantMetricSeconds(role, metrics.E2ELatencyMs),
 		TextAggregationMs:                assistantMetricSeconds(role, metrics.TTSTextAggregationMs),
-		Created:                          at.Format(time.RFC3339Nano),
+		Created:                          created,
 		IsDebugLog:                       isDebugLog,
 		AdditionalData:                   additionalData,
 		MainAgentSystemPromptLangfuseKey: promptKeyPtr,
 	}
 	if c.chunkDecorator != nil {
-		c.chunkDecorator(&chunk)
+		c.chunkDecorator(chunk)
 	}
+	return chunk
+}
+
+func (c *CallEventCallbacks) rewriteLastUserChunk(text string, at time.Time, promptKey string) {
+	if c == nil || c.redis == nil {
+		return
+	}
+	chunk := c.buildChunk(
+		text,
+		"user",
+		at,
+		voicepipelinecore.TurnMetrics{},
+		promptKey,
+		nil,
+		false,
+		c.lastChunk.id,
+		c.lastChunk.created,
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), chunkWriteTimeout)
 	defer cancel()
-	if err := c.redis.AppendChunk(ctx, c.userID, c.conversationID, chunk); err != nil && c.logger != nil {
-		c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, role, err)
+	if err := c.redis.SetChunk(ctx, c.userID, c.conversationID, c.lastChunk.index, *chunk); err != nil && c.logger != nil {
+		c.logger.Printf("disha: chunk persist failed conversation=%s role=%s: %v\n", c.conversationID, chunk.Role, err)
 	}
 }
 
@@ -289,12 +378,9 @@ func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndR
 		EndReason:                      mapEndReason(reason),
 		TotalUserDuration:              int(stats.TotalUserDurationSec),
 		FirstUserAudioFramesReceivedAt: optionalTime(stats.FirstUserAudioFrameAt),
-		EndedAt:                        stats.EndedAt,
+		EndedAt:                        resolveEndedAt(stats),
 		LogDataS3Key:                   logDataS3Key,
 		OnboardingCallDone:             false,
-	}
-	if req.EndedAt.IsZero() {
-		req.EndedAt = time.Now()
 	}
 	if c.postCallDecorator != nil {
 		c.postCallDecorator(&req)

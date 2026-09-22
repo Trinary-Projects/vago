@@ -73,6 +73,10 @@ type ttsCommand struct {
 // override it.
 var ttsDialURL = "wss://api.cartesia.ai/tts/websocket?cartesia_version=2025-04-16&api_key="
 
+// defaultCartesiaModelID is used when the caller passes an empty modelID,
+// matching the pre-A/B-test Cartesia model.
+const defaultCartesiaModelID = "sonic-3"
+
 // ttsPendingEndTimeout bounds how long the orchestrator will hold a
 // deferred EndFrame waiting for Cartesia's "done" event before giving
 // up and forwarding it anyway. Exposed as a package variable so tests
@@ -112,6 +116,7 @@ type TTSProcessor struct {
 	taskCtx  *TaskContext
 	metrics  *ProcessorMetrics
 	phonetic *phoneticFilter
+	modelID  string
 
 	outputSampleRate int
 
@@ -136,8 +141,16 @@ type TTSProcessor struct {
 	ttsEvents chan ttsEvent
 	connected chan struct{} // closed when websocketConn is established
 
+	// connMu guards websocketConn and closing. The reader swaps
+	// websocketConn on reconnect while the orchestrator writes to it and
+	// Stop/EndFrame close it, so every access goes through the mutex.
+	// closing is set by the first intentional close (EndFrame forward or
+	// Stop) and makes the reader exit instead of reconnecting; connect()
+	// re-checks it after dialing so a socket dialed concurrently with the
+	// close is closed immediately rather than left unclosable.
+	connMu        sync.Mutex
 	websocketConn *websocket.Conn
-	closeOnce     sync.Once // idempotent websocket close
+	closing       bool
 
 	// Orchestrator-owned provider-error reporting windows.
 	providerErrorWindows map[string]ttsProviderErrorWindow
@@ -184,11 +197,18 @@ type CartesiaTTSDoneMessage struct {
 // only thing the caller supplies for pronunciation rewriting — the
 // filter itself is built and owned here, so the dictionary never has to
 // live on the shared TaskContext. A nil/empty dict means no filtering.
-func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string) *TTSProcessor {
+// modelID selects the Cartesia model (e.g. for the call_tts_variant_flag
+// A/B test); an empty string falls back to defaultCartesiaModelID. Voice
+// id, language, and output format are unaffected by this parameter.
+func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string, modelID string) *TTSProcessor {
+	if modelID == "" {
+		modelID = defaultCartesiaModelID
+	}
 	t := &TTSProcessor{
 		taskCtx:              taskCtx,
 		metrics:              NewProcessorMetrics("tts"),
 		phonetic:             newPhoneticFilter(phoneticDict),
+		modelID:              modelID,
 		outputSampleRate:     outputSampleRateFromRoom(taskCtx),
 		commands:             make(chan ttsCommand, 100),
 		ttsEvents:            make(chan ttsEvent, 100),
@@ -209,19 +229,41 @@ func (t *TTSProcessor) Start(ctx context.Context) {
 // closes the websocket (unblocking the reader's ReadMessage). Order
 // matters: cancel ctx before closing the ws so the reader exits
 // cleanly on its ctx check rather than racing into a reconnect attempt.
-// Idempotent via BaseProcessor's cancelling flag + closeOnce.
+// Idempotent: BaseProcessor's cancelling flag + closeTTSConnection is
+// safe to call repeatedly.
 func (t *TTSProcessor) Stop() {
 	t.BaseProcessor.Stop()
 	t.closeTTSConnection()
 }
 
+// closeTTSConnection is the intentional close (EndFrame forward or
+// Stop). It marks the processor as closing — so the reader exits on its
+// next read error instead of reconnecting — and closes whatever
+// connection is current, including one installed by a reconnect.
+// Safe to call more than once; closing an already-closed conn is a no-op
+// error we ignore.
 func (t *TTSProcessor) closeTTSConnection() {
 	t.activeContextId.Store("")
-	t.closeOnce.Do(func() {
-		if t.websocketConn != nil {
-			t.websocketConn.Close()
-		}
-	})
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.closing = true
+	if t.websocketConn != nil {
+		t.websocketConn.Close()
+	}
+}
+
+// isClosing reports whether an intentional close has happened.
+func (t *TTSProcessor) isClosing() bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.closing
+}
+
+// currentConn returns the current Cartesia websocket under connMu.
+func (t *TTSProcessor) currentConn() *websocket.Conn {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.websocketConn
 }
 
 // runReader connects to Cartesia, signals readiness, and then reads
@@ -632,7 +674,7 @@ func (t *TTSProcessor) sendTextToTTS(text string) bool {
 		}
 	}
 	payload := map[string]interface{}{
-		"model_id":       "sonic-3",
+		"model_id":       t.modelID,
 		"transcript":     speakable,
 		"voice":          map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format":  map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
@@ -641,7 +683,7 @@ func (t *TTSProcessor) sendTextToTTS(text string) bool {
 		"continue":       true,
 		"add_timestamps": true,
 	}
-	if err := t.websocketConn.WriteJSON(payload); err != nil {
+	if err := t.currentConn().WriteJSON(payload); err != nil {
 		t.taskCtx.Logger.Println("failed to send TTS payload:", err)
 		return false
 	}
@@ -656,14 +698,14 @@ func (t *TTSProcessor) ResetTTSContext() bool {
 		return false
 	}
 	payload := map[string]interface{}{
-		"model_id":      "sonic-3",
+		"model_id":      t.modelID,
 		"transcript":    "",
 		"voice":         map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format": map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
 		"context_id":    t.currentContextId,
 		"continue":      false,
 	}
-	if err := t.websocketConn.WriteJSON(payload); err != nil {
+	if err := t.currentConn().WriteJSON(payload); err != nil {
 		t.taskCtx.Logger.Println("failed to reset TTS context:", err)
 		return false
 	}
@@ -678,7 +720,7 @@ func (t *TTSProcessor) CancelTTSContext() bool {
 		"context_id": t.currentContextId,
 		"cancel":     true,
 	}
-	if err := t.websocketConn.WriteJSON(payload); err != nil {
+	if err := t.currentConn().WriteJSON(payload); err != nil {
 		t.taskCtx.Logger.Println("failed to cancel TTS context:", err)
 		return false
 	}
@@ -810,13 +852,22 @@ func (t *TTSProcessor) frameBytes() int {
 
 func (t *TTSProcessor) connect() bool {
 	for {
-		if t.ctx.Err() != nil {
+		if t.ctx.Err() != nil || t.isClosing() {
 			return false
 		}
 		conn, _, err := websocket.DefaultDialer.Dial(ttsDialURL+os.Getenv("CARTESIA_API_KEY"), nil)
 		if err == nil {
+			t.connMu.Lock()
+			if t.closing {
+				// An intentional close raced this dial; never install a
+				// socket nobody will close.
+				t.connMu.Unlock()
+				conn.Close()
+				return false
+			}
 			t.websocketConn = conn
-			t.taskCtx.Logger.Println("TTS websocket connected")
+			t.connMu.Unlock()
+			t.taskCtx.Logger.Printf("TTS websocket connected model_id=%s\n", t.modelID)
 			return true
 		}
 		t.taskCtx.Logger.Printf("TTS connect failed: %v, retrying in 1s...", err)
@@ -843,10 +894,14 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			t.taskCtx.Logger.Println("TTS reader exiting")
 			return
 		}
-		_, msg, err := t.websocketConn.ReadMessage()
+		_, msg, err := t.currentConn().ReadMessage()
 		if err != nil {
 			if t.ctx.Err() != nil {
 				t.taskCtx.Logger.Println("TTS reader exiting")
+				return
+			}
+			if t.isClosing() {
+				t.taskCtx.Logger.Println("TTS reader exiting after intentional close")
 				return
 			}
 			t.taskCtx.Logger.Println("TTS read error, reconnecting:", err)

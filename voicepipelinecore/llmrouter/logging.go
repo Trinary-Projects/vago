@@ -31,6 +31,10 @@ type CallLog struct {
 	FinishReason     string
 	UsingFallback    bool
 	SelectedGroup    string
+	// ResponseInputMode is set by Responses WebSocket clients to "full" or
+	// "incremental". It deliberately records the mode, not the response ID.
+	ResponseInputMode string
+	ReasoningTokens   int
 }
 
 // deploymentName mirrors OpenAIConfigHandler.get_deployment_name so the
