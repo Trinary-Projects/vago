@@ -1,6 +1,6 @@
 # TEC-5252: Pipecat state and frame alignment
 
-Status: implemented locally on PR #43's `0b11bd7` head; awaiting review before commit/push. The shared-context baseline, processor metrics, and final frame/queue alignment were explicitly approved by Jaideep.
+Status: implemented for PR #43, including the September 22 continuation-context correction. The shared-context baseline, processor metrics, frame/queue alignment, and routing continuation through speech output were approved by Jaideep. Both uninterrupted continuation and interruption while continuation was queued passed live staging verification.
 
 Reference: installed **Pipecat 0.0.108**, under `/Users/jaideepsingh/Projects/disha-backend/.venv/lib/python3.11/site-packages/pipecat`. This comparison uses its standard OpenAI service, universal aggregators, TTS service, and base output transport. Provider-specific Pipecat services can differ.
 
@@ -42,19 +42,20 @@ The old Soniox `TranscriptFrame.ResponseID` and provider-native Responses API ID
 
 ```mermaid
 flowchart LR
-    S[Successful stage transition] --> A[Append ordinary user instruction]
-    A --> C[Shared LLMContext]
-    A --> F[LLMContextFrame]
-    F --> Q[Normal processor queue]
-    Q --> L[LLM reads shared context and generates]
-    L --> T[TTS contexts and serialization queue]
+    S[Successful stage transition] --> A[Push append frame past user aggregator]
+    A --> T[TTS serialization queue]
+    L[LLM speech and response end] --> T
     T --> O[Output FIFO and paced audio]
-    O --> W[Downstream word text and response end]
-    W --> H[Assistant aggregator appends text]
-    H --> C
+    O --> W[Played words and response end]
+    W --> H[Assistant aggregator commits speech]
+    O --> D[Following append frame]
+    D --> I[Assistant appends ordinary user instruction]
+    H --> C[Shared LLMContext]
+    I --> C
+    I --> F[LLMContextFrame upstream]
+    F --> Q[Normal LLM processor queue]
+    Q --> L
     O --> B[Bot started/stopped broadcasts both ways]
-    R[Tool result] --> H
-    H -->|RunLLM: context upstream| Q
 ```
 
 For standalone `TTSSpeakFrame`, TTS creates an independent context. Outside an active LLM response, it queues `LLMAssistantPushAggregationFrame` to flush that speech into context. Inside an active LLM response, the ordinary response-end remains the aggregation boundary. A new generation or cue never clears earlier output.
@@ -103,6 +104,24 @@ Tests cover shared context read at invocation; sequential generation; independen
 
 Enrichment regression tests cover concurrent assistant/user appends and tool-result updates while retrieval is blocked, mutation confined to the outgoing copy, nil/empty-result fallback, cancellation before a provider request, queued context read at consumption, and enrichment on tool-result runs.
 
-`go test ./...` and `go test -race ./voicepipelinecore ./disha -timeout 120s` passed after the runtime changes. The added standalone-speech integration test also passed under the race detector. `git diff --check` passed. No live call QA or deployment has been performed.
+`go test ./...` and `go test -race ./voicepipelinecore ./disha -timeout 120s` passed after the runtime changes. The added standalone-speech integration test also passed under the race detector. `git diff --check` passed. That validation preceded live staging QA.
 
 After the request-only enrichment correction, the targeted enrichment/queued-request/tool-loop tests passed under `-race`, followed by fresh successful runs of `go test ./...` and `go test -race ./voicepipelinecore ./disha -timeout 120s`.
+
+## September 22: continuation sees the previous statement
+
+DJ's staging call `05343812-bbea-46a8-b9ce-91ae6a5ed58c` exposed a semantic gap: continuation started at 23:25:29.613 IST, while the preceding statement was committed only at 23:25:34.864. The next request lacked that statement and repeated reassurance. Both messages were eventually persisted; this was an early request, not permanent history loss.
+
+The tracker now calls `pair.User().PushFrame` instead of `QueueFrame`. This bypasses immediate consumption by the user aggregator. The unchanged append frame passes through the LLM, TTS serialization and playback FIFO, behind the response-end boundary; the assistant aggregator commits speech before handling the append and requesting inference upstream. No core handler, frame contract, or coordination state changes.
+
+Pipecat references: `services/tts_service.py::process_frame` serializes response-end and ordinary downstream frames; `processors/aggregators/llm_response_universal.py::LLMAssistantAggregator._handle_llm_messages_append` consumes the append and pushes context upstream. The user-side append handler still runs immediately for other use cases.
+
+Tradeoff: continuation generation now starts after preceding playback, exposing its LLM/TTS startup latency. Ordinary queued continuations are discarded by native interruption clearing. Late classifier completion after interruption retains the existing behavior; no new stale-result guard is introduced. Generated text is never inserted as already-spoken history.
+
+Regression coverage checks both transition/playback completion orders, exact assistant-before-instruction context, interruption while synthesis or playback is pending, and a replacement patient turn without the discarded instruction. Stage eligibility, failed/stale transitions, consecutive stages, and late-classifier behavior remain covered. The new stage-routing test failed on the old user-queue route before the correction.
+
+Validation: `go test ./...`, `go test -race ./voicepipelinecore ./disha -timeout 120s`, and `git diff --check` passed. The correction was deployed to staging from the uncommitted checkout on September 22 and verified in call `b1e64fb3-f05c-49d6-9176-5d9c29dea1e1`: the continuation request contained the complete preceding assistant statement exactly once before the instruction, then asked the next question without repeating reassurance. Playback resumed 860 ms after the statement finished. Both chunks' stored timings matched their respective raw metric events. The question-ending transition correctly waited for patient input; client disconnect cleared 46 pending playback frames and cleanup completed normally. This call did not exercise barge-in while a continuation append was queued.
+
+Call `97d75cd2-281c-4bdf-a935-2d5cc568226c` then verified interruption while continuation was queued. The stage update completed at 08:23:09.590 IST; barge-in at 08:23:15.389 cleared 89 queued playback frames. The next request contained the interrupted assistant prefix exactly once, followed by fresh patient input, with no unspoken suffix or continuation instruction. It used the updated RCA prompt and asked the next question without repeated reassurance. Both relevant chunks' timings matched raw metric events; playback latency was 872 ms for the interrupted statement and 875 ms for the new patient turn. Disconnect cleared pending playback and cleanup completed normally. These checks used runtime events and saved requests; neither call had a recording.
+
+Deployment receipt: `deploy-staging.sh` built the working tree without a commit, pushed image digest `sha256:cba1ad4bc8fdd454cff516032f15e539e69f0268167fea892ea21575a08023c8`, and completed deployment generation 166 in `disha-voice-worker-staging` (`us-east1`, namespace `staging`). ReplicaSet `5b55566c56` had 2/2 updated, ready, and available pods. Both health and readiness endpoints returned HTTP 200 on both pods. Their `/app/talk-go` SHA-256 matched the locally built image: `c9fe3492cc19a634663b4345cafbadf9c44dc7c130a62d7726b4f684c35be202`. Git HEAD at deployment was `e685aee`; the correction was deployed before committing, as requested.

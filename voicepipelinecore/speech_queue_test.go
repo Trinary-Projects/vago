@@ -214,7 +214,7 @@ func TestSpeechInterruptionCancelsAllContextsAndRejectsLateAudio(t *testing.T) {
 	}
 }
 
-func TestContinuationGeneratesAheadWithoutSpeculativeHistory(t *testing.T) {
+func TestImmediateAppendGeneratesAheadWithoutSpeculativeHistory(t *testing.T) {
 	fix := newTestFixture(t)
 	fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
 	fs := newFakeCartesiaServer(t)
@@ -284,6 +284,138 @@ func TestContinuationGeneratesAheadWithoutSpeculativeHistory(t *testing.T) {
 	})
 	if !keptInstruction || !strings.Contains(third[len(third)-1].Content, "change the topic") {
 		t.Fatalf("user messages were lost: %+v", third)
+	}
+}
+
+func TestSpeechQueuedAppendRunsAfterAssistantCommit(t *testing.T) {
+	for _, playbackFirst := range []bool{false, true} {
+		name := "append before playback"
+		if playbackFirst {
+			name = "append after playback"
+		}
+		t.Run(name, func(t *testing.T) {
+			fix := newTestFixture(t)
+			fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
+			fs := newFakeCartesiaServer(t)
+			withTTSDialURL(t, fs.URL)
+			pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
+			client := &stubLLMClient{responses: []stubLLMResponse{
+				{tokens: []string{"previous statement."}}, {tokens: []string{"next question?"}},
+			}}
+			llm := NewLLMProcessorWithClient(fix.TaskCtx, client)
+			tts := NewTTSProcessor(fix.TaskCtx, nil, "")
+			playback := NewPlaybackSinkProcessor(fix.TaskCtx)
+			processors := []Processor{pair.User(), llm, tts, playback, pair.Assistant()}
+			NewPipeline(processors).Start(fix.RootCtx)
+			defer stopProcessorsAndWait(t, fix, 2*time.Second, processors...)
+			pair.User().QueueFrame(NewLLMMessagesAppendFrame(nil, true), Downstream)
+			fc := fs.conn(t, 0)
+			id := collectSpeechRequests(t, fc, 1)["previous statement."]
+			instruction := Message{Role: "user", Content: "<system_message>continue</system_message>"}
+			appendContinuation := func() {
+				// Bypass the user handler so the ordinary frame reaches the
+				// assistant handler after serialized TTS and paced playback.
+				pair.User().PushFrame(NewLLMMessagesAppendFrame([]Message{instruction}, true), Downstream)
+			}
+			if !playbackFirst {
+				appendContinuation()
+			}
+			sendSpeechWords(t, fc, id, []string{"previous", "statement."}, []float64{0, 0.02})
+			sendSpeechAudio(t, fc, id, 1, 10)
+			fc.sendDone(id)
+			if playbackFirst {
+				awaitSpeechCondition(t, "statement committed before append", func() bool {
+					messages := pair.MessagesSnapshot()
+					return messages[len(messages)-1].Content == "previous statement."
+				})
+				appendContinuation()
+			}
+			awaitSpeechCondition(t, "continuation inference", func() bool { return len(client.Requests()) == 2 })
+			want := append(testInitialMessages(), Message{Role: "assistant", Content: "previous statement."}, instruction)
+			if got := client.Requests()[1].Messages; !reflect.DeepEqual(got, want) {
+				t.Fatalf("continuation history = %+v, want %+v", got, want)
+			}
+			if got := pair.MessagesSnapshot(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("shared history = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestSpeechQueuedAppendIsDroppedOnInterruption(t *testing.T) {
+	for _, duringPlayback := range []bool{false, true} {
+		name := "during synthesis"
+		if duringPlayback {
+			name = "during playback"
+		}
+		t.Run(name, func(t *testing.T) {
+			fix := newTestFixture(t)
+			fix.TaskCtx.Room = &testOutputRoom{outputSampleRate: defaultOutputSampleRate}
+			fs := newFakeCartesiaServer(t)
+			withTTSDialURL(t, fs.URL)
+			pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
+			client := &stubLLMClient{responses: []stubLLMResponse{
+				{tokens: []string{"alpha unheard."}}, {tokens: []string{"new answer."}},
+			}}
+			llm := NewLLMProcessorWithClient(fix.TaskCtx, client)
+			tts := NewTTSProcessor(fix.TaskCtx, nil, "")
+			output := newQueueProcessor(fix.TaskCtx, "tts-output", Downstream)
+			playback := NewPlaybackSinkProcessor(fix.TaskCtx)
+			processors := []Processor{pair.User(), llm, tts, output, playback, pair.Assistant()}
+			NewPipeline(processors).Start(fix.RootCtx)
+			defer stopProcessorsAndWait(t, fix, 2*time.Second, processors...)
+			pair.User().QueueFrame(NewLLMMessagesAppendFrame(nil, true), Downstream)
+			fc := fs.conn(t, 0)
+			id := collectSpeechRequests(t, fc, 1)["alpha unheard."]
+			pair.User().PushFrame(NewLLMMessagesAppendFrame([]Message{{Role: "user", Content: "queued continuation"}}, true), Downstream)
+			// This subsequent speak request reaching the provider proves TTS
+			// has consumed the preceding append into its serialization queue.
+			pair.User().PushFrame(NewTTSSpeakFrame("queue marker."), Downstream)
+			collectSpeechRequests(t, fc, 1)
+			if duringPlayback {
+				sendSpeechWords(t, fc, id, []string{"alpha", "unheard"}, []float64{0, 1.5})
+				sendSpeechAudio(t, fc, id, 1, 100)
+				fc.sendDone(id)
+				awaitSpeechCondition(t, "continuation released to playback", func() bool {
+					return countFrames[LLMMessagesAppendFrame](output.Captured()) == 1
+				})
+				awaitSpeechCondition(t, "first word played", func() bool {
+					pair.assistant.mu.Lock()
+					defer pair.assistant.mu.Unlock()
+					return len(pair.assistant.playedWords) > 0
+				})
+			}
+			if len(client.Requests()) != 1 {
+				t.Fatal("continuation ran before speech finished")
+			}
+			pair.User().QueueFrame(NewInterruptFrame(), Downstream)
+			awaitSpeechCondition(t, "interruption handled downstream", func() bool {
+				return countFrames[InterruptFrame](output.Captured()) == 1
+			})
+			// A fresh turn still works; it must not pick up the discarded append.
+			pair.User().QueueFrame(NewTranscriptFrame("change the topic", true, 1, false), Downstream)
+			pair.User().QueueFrame(NewTranscriptFrame("<end>", true, 1, false), Downstream)
+			awaitSpeechCondition(t, "replacement user turn", func() bool { return len(client.Requests()) == 2 })
+			collectSpeechRequests(t, fc, 1)
+			for _, m := range client.Requests()[1].Messages {
+				if m.Content == "queued continuation" || (m.Role == "assistant" && m.Content != "alpha") {
+					t.Fatalf("unplayed continuation entered replacement context: %+v", m)
+				}
+			}
+			var keptUserInput bool
+			for _, m := range pair.MessagesSnapshot() {
+				keptUserInput = keptUserInput || (m.Role == "user" && m.Content == "change the topic")
+				if m.Content == "queued continuation" {
+					t.Fatal("discarded continuation entered shared history")
+				}
+			}
+			if !keptUserInput {
+				t.Fatal("new patient input lost")
+			}
+			if len(client.Requests()) != 2 {
+				t.Fatal("discarded continuation triggered an extra LLM run")
+			}
+		})
 	}
 }
 

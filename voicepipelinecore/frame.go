@@ -335,10 +335,11 @@ func (f ErrorFrame) IsInterruptible() bool { return false }
 
 // LLMMessagesAppendFrame appends messages to the conversation context and
 // optionally runs the LLM. Mirrors Pipecat's LLMMessagesAppendFrame.
-// UserContextAggregator handles it: it appends Messages (if any) to its
-// context, and when RunLLM is set it emits an LLMContextFrame for the
-// current context. Pushing one with no Messages and RunLLM=true is how
-// the bot takes the first turn (greet-first) from the initial context.
+// Either aggregator can consume it and append Messages to shared context.
+// RunLLM emits an LLMContextFrame downstream from the user aggregator or
+// upstream from the assistant aggregator. Delivering one to the user
+// aggregator with no Messages and RunLLM=true starts the greeting; routing
+// one through TTS/playback to the assistant orders it after preceding speech.
 type LLMMessagesAppendFrame struct {
 	FrameBase
 	Messages []Message

@@ -410,7 +410,9 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 	}
 }
 
-// Pipecat message append requests inference immediately on the shared context.
+// Let the assistant aggregator consume the append after TTS/playback have
+// delivered the preceding response-end and committed the spoken text. Pipecat
+// serializes ordinary downstream frames behind speech in the same way.
 func (t *OnboardingStageTracker) queueContinuation() {
 	ctx, pair, _ := t.infrastructure()
 	if ctx == nil || ctx.Err() != nil || pair == nil {
@@ -419,7 +421,7 @@ func (t *OnboardingStageTracker) queueContinuation() {
 	frame := voicepipelinecore.NewLLMMessagesAppendFrame([]voicepipelinecore.Message{
 		{Role: "user", Content: stageContinuationInstruction},
 	}, true)
-	pair.User().QueueFrame(frame, voicepipelinecore.Downstream)
+	pair.User().PushFrame(frame, voicepipelinecore.Downstream)
 }
 
 // reportRunError is _run's generic `except Exception` arm: log + RTVI +
