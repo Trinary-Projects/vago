@@ -56,12 +56,6 @@ func main() {
 	defer sentry.Flush(2 * time.Second)
 	dishaDeps = newDishaDeps()
 	defer closeDishaDeps(dishaDeps)
-	// One drainer per process, not per call: a call ends but its queued
-	// work outlives it, and an item written by a pod that has since died
-	// must still be retried by whoever is alive.
-	outboxDrainer := disha.NewOutboxDrainer(dishaDeps.Outbox, dishaDeps.API, dishaDeps.Logger)
-	outboxDrainer.Start(context.Background())
-	defer outboxDrainer.Stop()
 	workerRuntime := worker.NewRuntime(dishaDeps, prepareTask)
 	defer workerRuntime.ReportAbruptShutdownOnExit()
 	workerRuntime.RegisterSignalHandlers()
@@ -172,21 +166,10 @@ func newDishaDeps() disha.Deps {
 		}()
 	}
 	api := disha.NewAPIClient(firstNonEmpty(os.Getenv("DISHA_API_URL"), os.Getenv("API_BASE_URL")), 10*time.Second, logger)
-	// The outbox is what makes a failed Disha call recoverable instead of
-	// lost. VAGO_OUTBOX_ENABLED=0 reverts to the previous one-shot
-	// behaviour without a redeploy of anything else.
-	outbox := disha.NewOutbox(redis, logger, outboxEnabledFromEnv())
-	api.SetOutbox(outbox)
-	if outbox.Enabled() {
-		logger.Printf("disha: outbox ENABLED — Disha API calls are persisted before sending\n")
-	} else {
-		logger.Printf("disha: outbox DISABLED (VAGO_OUTBOX_ENABLED) — Disha API calls are one-shot\n")
-	}
 	return disha.Deps{
 		Logger:       logger,
 		Redis:        redis,
 		API:          api,
-		Outbox:       outbox,
 		Documents:    disha.NewDocumentStore(redis, logger),
 		PhoneticDict: phonetic,
 		S3:           disha.NewS3GetClientFromEnv(logger, "AWS_BUCKET_NAME", "AWS_MAIN_REGION"),
@@ -204,18 +187,6 @@ func closeDishaDeps(deps disha.Deps) {
 		if err := deps.Redis.Close(); err != nil {
 			log.Printf("failed to close Disha Redis client: %v", err)
 		}
-	}
-}
-
-// outboxEnabledFromEnv defaults to ON. Set VAGO_OUTBOX_ENABLED to 0 or
-// false to fall back to one-shot delivery.
-func outboxEnabledFromEnv() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("VAGO_OUTBOX_ENABLED"))) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		log.Println("VAGO Outbox is enabled")
-		return true
 	}
 }
 

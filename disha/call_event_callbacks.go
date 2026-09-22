@@ -203,18 +203,17 @@ func (c *CallEventCallbacks) updateConversation(event string, req UpdateConversa
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), callEventRequestTimeout)
 	defer cancel()
-	oc := c.outboxContext(opUpdateConversation, c.conversationID, event)
-	if err := c.api.UpdateConversationDurable(ctx, req, oc); err != nil && c.logger != nil {
+	ic := c.idempotency(opUpdateConversation, c.conversationID, event)
+	if err := c.api.UpdateConversation(ctx, req, ic); err != nil && c.logger != nil {
 		c.logger.Printf("disha: update_conversation(%s) failed: %v\n", event, err)
 	}
 }
 
-// outboxContext bundles the deterministic idempotency key with the call
-// identity. The tags are persisted on the outbox item so the drainer —
-// which runs long after this task is gone — can still report a give-up
-// against the right conversation.
-func (c *CallEventCallbacks) outboxContext(operation string, keyParts ...string) OutboxContext {
-	return OutboxContext{
+// idempotency bundles the deterministic key with the call identity, so
+// disha-backend can recognise a replay and a failure report can name the
+// conversation it belongs to.
+func (c *CallEventCallbacks) idempotency(operation string, keyParts ...string) IdempotencyContext {
+	return IdempotencyContext{
 		IdempotencyKey: idempotencyKey(operation, keyParts...),
 		SentryTags: map[string]string{
 			"conversation_id": c.conversationID,
@@ -300,8 +299,8 @@ func (c *CallEventCallbacks) runPostCallOperations(reason voicepipelinecore.EndR
 	if c.postCallDecorator != nil {
 		c.postCallDecorator(&req)
 	}
-	oc := c.outboxContext(opRunPostCallOperations, c.conversationID)
-	if err := c.api.RunPostCallOperationsDurable(ctx, req, oc); err != nil && c.logger != nil {
+	ic := c.idempotency(opRunPostCallOperations, c.conversationID)
+	if err := c.api.RunPostCallOperations(ctx, req, ic); err != nil && c.logger != nil {
 		c.logger.Printf("disha: run_post_call_operations failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
 	}
 }
@@ -350,8 +349,8 @@ func (c *CallEventCallbacks) enqueueChunkSync() {
 		},
 		SQSQueue: "p1-fast-l1",
 	}
-	oc := c.outboxContext(opSyncConversationChunks, c.conversationID)
-	if err := c.api.EnqueueJobDurable(ctx, opSyncConversationChunks, req, oc); err != nil && c.logger != nil {
+	ic := c.idempotency(opSyncConversationChunks, c.conversationID)
+	if err := c.api.EnqueueJobKeyed(ctx, opSyncConversationChunks, req, ic); err != nil && c.logger != nil {
 		c.logger.Printf("disha: enqueue chunk sync failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
 	}
 }

@@ -13,11 +13,12 @@ import (
 )
 
 type capturedAPIRequest struct {
-	Method        string
-	Path          string
-	ContentType   string
-	Authorization string
-	Body          map[string]any
+	Method         string
+	Path           string
+	ContentType    string
+	Authorization  string
+	IdempotencyKey string
+	Body           map[string]any
 }
 
 func captureAPIRequest(t *testing.T, status int) (*httptest.Server, <-chan capturedAPIRequest) {
@@ -39,11 +40,12 @@ func captureAPIRequest(t *testing.T, status int) (*httptest.Server, <-chan captu
 			}
 		}
 		requests <- capturedAPIRequest{
-			Method:        r.Method,
-			Path:          r.URL.Path,
-			ContentType:   r.Header.Get("Content-Type"),
-			Authorization: r.Header.Get("Authorization"),
-			Body:          body,
+			Method:         r.Method,
+			Path:           r.URL.Path,
+			ContentType:    r.Header.Get("Content-Type"),
+			Authorization:  r.Header.Get("Authorization"),
+			IdempotencyKey: r.Header.Get(idempotencyHeader),
+			Body:           body,
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"success":true}`))
@@ -60,7 +62,7 @@ func TestAPIClientUpdateConversation(t *testing.T) {
 	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{
 		ConversationID: "conv-1",
 		BotJoinedAt:    &at,
-	})
+	}, IdempotencyContext{})
 	if err != nil {
 		t.Fatalf("UpdateConversation: %v", err)
 	}
@@ -93,7 +95,7 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 		EndedAt:            endedAt,
 		LogDataS3Key:       "",
 		OnboardingCallDone: false,
-	})
+	}, IdempotencyContext{})
 	if err != nil {
 		t.Fatalf("RunPostCallOperations: %v", err)
 	}
@@ -158,7 +160,7 @@ func TestAPIClientNon2xxReturnsError(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
 
-	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{ConversationID: "conv-1"})
+	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{ConversationID: "conv-1"}, IdempotencyContext{})
 	if err == nil || !strings.Contains(err.Error(), "418") || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("error = %v, want status/body", err)
 	}
@@ -173,7 +175,7 @@ func TestAPIClientContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := client.UpdateConversation(ctx, UpdateConversationRequest{ConversationID: "conv-1"})
+	err := client.UpdateConversation(ctx, UpdateConversationRequest{ConversationID: "conv-1"}, IdempotencyContext{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
@@ -184,13 +186,13 @@ func TestAPIClientSetUserCareplan(t *testing.T) {
 	client := NewAPIClient(server.URL, 0, nil)
 
 	detected := "hair_loss"
-	err := client.SetUserCareplanDurable(context.Background(), SetUserCareplanRequest{
+	err := client.SetUserCareplan(context.Background(), SetUserCareplanRequest{
 		UserID:             "user-1",
 		OnboardingCarePlan: "general",
 		DetectedCarePlan:   &detected,
-	}, OutboxContext{IdempotencyKey: "vago:careplan:user-1:general"})
+	}, IdempotencyContext{IdempotencyKey: "vago:careplan:user-1:general"})
 	if err != nil {
-		t.Fatalf("SetUserCareplanDurable: %v", err)
+		t.Fatalf("SetUserCareplan: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPost || got.Path != "/bot/set_user_careplan" {
@@ -208,7 +210,7 @@ func TestAPIClientSetUserCareplanNullDetected(t *testing.T) {
 	err := client.SetUserCareplan(context.Background(), SetUserCareplanRequest{
 		UserID:             "user-1",
 		OnboardingCarePlan: "general",
-	})
+	}, IdempotencyContext{})
 	if err != nil {
 		t.Fatalf("SetUserCareplan: %v", err)
 	}
@@ -223,12 +225,12 @@ func TestAPIClientAddTagToUser(t *testing.T) {
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, 0, nil)
 
-	err := client.AddTagToUserDurable(context.Background(), AddTagToUserRequest{
+	err := client.AddTagToUser(context.Background(), AddTagToUserRequest{
 		UserID:  "user-1",
 		TagName: "Stage Transition Failure",
-	}, OutboxContext{IdempotencyKey: "vago:tag:user-1:Stage Transition Failure"})
+	}, IdempotencyContext{IdempotencyKey: "vago:tag:user-1:Stage Transition Failure"})
 	if err != nil {
-		t.Fatalf("AddTagToUserDurable: %v", err)
+		t.Fatalf("AddTagToUser: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPost || got.Path != "/bot/add_tag_to_user" {

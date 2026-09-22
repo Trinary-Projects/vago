@@ -37,10 +37,14 @@ const (
 	opSyncConversationChunks = "sync_conversation_chunks_to_db"
 )
 
-// OutboxContext is the per-operation durability metadata a caller
-// supplies: the deterministic idempotency key that makes a replay safe,
-// and the call identity to tag a give-up event with.
-type OutboxContext struct {
+// IdempotencyContext is the per-operation metadata a caller supplies:
+// the deterministic key that lets disha-backend recognise a replay, and
+// the call identity to tag a failure report with.
+//
+// vago does not retry (decided 2026-09-21). Durability lives in
+// disha-backend, which is co-located with its Redis and SQS; this side
+// makes exactly one attempt and reports the ones that do not land.
+type IdempotencyContext struct {
 	IdempotencyKey string
 	SentryTags     map[string]string
 }
@@ -49,7 +53,6 @@ type APIClient struct {
 	baseURL    string
 	httpClient *http.Client
 	logger     *log.Logger
-	outbox     *Outbox
 }
 
 func NewAPIClient(baseURL string, timeout time.Duration, logger *log.Logger) *APIClient {
@@ -67,165 +70,95 @@ func NewAPIClient(baseURL string, timeout time.Duration, logger *log.Logger) *AP
 	}
 }
 
-// SetOutbox enables durable delivery. Until it is called (or when the
-// outbox is disabled) every ...Durable method degrades to exactly the
-// pre-outbox behaviour: one attempt, error returned to the caller.
-func (c *APIClient) SetOutbox(o *Outbox) {
-	c.outbox = o
+func (c *APIClient) UpdateConversation(ctx context.Context, req UpdateConversationRequest, ic IdempotencyContext) error {
+	return c.call(ctx, opUpdateConversation, http.MethodPatch, "/bot/update_conversation", req, ic)
 }
 
-func (c *APIClient) UpdateConversation(ctx context.Context, req UpdateConversationRequest) error {
-	return c.send(ctx, http.MethodPatch, "/bot/update_conversation", req, "")
+func (c *APIClient) RunPostCallOperations(ctx context.Context, req PostCallOperationsRequest, ic IdempotencyContext) error {
+	return c.call(ctx, opRunPostCallOperations, http.MethodPost, "/bot/run_post_call_operations", req, ic)
 }
 
-func (c *APIClient) UpdateConversationDurable(ctx context.Context, req UpdateConversationRequest, oc OutboxContext) error {
-	return c.durable(ctx, opUpdateConversation, http.MethodPatch, "/bot/update_conversation", req, oc)
+func (c *APIClient) SetUserCareplan(ctx context.Context, req SetUserCareplanRequest, ic IdempotencyContext) error {
+	return c.call(ctx, opSetUserCareplan, http.MethodPost, "/bot/set_user_careplan", req, ic)
 }
 
-func (c *APIClient) RunPostCallOperations(ctx context.Context, req PostCallOperationsRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/run_post_call_operations", req, "")
+func (c *APIClient) AddTagToUser(ctx context.Context, req AddTagToUserRequest, ic IdempotencyContext) error {
+	return c.call(ctx, opAddTagToUser, http.MethodPost, "/bot/add_tag_to_user", req, ic)
 }
 
-func (c *APIClient) RunPostCallOperationsDurable(ctx context.Context, req PostCallOperationsRequest, oc OutboxContext) error {
-	return c.durable(ctx, opRunPostCallOperations, http.MethodPost, "/bot/run_post_call_operations", req, oc)
-}
-
-func (c *APIClient) SetUserCareplan(ctx context.Context, req SetUserCareplanRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/set_user_careplan", req, "")
-}
-
-func (c *APIClient) SetUserCareplanDurable(ctx context.Context, req SetUserCareplanRequest, oc OutboxContext) error {
-	return c.durable(ctx, opSetUserCareplan, http.MethodPost, "/bot/set_user_careplan", req, oc)
-}
-
-func (c *APIClient) AddTagToUser(ctx context.Context, req AddTagToUserRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/add_tag_to_user", req, "")
-}
-
-func (c *APIClient) AddTagToUserDurable(ctx context.Context, req AddTagToUserRequest, oc OutboxContext) error {
-	return c.durable(ctx, opAddTagToUser, http.MethodPost, "/bot/add_tag_to_user", req, oc)
-}
-
+// EnqueueJob posts a background job with no idempotency key. Use it only
+// for best-effort telemetry (LLM logs, Daily metrics) where a duplicate
+// is harmless and a loss is acceptable.
 func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error {
 	return c.send(ctx, http.MethodPost, enqueueJobPath, req, "")
 }
 
-// EnqueueJobDurable persists the job before attempting it, so a failed
-// enqueue is retried rather than dropped. The idempotency key travels
-// inside the envelope, where disha-backend's worker dispatcher reads it.
-func (c *APIClient) EnqueueJobDurable(ctx context.Context, operation string, req EnqueueJobRequest, oc OutboxContext) error {
-	req.IdempotencyKey = oc.IdempotencyKey
-	return c.durable(ctx, operation, http.MethodPost, enqueueJobPath, req, oc)
+// EnqueueJobKeyed posts a job whose replay must be suppressed. The key
+// travels inside the envelope, where disha-backend's worker dispatcher
+// reads it.
+func (c *APIClient) EnqueueJobKeyed(ctx context.Context, operation string, req EnqueueJobRequest, ic IdempotencyContext) error {
+	req.IdempotencyKey = ic.IdempotencyKey
+	return c.call(ctx, operation, http.MethodPost, enqueueJobPath, req, ic)
 }
 
-// durable implements outbox-first delivery: persist, then attempt, then
-// delete on success. Persisting first is what makes "nothing is
-// dropped" true — run_post_call_operations fires at call end, exactly
-// when KEDA is most likely to SIGTERM the pod mid-attempt. The cost is
-// that a crash between a successful attempt and the delete replays the
-// operation, which the backend idempotency key absorbs.
-func (c *APIClient) durable(ctx context.Context, operation, method, path string, body any, oc OutboxContext) error {
-	if !c.outbox.Enabled() {
-		// TODO: remove this when merging PR
-		outboxLogf(c.logger, "disabled operation=%s direct_send=%s %s idempotency_key=%s", operation, method, path, oc.IdempotencyKey)
-		return c.send(ctx, method, path, body, oc.IdempotencyKey)
-	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("disha: marshal %s request: %w", operation, err)
-	}
-	item := &OutboxItem{
-		Kind:           OutboxKindAPI,
-		Operation:      operation,
-		Method:         method,
-		Path:           path,
-		Payload:        payload,
-		IdempotencyKey: oc.IdempotencyKey,
-		SentryTags:     oc.SentryTags,
-	}
-	if path == enqueueJobPath {
-		item.Kind = OutboxKindJob
-	}
-
-	if err := c.outbox.Enqueue(ctx, item); err != nil {
-		// Redis is unavailable. Degrade to a plain attempt rather than
-		// refusing to do the work at all — but with no durable copy
-		// there is nothing to retry, so a failure here IS terminal and
-		// is the one Redis-related condition worth reporting.
-		if c.logger != nil {
-			c.logger.Printf("disha: outbox enqueue failed operation=%s, attempting inline: %v\n", operation, err)
-		}
-		start := time.Now()
-		sendErr := c.send(ctx, method, path, body, oc.IdempotencyKey)
-		if sendErr != nil {
-			outboxLogf(c.logger, "DROPPED operation=%s attempt=1/1 source=inline_no_outbox duration_ms=%d reason=not_durable: %v",
-				operation, time.Since(start).Milliseconds(), sendErr)
-			c.reportDropped(operation, item, sendErr, "not_durable")
-			return sendErr
-		}
-		outboxLogf(c.logger, "delivered operation=%s attempts=1 source=inline_no_outbox duration_ms=%d (no durable copy)",
-			operation, time.Since(start).Milliseconds())
-		return nil
-	}
-
-	item.Attempts = 1
-	// TODO: remove this when merging PR
-	outboxLogf(c.logger, "attempt operation=%s id=%s attempt=%d/%d source=inline %s %s",
-		operation, item.ID, item.Attempts, outboxMaxAttempts, method, path)
+// call makes ONE attempt and reports a failure that nothing else will
+// recover.
+//
+// There is no retry here by design: vago's worker is a cross-region hop
+// from Disha, and holding operations on this side meant either paying
+// that latency to persist them (the Redis outbox) or keeping them in
+// memory where a pod deletion loses them. disha-backend owns durability
+// instead — it is co-located with its Redis and SQS, and its idempotency
+// claim makes a replay safe.
+//
+// The consequence, stated plainly: a request that never reaches the
+// backend is gone. That is what the report below is for.
+func (c *APIClient) call(ctx context.Context, operation, method, path string, body any, ic IdempotencyContext) error {
 	start := time.Now()
-	sendErr := c.sendRaw(ctx, method, path, payload, oc.IdempotencyKey)
-	logOutboxAttempt(c.logger, item, "inline", time.Since(start), sendErr)
-	if sendErr != nil {
-		if !outboxRetryable(sendErr) {
-			// A permanent client error will never succeed, so retrying
-			// it eight times only delays the alert. Terminal.
-			_ = c.outbox.Park(ctx, item, sendErr)
-			outboxLogf(c.logger, "GAVE UP operation=%s id=%s attempts=%d reason=permanent source=inline: %v",
-				operation, item.ID, item.Attempts, sendErr)
-			c.reportDropped(operation, item, sendErr, "permanent")
-			return sendErr
-		}
-		// Durably queued — the drainer owns it from here, so this is
-		// not a failure from the caller's point of view. Outbox.Retry
-		// logs when it comes due.
-		if rerr := c.outbox.Retry(ctx, item, sendErr); rerr != nil && c.logger != nil {
-			c.logger.Printf("disha: outbox reschedule failed operation=%s id=%s: %v\n", operation, item.ID, rerr)
-		}
+	err := c.send(ctx, method, path, body, ic.IdempotencyKey)
+	if err == nil {
+		// TODO: remove this when merging PR
+		apiLogf(c.logger, "delivered operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s",
+			operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"])
 		return nil
 	}
-
-	if err := c.outbox.Complete(ctx, item.ID); err != nil && c.logger != nil {
-		c.logger.Printf("disha: outbox complete failed operation=%s id=%s: %v\n", operation, item.ID, err)
-	}
-	outboxLogf(c.logger, "delivered operation=%s id=%s attempts=%d source=inline", operation, item.ID, item.Attempts)
-	return nil
+	apiLogf(c.logger, "NOT DELIVERED operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s: %v",
+		operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], err)
+	c.reportUndelivered(operation, ic, err)
+	return err
 }
 
-// reportDropped fires the single Sentry event for an operation that is
-// definitively lost on this path — no durable copy and no further
-// attempt will be made. Everything recoverable is logged instead, so an
-// event from this component always means real data loss.
-func (c *APIClient) reportDropped(operation string, item *OutboxItem, cause error, reason string) {
-	details := map[string]any{"reason": reason, "attempts": item.Attempts}
-	for k, v := range item.SentryTags {
+// reportUndelivered captures one event per operation per minute. Nothing
+// retries these, so each is real loss and worth seeing — but a Disha
+// outage would otherwise produce one event per operation per call, which
+// is how VAGO-6 and VAGO-7 became unreadable.
+func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, cause error) {
+	if !allowSentryReport("api_undelivered:"+operation, time.Now()) {
+		return
+	}
+	details := map[string]any{"idempotency_key": ic.IdempotencyKey}
+	for k, v := range ic.SentryTags {
 		details[k] = v
 	}
 	captureOutboxSentry(sentryutil.Event{
-		Hub: sentryutil.NewTaskHub(item.SentryTags),
+		Hub: sentryutil.NewTaskHub(ic.SentryTags),
 		Err: cause,
 		Tags: map[string]string{
-			"component": "disha_outbox",
+			"component": "disha_api",
 			"operation": operation,
-			"reason":    reason,
+			"reason":    "not_delivered",
 		},
 		Details: details,
 	})
 }
 
-// attemptOutbox replays a claimed item. It satisfies outboxAttempter.
-func (c *APIClient) attemptOutbox(ctx context.Context, item *OutboxItem) error {
-	return c.sendRaw(ctx, item.Method, item.Path, item.Payload, item.IdempotencyKey)
+// apiLogf mirrors the outbox line format that preceded it.
+// TODO: remove this when merging PR
+func apiLogf(logger *log.Logger, format string, v ...any) {
+	if logger == nil {
+		return
+	}
+	logger.Printf("disha: api "+format+"\n", v...)
 }
 
 func (c *APIClient) send(ctx context.Context, method, path string, body any, idempotencyKey string) error {

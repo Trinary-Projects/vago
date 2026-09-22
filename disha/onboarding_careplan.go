@@ -218,11 +218,11 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 	m.sendRTVI(fmt.Sprintf("[PROCESS] Care plan switcher complete: %s", plan.Name))
 
 	if m.api != nil {
-		err := m.api.SetUserCareplanDurable(ctx, SetUserCareplanRequest{
+		err := m.api.SetUserCareplan(ctx, SetUserCareplanRequest{
 			UserID:             m.userID,
 			OnboardingCarePlan: plan.Name,
 			DetectedCarePlan:   &detected,
-		}, OutboxContext{
+		}, IdempotencyContext{
 			IdempotencyKey: idempotencyKey(opSetUserCareplan, m.userID, plan.Name),
 			SentryTags: map[string]string{
 				"conversation_id": m.conversationID,
@@ -231,9 +231,9 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 			},
 		})
 		if err != nil {
-			// Only a permanent (non-retryable) failure reaches here now;
-			// a transient one is queued and owned by the drainer. Either
-			// way it never fails activation — Python parity.
+			// disha-backend owns any retry of this; from here a failure
+			// means the request did not land. It never fails activation
+			// either way — Python parity.
 			sentryutil.Capture(sentryutil.Event{
 				Hub: m.sentryHub(),
 				Err: fmt.Errorf("disha: set_user_careplan failed: %w", err),

@@ -163,10 +163,10 @@ func (m *OnboardingStageThresholdMonitor) tagUser(userID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), stageThresholdTagTimeout)
 	defer cancel()
 
-	if err := m.api.AddTagToUserDurable(ctx, AddTagToUserRequest{
+	if err := m.api.AddTagToUser(ctx, AddTagToUserRequest{
 		UserID:  userID,
 		TagName: stageTransitionFailureTag,
-	}, OutboxContext{
+	}, IdempotencyContext{
 		IdempotencyKey: idempotencyKey(opAddTagToUser, userID, stageTransitionFailureTag),
 		SentryTags: map[string]string{
 			"conversation_id": m.conversationID,
