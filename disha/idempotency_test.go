@@ -41,8 +41,9 @@ func resetSentryRateLimiter(t *testing.T) {
 	})
 }
 
-// Nothing retries a Disha call any more, so a failure here IS the loss
-// and must be reported — with the conversation identity attached.
+// When neither the route nor the fallback job takes the work, that IS
+// the loss and must be reported — with the conversation identity
+// attached. The stub 503s both hops.
 func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 	resetSentryRateLimiter(t)
 	events := recordSentryEvents(t)
@@ -79,8 +80,9 @@ func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 	}
 }
 
-// A Disha outage must not reproduce VAGO-7: one event per operation per
-// minute, however many calls end during it.
+// A Disha outage takes both hops down together and must not reproduce
+// VAGO-7: one event per operation per minute, however many calls end
+// during it.
 func TestAPIClientRateLimitsUndeliveredReports(t *testing.T) {
 	resetSentryRateLimiter(t)
 	events := recordSentryEvents(t)

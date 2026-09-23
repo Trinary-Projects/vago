@@ -174,21 +174,12 @@ func (m *OnboardingStageThresholdMonitor) tagUser(userID string) {
 			"bot_type":        OnboardingCallBotType,
 		},
 	}); err != nil {
-		// Python logs and captures the tagging failure but never lets it
-		// affect the call.
-		m.logger.Printf("Failed to tag user with stage transition failure: %v", err)
-		sentryutil.Capture(sentryutil.Event{
-			Hub: m.sentryHub(),
-			Err: err,
-			Tags: map[string]string{
-				"component": "disha_onboarding",
-				"operation": "stage_threshold_tag_user",
-			},
-			Details: map[string]any{
-				"conversation_id": m.conversationID,
-				"user_id":         userID,
-			},
-		})
+		// APIClient.call already captured this as the one
+		// not_delivered report for add_tag_to_user; capturing again
+		// here only split the same failure across two issues. It never
+		// affects the call either way — Python parity.
+		m.logger.Printf("Failed to tag user with stage transition failure conversation=%s user=%s: %v",
+			m.conversationID, userID, err)
 	}
 }
 

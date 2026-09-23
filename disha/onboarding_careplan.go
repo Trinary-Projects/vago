@@ -231,22 +231,14 @@ func (m *OnboardingCarePlanManager) Activate(ctx context.Context, name, detected
 			},
 		})
 		if err != nil {
-			// disha-backend owns any retry of this; from here a failure
-			// means the request did not land. It never fails activation
-			// either way — Python parity.
-			sentryutil.Capture(sentryutil.Event{
-				Hub: m.sentryHub(),
-				Err: fmt.Errorf("disha: set_user_careplan failed: %w", err),
-				Tags: map[string]string{
-					"component": "disha_onboarding",
-					"operation": "careplan_set_user_careplan",
-				},
-				Details: map[string]any{
-					"conversation_id": m.conversationID,
-					"user_id":         m.userID,
-					"care_plan":       plan.Name,
-				},
-			})
+			// APIClient.call already captured this as the one
+			// not_delivered report for the operation; a second capture
+			// here only split the same failure across two issues. It
+			// never fails activation either way — Python parity.
+			if m.logger != nil {
+				m.logger.Printf("disha: set_user_careplan failed conversation=%s user=%s care_plan=%s: %v\n",
+					m.conversationID, m.userID, plan.Name, err)
+			}
 		}
 	}
 

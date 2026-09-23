@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,12 @@ const (
 	defaultAPITimeout = 10 * time.Second
 
 	enqueueJobPath = "/common/enqueue_job"
+
+	// fallbackJobModule holds the module-level Python equivalents of the
+	// four bot routes; fallbackJobQueue is the same queue Disha's own
+	// callers use for them.
+	fallbackJobModule = "bots.operations.voice_bot_operations"
+	fallbackJobQueue  = "p0-fast-l1"
 
 	// idempotencyHeader carries the envelope key on the direct HTTP
 	// routes. The job path carries the same key inside
@@ -37,13 +44,25 @@ const (
 	opSyncConversationChunks = "sync_conversation_chunks_to_db"
 )
 
+// jobFallbackFunc maps an operation to the module-level Python function
+// that performs the same work off SQS. An operation absent from this map
+// has no fallback: opSyncConversationChunks IS an enqueue_job, so
+// queueing it again would just repeat the call that has already failed.
+var jobFallbackFunc = map[string]string{
+	opUpdateConversation:    "update_conversation",
+	opRunPostCallOperations: "run_post_call_operations",
+	opSetUserCareplan:       "set_user_careplan",
+	opAddTagToUser:          "add_tag_to_user",
+}
+
 // IdempotencyContext is the per-operation metadata a caller supplies:
 // the deterministic key that lets disha-backend recognise a replay, and
 // the call identity to tag a failure report with.
 //
-// vago does not retry (decided 2026-09-21). Durability lives in
-// disha-backend, which is co-located with its Redis and SQS; this side
-// makes exactly one attempt and reports the ones that do not land.
+// The key travels on both delivery hops — the route's Idempotency-Key
+// header and the fallback job's envelope — so a backend that honours it
+// cannot run the same operation twice when vago falls back after a
+// request whose response was lost rather than whose work never ran.
 type IdempotencyContext struct {
 	IdempotencyKey string
 	SentryTags     map[string]string
@@ -101,18 +120,19 @@ func (c *APIClient) EnqueueJobKeyed(ctx context.Context, operation string, req E
 	return c.call(ctx, operation, http.MethodPost, enqueueJobPath, req, ic)
 }
 
-// call makes ONE attempt and reports a failure that nothing else will
-// recover.
+// call sends the operation to its route and, if that fails, queues the
+// same work as a background job. Sentry hears about it only when BOTH
+// have failed — that is the point at which the operation is genuinely
+// lost, and one incident should produce one alert, not one per hop.
 //
-// There is no retry here by design: vago's worker is a cross-region hop
-// from Disha, and holding operations on this side meant either paying
-// that latency to persist them (the Redis outbox) or keeping them in
-// memory where a pod deletion loses them. disha-backend owns durability
-// instead — it is co-located with its Redis and SQS, and its idempotency
-// claim makes a replay safe.
+// The fallback is API-first rather than enqueue-always because the happy
+// path is virtually every call: queueing all of them would add four SQS
+// messages per call for the update_conversation lifecycle alone.
 //
-// The consequence, stated plainly: a request that never reaches the
-// backend is gone. That is what the report below is for.
+// The deterministic idempotency key travels on both hops — as the
+// Idempotency-Key header on the route, and inside the job envelope — so
+// a backend that honours it runs the work at most once even when the
+// route in fact succeeded and only its response was lost.
 func (c *APIClient) call(ctx context.Context, operation, method, path string, body any, ic IdempotencyContext) error {
 	start := time.Now()
 	err := c.send(ctx, method, path, body, ic.IdempotencyKey)
@@ -122,16 +142,80 @@ func (c *APIClient) call(ctx context.Context, operation, method, path string, bo
 			operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"])
 		return nil
 	}
+
+	fallbackErr := c.enqueueAPIFallback(operation, body, ic, err)
+	if fallbackErr == nil {
+		apiLogf(c.logger, "queued fallback job operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s after: %v",
+			operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], err)
+		return nil
+	}
+
 	apiLogf(c.logger, "NOT DELIVERED operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s: %v",
-		operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], err)
-	c.reportUndelivered(operation, ic, err)
-	return err
+		operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], fallbackErr)
+	c.reportUndelivered(operation, ic, fallbackErr)
+	return fallbackErr
 }
 
-// reportUndelivered captures one event per operation per minute. Nothing
-// retries these, so each is real loss and worth seeing — but a Disha
-// outage would otherwise produce one event per operation per call, which
-// is how VAGO-6 and VAGO-7 became unreadable.
+// enqueueAPIFallback queues the failed operation as a background job.
+// It returns nil once the job is accepted, and otherwise the error that
+// describes the ultimate failure — the one worth reporting.
+func (c *APIClient) enqueueAPIFallback(operation string, body any, ic IdempotencyContext, cause error) error {
+	funcName, ok := jobFallbackFunc[operation]
+	if !ok {
+		// Nothing to fall back to; the route error is already final.
+		return cause
+	}
+	// A permanent 4xx will fail exactly the same way inside the worker,
+	// so queueing it only moves the failure to the DLQ. Only a response
+	// the backend may yet recover from — or no response at all — is
+	// worth a second hop.
+	var status *APIStatusError
+	if errors.As(cause, &status) && !status.IsServerSide() {
+		return cause
+	}
+
+	kwargs, err := requestAsMap(body)
+	if err != nil {
+		return fmt.Errorf("disha: %s API failed (%v) and building fallback kwargs failed: %w", operation, cause, err)
+	}
+
+	// The caller's context is normally already dead here — a timeout is
+	// exactly when this path runs — so the fallback gets its own budget.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultAPITimeout)
+	defer cancel()
+	if err := c.EnqueueJob(ctx, EnqueueJobRequest{
+		ModuleName:     fallbackJobModule,
+		FuncName:       funcName,
+		Kwargs:         kwargs,
+		SQSQueue:       fallbackJobQueue,
+		IdempotencyKey: ic.IdempotencyKey,
+	}); err != nil {
+		return fmt.Errorf("disha: %s API failed (%v) and fallback enqueue failed: %w", operation, cause, err)
+	}
+	return nil
+}
+
+// requestAsMap turns a typed request into the job kwargs. The JSON tags
+// already match the Python functions' parameter names, and those have
+// strict signatures, so this must stay a plain round-trip: an extra key
+// TypeErrors the job in the worker.
+func requestAsMap(req any) (map[string]any, error) {
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// reportUndelivered captures one event per operation per minute. It runs
+// only after the route AND the fallback job have both failed, so every
+// event here is real loss — but a Disha outage would otherwise produce
+// one per operation per call, which is how VAGO-6 and VAGO-7 became
+// unreadable.
 func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, cause error) {
 	if !allowSentryReport("api_undelivered:"+operation, time.Now()) {
 		return
@@ -173,8 +257,8 @@ func (c *APIClient) send(ctx context.Context, method, path string, body any, ide
 // It deliberately does NOT capture to Sentry. It used to, which is what
 // made VAGO-6 and VAGO-7 fire on every transient blip — including ones
 // the fallback then recovered from — and collapsed nine unrelated job
-// call sites into a single ungroupable issue. Reporting is now the
-// responsibility of whoever exhausts the retry budget.
+// call sites into a single ungroupable issue. Reporting belongs to
+// whoever runs out of ways to deliver the work.
 func (c *APIClient) sendRaw(ctx context.Context, method, path string, payload []byte, idempotencyKey string) error {
 	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {

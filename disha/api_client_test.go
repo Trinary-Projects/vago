@@ -3,7 +3,6 @@ package disha
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -128,10 +127,22 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 // attempt and a failure surfaces to the caller. Nothing may fall back to
 // a /common/enqueue_job retry any more, so a failing route must produce
 // exactly one request.
-func TestAPIClientFailureDoesNotQueueFallbackJob(t *testing.T) {
+// A route failure queues the same work as a job. The caller sees success
+// because the operation is still going to run.
+func TestAPIClientFailureQueuesFallbackJob(t *testing.T) {
+	resetSentryRateLimiter(t)
+	events := recordSentryEvents(t)
 	requests := make(chan capturedAPIRequest, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path}
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		requests <- capturedAPIRequest{Method: r.Method, Path: r.URL.Path, Body: body}
+		if r.URL.Path == enqueueJobPath {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("db down"))
 	}))
@@ -142,19 +153,121 @@ func TestAPIClientFailureDoesNotQueueFallbackJob(t *testing.T) {
 	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{
 		ConversationID: "conv-1",
 		BotJoinedAt:    &at,
-	}, IdempotencyContext{})
-	if err == nil {
-		t.Fatal("expected the 500 to surface to the caller")
+	}, IdempotencyContext{IdempotencyKey: "vago:updateconv:conv-1:bot_joined"})
+	if err != nil {
+		t.Fatalf("a queued fallback must read as delivered, got %v", err)
 	}
 
 	first := <-requests
 	if first.Method != http.MethodPatch || first.Path != "/bot/update_conversation" {
 		t.Fatalf("request = %s %s, want PATCH /bot/update_conversation", first.Method, first.Path)
 	}
-	select {
-	case extra := <-requests:
-		t.Fatalf("unexpected second request %s %s; vago must not retry or queue a fallback job", extra.Method, extra.Path)
-	case <-time.After(100 * time.Millisecond):
+	second := <-requests
+	if second.Method != http.MethodPost || second.Path != enqueueJobPath {
+		t.Fatalf("fallback = %s %s, want POST %s", second.Method, second.Path, enqueueJobPath)
+	}
+	if second.Body["module_name"] != fallbackJobModule || second.Body["func_name"] != opUpdateConversation {
+		t.Fatalf("fallback job = %v.%v", second.Body["module_name"], second.Body["func_name"])
+	}
+	if second.Body["sqs_queue"] != fallbackJobQueue {
+		t.Fatalf("fallback queue = %v, want %q", second.Body["sqs_queue"], fallbackJobQueue)
+	}
+	if second.Body["idempotency_key"] != "vago:updateconv:conv-1:bot_joined" {
+		t.Fatalf("fallback lost the key: %v", second.Body["idempotency_key"])
+	}
+	// The kwargs must be exactly the route's body: bots.operations.
+	// voice_bot_operations.update_conversation has a strict signature.
+	kwargs, _ := second.Body["kwargs"].(map[string]any)
+	if kwargs["conversation_id"] != "conv-1" || kwargs["bot_joined_at"] == nil {
+		t.Fatalf("fallback kwargs = %+v", kwargs)
+	}
+	if len(*events) != 0 {
+		t.Fatalf("a recovered failure reported %d events, want 0", len(*events))
+	}
+}
+
+// Both hops failing is the ultimate failure, and reports exactly once.
+func TestAPIClientQueuedFallbackFailureReportsOnce(t *testing.T) {
+	resetSentryRateLimiter(t)
+	events := recordSentryEvents(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, time.Second, nil)
+	err := client.UpdateConversation(context.Background(),
+		UpdateConversationRequest{ConversationID: "conv-1"},
+		IdempotencyContext{SentryTags: map[string]string{"conversation_id": "conv-1"}})
+	if err == nil {
+		t.Fatal("expected the loss to surface once both hops failed")
+	}
+	if len(paths) != 2 || paths[1] != enqueueJobPath {
+		t.Fatalf("paths = %v, want the route then %s", paths, enqueueJobPath)
+	}
+	if len(*events) != 1 {
+		t.Fatalf("captured %d events for one lost operation, want 1", len(*events))
+	}
+	if (*events)[0].Tags["operation"] != opUpdateConversation {
+		t.Fatalf("operation tag = %q, want the operation, not the enqueue", (*events)[0].Tags["operation"])
+	}
+}
+
+// A permanent 4xx would fail identically in the worker, so it is not
+// worth a second hop — it reports straight away.
+func TestAPIClientPermanentStatusSkipsFallback(t *testing.T) {
+	resetSentryRateLimiter(t)
+	events := recordSentryEvents(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, time.Second, nil)
+	err := client.AddTagToUser(context.Background(),
+		AddTagToUserRequest{UserID: "user-1", TagName: "Stage Transition Failure"},
+		IdempotencyContext{})
+	if err == nil {
+		t.Fatal("expected the 422 to surface")
+	}
+	if len(paths) != 1 {
+		t.Fatalf("paths = %v, want the route only", paths)
+	}
+	if len(*events) != 1 {
+		t.Fatalf("captured %d events, want 1", len(*events))
+	}
+}
+
+// Chunk sync IS an enqueue_job; re-queueing it would repeat the call
+// that just failed, so it reports on the first failure.
+func TestAPIClientEnqueueJobKeyedHasNoFallback(t *testing.T) {
+	resetSentryRateLimiter(t)
+	events := recordSentryEvents(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, time.Second, nil)
+	err := client.EnqueueJobKeyed(context.Background(), opSyncConversationChunks, EnqueueJobRequest{
+		ModuleName: "services.conversation_chunk_manager",
+		FuncName:   "sync_conversation_chunks_to_db",
+		SQSQueue:   "p1-fast-l1",
+	}, IdempotencyContext{})
+	if err == nil {
+		t.Fatal("expected the 503 to surface")
+	}
+	if len(paths) != 1 {
+		t.Fatalf("paths = %v, want one attempt", paths)
+	}
+	if len(*events) != 1 {
+		t.Fatalf("captured %d events, want 1", len(*events))
 	}
 }
 
@@ -223,9 +336,18 @@ func TestAPIClientNon2xxReturnsError(t *testing.T) {
 	}
 }
 
-func TestAPIClientContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// A dead caller context is the normal shape of this failure — the 10s
+// budget expiring is a deadline, and a call ending mid-transition is a
+// cancel. The work is still wanted either way, so the fallback runs on
+// its own budget rather than inheriting the context that just died.
+func TestAPIClientContextCancellationStillQueuesFallback(t *testing.T) {
+	resetSentryRateLimiter(t)
+	events := recordSentryEvents(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
 	}))
 	t.Cleanup(server.Close)
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
@@ -233,8 +355,14 @@ func TestAPIClientContextCancellation(t *testing.T) {
 	cancel()
 
 	err := client.UpdateConversation(ctx, UpdateConversationRequest{ConversationID: "conv-1"}, IdempotencyContext{})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context.Canceled", err)
+	if err != nil {
+		t.Fatalf("a queued fallback must read as delivered, got %v", err)
+	}
+	if len(paths) != 1 || paths[0] != enqueueJobPath {
+		t.Fatalf("paths = %v, want only the fallback (the route never left)", paths)
+	}
+	if len(*events) != 0 {
+		t.Fatalf("captured %d events, want 0", len(*events))
 	}
 }
 
