@@ -5,15 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math/rand/v2"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
@@ -40,8 +39,7 @@ const (
 	// ttsEventReconnected signals that the reader re-established the
 	// Cartesia websocket after a read error. It carries no contextID —
 	// Cartesia has no idea what context we were in — so the orchestrator
-	// must handle it before the isCurrentContext check in handleTTSEvent
-	// would otherwise eat it.
+	// must finish all contexts from the lost connection.
 	ttsEventReconnected
 	// ttsEventProviderError carries a Cartesia error response to the
 	// orchestrator, which owns the active synthesis state.
@@ -63,6 +61,7 @@ type ttsEvent struct {
 // orchestrator after the frame has been fully processed and (for
 // EndFrame) forwarded downstream.
 type ttsCommand struct {
+	ctx   context.Context
 	frame Frame
 	dir   Direction
 	done  chan struct{}
@@ -93,66 +92,52 @@ type ttsProviderErrorWindow struct {
 	count     int
 }
 
-// TTSProcessor wraps Cartesia. After migration its shape is:
-//
-//   - readTTSConnectionData goroutine: reads from the websocket, parses
-//     messages, and pushes typed events to ttsEvents.
-//   - orchestrator goroutine: owns ALL TTS state (aggregation, synthesis,
-//     shutdown). It drives Cartesia (send text, reset, cancel) and
-//     emits downstream frames (AudioFrame, WordTimestampFrame,
-//     TTSDoneFrame, deferred EndFrame). After forwarding EndFrame it
-//     closes the Cartesia connection and exits, but leaves the base
-//     processor queues alive until PipelineTask cleanup stops them.
-//   - ProcessFrame: thin relay. For EndFrame it blocks until the
-//     orchestrator confirms the EndFrame has been forwarded; for
-//     InterruptFrame it forwards downstream immediately and signals the
-//     orchestrator to clean up; for other downstream frames it queues a
-//     command; for upstream pass-through frames it forwards directly.
-//
-// State ownership: only the orchestrator mutates state, so there is no
-// concurrent access to currentAggregation, pcmBuffer, etc.
+// ttsContext keeps synthesis state separate for each utterance. Provider
+// responses may arrive out of order; output is released in creation order.
+type ttsContext struct {
+	id              string
+	aggregation     string
+	firstText       bool
+	firstSentence   bool
+	firstAudio      bool
+	pcmBuffer       []byte
+	pendingWords    []pendingWord
+	audioTimePushed float64
+	sent            bool
+	closed          bool
+	done            bool
+	output          []Frame
+}
+
+// ttsOutputItem mirrors Pipecat's serialization queue: either a context to
+// drain completely or an ordinary frame that follows that context.
+type ttsOutputItem struct {
+	context *ttsContext
+	frame   Frame
+}
+
+// TTSProcessor has one websocket reader and one state-owning orchestrator.
+// Like Pipecat's audio contexts, each utterance can synthesize independently,
+// while contexts and their audio/word/end frames drain downstream in FIFO order.
 type TTSProcessor struct {
 	*BaseProcessor
-	taskCtx  *TaskContext
-	metrics  *ProcessorMetrics
-	phonetic *phoneticFilter
-	modelID  string
-
+	taskCtx          *TaskContext
+	metrics          *ProcessorMetrics
+	phonetic         *phoneticFilter
+	modelID          string
 	outputSampleRate int
 
-	// Aggregation state (orchestrator only)
-	currentAggregation string
-	currentContextId   string
-	firstTextReceived  bool
-	firstSentenceSent  bool
+	// Orchestrator-owned. turn receives LLM tokens; outputQueue owns emission order.
+	turn         *ttsContext
+	outputQueue  []ttsOutputItem
+	contextsByID map[string]*ttsContext
+	commands     chan ttsCommand
+	ttsEvents    chan ttsEvent
+	connected    chan struct{}
 
-	// Synthesis state (orchestrator only — modified inside handleTTSEvent
-	// which is called only from orchestrator goroutine)
-	pcmBuffer          []byte
-	pendingWords       []pendingWord
-	audioTimePushed    float64
-	firstAudioReceived bool
-
-	// Shared (atomic) — read by reader goroutine, written by orchestrator.
-	activeContextId atomic.Value // string
-
-	// Channels
-	commands  chan ttsCommand
-	ttsEvents chan ttsEvent
-	connected chan struct{} // closed when websocketConn is established
-
-	// connMu guards websocketConn and closing. The reader swaps
-	// websocketConn on reconnect while the orchestrator writes to it and
-	// Stop/EndFrame close it, so every access goes through the mutex.
-	// closing is set by the first intentional close (EndFrame forward or
-	// Stop) and makes the reader exit instead of reconnecting; connect()
-	// re-checks it after dialing so a socket dialed concurrently with the
-	// close is closed immediately rather than left unclosable.
-	connMu        sync.Mutex
-	websocketConn *websocket.Conn
-	closing       bool
-
-	// Orchestrator-owned provider-error reporting windows.
+	connMu               sync.Mutex
+	websocketConn        *websocket.Conn
+	closing              bool
 	providerErrorWindows map[string]ttsProviderErrorWindow
 }
 
@@ -205,8 +190,9 @@ func NewTTSProcessor(taskCtx *TaskContext, phoneticDict map[string]string, model
 		modelID = defaultCartesiaModelID
 	}
 	t := &TTSProcessor{
-		taskCtx:              taskCtx,
 		metrics:              NewProcessorMetrics("tts"),
+		taskCtx:              taskCtx,
+		contextsByID:         make(map[string]*ttsContext),
 		phonetic:             newPhoneticFilter(phoneticDict),
 		modelID:              modelID,
 		outputSampleRate:     outputSampleRateFromRoom(taskCtx),
@@ -243,7 +229,6 @@ func (t *TTSProcessor) Stop() {
 // Safe to call more than once; closing an already-closed conn is a no-op
 // error we ignore.
 func (t *TTSProcessor) closeTTSConnection() {
-	t.activeContextId.Store("")
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
 	t.closing = true
@@ -278,343 +263,282 @@ func (t *TTSProcessor) runReader() {
 
 // ProcessFrame relays frames to the orchestrator. EndFrame blocks until
 // the orchestrator has fully processed it (waited for Cartesia done +
-// forwarded the EndFrame downstream); InterruptFrame is forwarded
-// downstream immediately, then the orchestrator is signalled to clean
-// up; other frames are queued non-blocking.
+// forwarded the EndFrame downstream). The orchestrator cancels synthesis
+// before forwarding interruption, so old audio cannot follow the interrupt.
 func (t *TTSProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
-	switch frame.(type) {
-	case EndFrame:
-		done := make(chan struct{})
+	if dir == Upstream {
+		t.PushFrame(frame, dir)
+		return
+	}
+	cmd := ttsCommand{ctx: ctx, frame: frame, dir: dir}
+	if _, interrupted := frame.(InterruptFrame); interrupted {
 		select {
-		case t.commands <- ttsCommand{frame: frame, dir: dir, done: done}:
-		case <-t.ctx.Done():
+		case <-t.connected:
+		default:
+			// No synthesis can exist before the initial connection. Relayed
+			// commands from before this interrupt carry cancelled contexts.
+			t.PushFrame(frame, dir)
 			return
 		}
+	}
+	if _, ok := frame.(EndFrame); ok {
+		cmd.done = make(chan struct{})
+	}
+	select {
+	case t.commands <- cmd:
+	case <-ctx.Done():
+		return
+	}
+	if cmd.done != nil {
 		select {
-		case <-done:
+		case <-cmd.done:
 		case <-ctx.Done():
-		}
-	case InterruptFrame:
-		// Forward downstream right away so PlaybackSink/playback goroutine
-		// can stop in parallel with orchestrator cleanup.
-		t.PushFrame(frame, dir)
-		select {
-		case t.commands <- ttsCommand{frame: frame, dir: dir}:
-		case <-t.ctx.Done():
-		}
-	case TTSDoneFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame, WordTimestampFrame:
-		// Upstream pass-through; orchestrator doesn't react to these.
-		t.PushFrame(frame, dir)
-	default:
-		// All other downstream frames (LLMResponseStart/End, TextFrame,
-		// TTSSpeakFrame, LLMMessagesFrame, etc.) go through the orchestrator.
-		select {
-		case t.commands <- ttsCommand{frame: frame, dir: dir}:
-		case <-t.ctx.Done():
 		}
 	}
 }
 
-// orchestrator owns all TTS state and drives Cartesia. It mirrors the
-// original Process loop's switch structure, but reads commands from a
-// dedicated channel (relayed by ProcessFrame) instead of from
-// ProcessorChannels.
-//
-// The orchestrator waits for runReader to establish the Cartesia
-// connection before processing any command. This avoids racing on
-// t.websocketConn (the reader goroutine writes it; orchestrator
-// methods like sendTextToTTS read it). Commands queued during the
-// pre-connect window sit in t.commands (capacity 100). If shutdown is
-// requested before connect succeeds, orchestrator exits via ctx.Done
-// and any ProcessFrame caller blocked on a command's done channel
-// unblocks via its own per-frame ctx (procCtx, derived from b.ctx).
 func (t *TTSProcessor) orchestrator() {
 	select {
 	case <-t.connected:
 	case <-t.ctx.Done():
 		return
 	}
-
-	var pendingEnd *EndFrame
-	var pendingEndDir Direction
-	var pendingEndDone chan struct{}
-
-	// pendingEndTimeout is nil (and therefore inert in the select below)
-	// whenever no EndFrame is deferred. handleEnd arms pendingEndTimer
-	// when it defers; forwardPendingEnd stops and clears it whenever
-	// pendingEnd is cleared, including the normal done-released path, so
-	// a completed turn never leaves a live timer behind.
-	var pendingEndTimer *time.Timer
-	var pendingEndTimeout <-chan time.Time
-
-	// cartesiaTextSent: have we sent text to Cartesia in the current
-	// context that hasn't been resolved by a "done" event yet? When
-	// true, Cartesia owes us a "done" once we send Reset (continue:false).
-	// Set on sendTextToTTS success, cleared on done/interrupt/clear.
-	//
-	// Replaces the previous 3-state ttsSynth enum. We tolerate the rare
-	// duplicate Reset that can fire if EndFrame arrives between
-	// LLMResponseEndFrame's Reset and Cartesia's done — Cartesia
-	// responds with "Invalid context ID" which the reader already filters.
-	cartesiaTextSent := false
-
-	clearTTSState := func() {
-		t.activeContextId.Store("")
-		t.currentAggregation = ""
-		t.currentContextId = ""
-		t.pcmBuffer = nil
-		t.pendingWords = nil
-		t.audioTimePushed = 0
-		t.firstTextReceived = false
-		t.firstSentenceSent = false
-		t.firstAudioReceived = false
-		cartesiaTextSent = false
-	}
-
-	forwardPendingEnd := func(reason string) bool {
-		if pendingEnd == nil {
+	var pendingEnd *ttsCommand
+	var endTimer *time.Timer
+	var endTimeout <-chan time.Time
+	defer func() {
+		if endTimer != nil {
+			endTimer.Stop()
+		}
+	}()
+	finishEnd := func() bool {
+		if pendingEnd == nil || len(t.outputQueue) != 0 {
 			return false
 		}
-		t.taskCtx.Logger.Printf("TTS forwarding pending EndFrame %s: reason=%q\n", reason, pendingEnd.Reason)
-		t.PushFrame(*pendingEnd, pendingEndDir)
-		if pendingEndDone != nil {
-			close(pendingEndDone)
-			pendingEndDone = nil
-		}
-		pendingEnd = nil
-		if pendingEndTimer != nil {
-			pendingEndTimer.Stop()
-			pendingEndTimer = nil
-		}
-		pendingEndTimeout = nil
+		t.PushFrame(pendingEnd.frame, pendingEnd.dir)
+		close(pendingEnd.done)
 		t.closeTTSConnection()
 		return true
 	}
-
-	flushForEnd := func() {
-		if strings.TrimSpace(t.currentAggregation) != "" {
-			if t.sendTextToTTS(t.currentAggregation) {
-				cartesiaTextSent = true
-			}
-			t.currentAggregation = ""
-		}
-		if cartesiaTextSent {
-			if !t.ResetTTSContext() {
-				cartesiaTextSent = false
-			}
-		}
-	}
-
-	handleEnd := func(frame EndFrame, dir Direction, doneCh chan struct{}) bool {
-		if pendingEnd != nil {
-			t.taskCtx.Logger.Printf("EndFrame at TTSProcessor ignored: shutdown already pending: reason=%q\n", frame.Reason)
-			if doneCh != nil {
-				close(doneCh)
-			}
-			return false
-		}
-		flushForEnd()
-		if cartesiaTextSent {
-			pending := frame
-			pendingEnd = &pending
-			pendingEndDir = dir
-			pendingEndDone = doneCh
-			pendingEndTimer = time.NewTimer(ttsPendingEndTimeout)
-			pendingEndTimeout = pendingEndTimer.C
-			t.taskCtx.Logger.Printf("EndFrame at TTSProcessor deferred until TTS done: reason=%q\n", frame.Reason)
-			return false
-		}
-		t.taskCtx.Logger.Printf("EndFrame at TTSProcessor forwarding immediately: reason=%q\n", frame.Reason)
-		t.PushFrame(frame, dir)
-		if doneCh != nil {
-			close(doneCh)
-		}
-		t.closeTTSConnection()
-		return true
-	}
-
-	handleCommand := func(cmd ttsCommand) (exit bool) {
-		switch f := cmd.frame.(type) {
-		case InterruptFrame:
-			if pendingEnd != nil {
-				t.taskCtx.Logger.Println("TTS shutdown is pending, dropping interrupt")
-				return false
-			}
-			t.CancelTTSContext()
-			clearTTSState()
-			drainTTSEvents(t.ttsEvents)
-			t.metrics.Reset()
-			t.taskCtx.Logger.Println("TTS interrupted, cleared state")
-			// (ProcessFrame already forwarded the InterruptFrame downstream)
-			return false
-
-		case EndFrame:
-			return handleEnd(f, cmd.dir, cmd.done)
-
-		case LLMResponseStartFrame:
-			if pendingEnd != nil {
-				return false
-			}
-			clearTTSState()
-			drainTTSEvents(t.ttsEvents)
-			t.metrics.Reset()
-			t.currentContextId = fmt.Sprintf("ctx-%d", rand.IntN(9000000))
-			t.activeContextId.Store(t.currentContextId)
-			t.taskCtx.Logger.Println("LLM response started, resetting TTS aggregation")
-			t.PushFrame(f, cmd.dir)
-			return false
-
-		case TextFrame:
-			if pendingEnd != nil {
-				return false
-			}
-			if !t.firstTextReceived {
-				t.firstTextReceived = true
-				t.metrics.Start(MetricTextAggregation)
-			}
-			t.currentAggregation += f.Text
-			if endsWithPunctuation(t.currentAggregation) {
-				if !t.firstSentenceSent {
-					t.firstSentenceSent = true
-					if mf := t.metrics.Stop(MetricTextAggregation); mf != nil {
-						t.PushFrame(*mf, Downstream)
-					}
-					t.metrics.Start(MetricTTFB)
-				}
-				if t.sendTextToTTS(t.currentAggregation) {
-					cartesiaTextSent = true
-				}
-				t.currentAggregation = ""
-			}
-			return false
-
-		case LLMResponseEndFrame:
-			if pendingEnd != nil {
-				return false
-			}
-			if strings.TrimSpace(t.currentAggregation) != "" {
-				if t.sendTextToTTS(t.currentAggregation) {
-					cartesiaTextSent = true
-				}
-			}
-			if cartesiaTextSent {
-				if !t.ResetTTSContext() {
-					cartesiaTextSent = false
-				}
-			} else {
-				// Empty turn — no text was sent to Cartesia, so no "done"
-				// event will arrive. Emit TTSDone directly so the turn
-				// still closes (PlaybackSink broadcasts BotStopped and
-				// UserIdle arms). Covers a failed LLM turn and a rare
-				// zero-token response.
-				t.PushFrame(NewTTSDoneFrame(), Downstream)
-			}
-			t.currentAggregation = ""
-			t.pcmBuffer = nil
-			t.taskCtx.Logger.Println("LLM response ended, flushing TTS context")
-			t.PushFrame(f, cmd.dir)
-			return false
-
-		case TTSSpeakFrame:
-			if pendingEnd != nil {
-				return false
-			}
-			clearTTSState()
-			drainTTSEvents(t.ttsEvents)
-			t.firstSentenceSent = true // skip aggregation metrics for idle prompts
-			t.metrics.Reset()
-			t.currentContextId = fmt.Sprintf("ctx-%d", rand.IntN(9000000))
-			t.activeContextId.Store(t.currentContextId)
-			t.metrics.Start(MetricTTFB)
-			if t.sendTextToTTS(f.Text) {
-				cartesiaTextSent = true
-				if !t.ResetTTSContext() {
-					cartesiaTextSent = false
-				}
-			}
-			t.PushFrame(f, cmd.dir)
-			return false
-
-		default:
-			if pendingEnd != nil {
-				t.taskCtx.Logger.Printf("TTS shutdown pending, dropping frame: %T\n", f)
-				return false
-			}
-			t.PushFrame(cmd.frame, cmd.dir)
-			return false
-		}
-	}
-
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
 		case cmd := <-t.commands:
-			if handleCommand(cmd) {
-				return
-			}
-		case event := <-t.ttsEvents:
-			if event.eventType == ttsEventReconnected {
-				// No contextID to check here: Cartesia forgot the
-				// context, so treat any synthesis we were waiting on as
-				// unrecoverable rather than routing through
-				// handleTTSEvent's isCurrentContext check.
-				if cartesiaTextSent {
-					t.taskCtx.Logger.Println("TTS reconnected while synthesis in flight; Cartesia done is unreachable, emitting TTSDone")
-					t.pushRemainingAudioFrames()
-					t.PushFrame(NewTTSDoneFrame(), Downstream)
-					cartesiaTextSent = false
-					if forwardPendingEnd("after reconnect") {
-						return
-					}
-				}
+			// Commands already relayed to this queue retain their interrupt context.
+			if cmd.frame.IsInterruptible() && cmd.ctx.Err() != nil {
 				continue
 			}
-			if event.eventType == ttsEventProviderError {
-				// Pipecat only handles messages for its currently active audio
-				// context. Context-free errors (for example authentication or
-				// quota errors) are still reportable and close an active turn.
-				if event.contextID != "" && !t.isCurrentContext(event.contextID) {
+			switch f := cmd.frame.(type) {
+			case InterruptFrame:
+				t.cancelContexts()
+				t.PushFrame(f, cmd.dir)
+			case EndFrame:
+				if pendingEnd != nil {
+					close(cmd.done)
 					continue
 				}
-				activeTurn := cartesiaTextSent && t.currentContextId != ""
-				if activeTurn {
-					t.pushRemainingAudioFrames()
-					t.PushFrame(NewTTSDoneFrame(), Downstream)
-					t.metrics.Reset()
-					clearTTSState()
+				pendingEnd = &cmd
+				if shouldStopPlaybackImmediately(f.Reason) {
+					t.cancelContexts()
+				} else {
+					t.closeTurn()
+					endTimer = time.NewTimer(ttsPendingEndTimeout)
+					endTimeout = endTimer.C
 				}
-				t.reportProviderError(event)
-				if activeTurn {
-					if forwardPendingEnd("after provider error") {
-						return
+			case LLMResponseStartFrame:
+				if pendingEnd == nil {
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: f})
+					t.turn = t.newContext()
+				}
+			case TextFrame:
+				if pendingEnd == nil {
+					t.addText(f.Text)
+				}
+			case LLMResponseEndFrame:
+				if pendingEnd == nil {
+					t.closeTurn()
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: f})
+					t.drainOutput()
+				}
+			case TTSSpeakFrame:
+				if pendingEnd != nil {
+					continue
+				}
+				pushAggregation := t.turn == nil
+				c := t.newContext()
+				c.firstSentence = true
+				t.metrics.Start(MetricTTFB)
+				c.sent = t.sendTextToTTS(c, f.Text)
+				t.closeContext(c)
+				if pushAggregation {
+					t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: NewLLMAssistantPushAggregationFrame()})
+					t.drainOutput()
+				}
+			default:
+				if pendingEnd == nil {
+					// Pipecat's serialization queue also orders ordinary control
+					// frames behind preceding speech contexts.
+					if !f.IsSystem() {
+						t.outputQueue = append(t.outputQueue, ttsOutputItem{frame: f})
+						t.drainOutput()
+					} else {
+						t.PushFrame(f, cmd.dir)
 					}
 				}
-				continue
 			}
-			if t.handleTTSEvent(event) {
-				cartesiaTextSent = false
-				if forwardPendingEnd("after TTS done") {
-					return
+		case event := <-t.ttsEvents:
+			switch event.eventType {
+			case ttsEventReconnected:
+				// The provider forgot every outstanding context on this connection.
+				for _, c := range t.contextsByID {
+					t.finishContext(c)
 				}
+			case ttsEventProviderError:
+				if event.contextID != "" {
+					c := t.contextsByID[event.contextID]
+					if c == nil || c.done {
+						continue
+					}
+					t.finishContext(c)
+				} else {
+					for _, c := range t.contextsByID {
+						t.finishContext(c)
+					}
+				}
+				t.reportProviderError(event)
+			default:
+				t.handleTTSEvent(event)
 			}
-		case <-pendingEndTimeout:
-			t.taskCtx.Logger.Println("TTS pending EndFrame timed out waiting for Cartesia done; forcing shutdown")
+		case <-endTimeout:
+			t.taskCtx.Logger.Println("TTS pending EndFrame timed out waiting for synthesis")
 			sentryutil.Capture(sentryutil.Event{
-				Hub:     t.taskCtx.SentryHub(),
-				Message: "TTS pending EndFrame timed out waiting for Cartesia done",
+				Hub: t.taskCtx.SentryHub(), Message: "TTS pending EndFrame timed out waiting for Cartesia done",
 				Tags:    map[string]string{"component": "tts", "operation": "pending_end_timeout"},
-				Details: map[string]any{
-					"context_id": t.currentContextId,
-					"timeout":    ttsPendingEndTimeout.String(),
-				},
+				Details: map[string]any{"timeout": ttsPendingEndTimeout.String()},
 			})
-			cartesiaTextSent = false
-			if forwardPendingEnd("after timeout") {
-				return
+			for _, c := range t.contextsByID {
+				t.finishContext(c)
 			}
 		}
+		if finishEnd() {
+			return
+		}
 	}
+}
+
+func (t *TTSProcessor) newContext() *ttsContext {
+	c := &ttsContext{id: uuid.NewString()}
+	t.outputQueue = append(t.outputQueue, ttsOutputItem{context: c})
+	t.contextsByID[c.id] = c
+	t.emit(c, NewTTSStartedFrame(c.id))
+	return c
+}
+
+func (t *TTSProcessor) emit(c *ttsContext, frame Frame) {
+	if mf, ok := frame.(MetricsFrame); ok {
+		t.PushFrame(mf, Downstream)
+		return
+	}
+	c.output = append(c.output, frame)
+	t.drainOutput()
+}
+
+func (t *TTSProcessor) drainOutput() {
+	for len(t.outputQueue) > 0 {
+		item := t.outputQueue[0]
+		if c := item.context; c != nil {
+			for _, f := range c.output {
+				t.PushFrame(f, Downstream)
+			}
+			c.output = nil
+			if !c.done {
+				return
+			}
+			delete(t.contextsByID, c.id)
+		} else {
+			t.PushFrame(item.frame, Downstream)
+		}
+		t.outputQueue[0] = ttsOutputItem{}
+		t.outputQueue = t.outputQueue[1:]
+	}
+}
+
+func (t *TTSProcessor) addText(text string) {
+	c := t.turn
+	if c == nil || c.done {
+		return
+	}
+	if !c.firstText {
+		c.firstText = true
+		t.metrics.Start(MetricTextAggregation)
+	}
+	c.aggregation += text
+	if endsWithPunctuation(c.aggregation) {
+		t.flushText(c)
+	}
+}
+
+func (t *TTSProcessor) flushText(c *ttsContext) {
+	if strings.TrimSpace(c.aggregation) == "" {
+		c.aggregation = ""
+		return
+	}
+	if !c.firstSentence {
+		c.firstSentence = true
+		if mf := t.metrics.Stop(MetricTextAggregation); mf != nil {
+			t.emit(c, *mf)
+		}
+		t.metrics.Start(MetricTTFB)
+	}
+	if t.sendTextToTTS(c, c.aggregation) {
+		c.sent = true
+	}
+	c.aggregation = ""
+}
+
+func (t *TTSProcessor) closeTurn() {
+	if t.turn != nil {
+		if !t.turn.done {
+			t.flushText(t.turn)
+			t.closeContext(t.turn)
+		}
+		t.turn = nil
+	}
+}
+
+func (t *TTSProcessor) closeContext(c *ttsContext) {
+	if c.closed || c.done {
+		return
+	}
+	c.closed = true
+	if !c.sent || !t.ResetTTSContext(c) {
+		t.finishContext(c)
+	}
+}
+
+func (t *TTSProcessor) finishContext(c *ttsContext) {
+	if c.done {
+		return
+	}
+	t.pushRemainingAudioFrames(c)
+	done := NewTTSDoneFrame()
+	done.ContextID = c.id
+	t.emit(c, done)
+	c.done = true
+	t.drainOutput()
+}
+
+func (t *TTSProcessor) cancelContexts() {
+	t.metrics.Reset()
+	for _, c := range t.contextsByID {
+		if !c.done {
+			t.CancelTTSContext(c)
+		}
+	}
+	t.outputQueue = nil
+	t.contextsByID = make(map[string]*ttsContext)
+	t.turn = nil
 }
 
 func (t *TTSProcessor) reportProviderError(event ttsEvent) {
@@ -664,7 +588,7 @@ func (t *TTSProcessor) shouldReportProviderError(key string, now time.Time) bool
 
 // --- Cartesia interactions (called only from orchestrator goroutine) ---
 
-func (t *TTSProcessor) sendTextToTTS(text string) bool {
+func (t *TTSProcessor) sendTextToTTS(c *ttsContext, text string) bool {
 	speakable := text
 	if t.phonetic != nil {
 		speakable = t.phonetic.apply(text)
@@ -679,7 +603,7 @@ func (t *TTSProcessor) sendTextToTTS(text string) bool {
 		"voice":          map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format":  map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
 		"language":       "hi",
-		"context_id":     t.currentContextId,
+		"context_id":     c.id,
 		"continue":       true,
 		"add_timestamps": true,
 	}
@@ -693,8 +617,8 @@ func (t *TTSProcessor) sendTextToTTS(text string) bool {
 	return true
 }
 
-func (t *TTSProcessor) ResetTTSContext() bool {
-	if t.currentContextId == "" {
+func (t *TTSProcessor) ResetTTSContext(c *ttsContext) bool {
+	if c.id == "" {
 		return false
 	}
 	payload := map[string]interface{}{
@@ -702,7 +626,7 @@ func (t *TTSProcessor) ResetTTSContext() bool {
 		"transcript":    "",
 		"voice":         map[string]interface{}{"mode": "id", "id": "95d51f79-c397-46f9-b49a-23763d3eaa2d"},
 		"output_format": map[string]interface{}{"container": "raw", "encoding": "pcm_s16le", "sample_rate": t.outputRate()},
-		"context_id":    t.currentContextId,
+		"context_id":    c.id,
 		"continue":      false,
 	}
 	if err := t.currentConn().WriteJSON(payload); err != nil {
@@ -712,12 +636,12 @@ func (t *TTSProcessor) ResetTTSContext() bool {
 	return true
 }
 
-func (t *TTSProcessor) CancelTTSContext() bool {
-	if t.currentContextId == "" {
+func (t *TTSProcessor) CancelTTSContext(c *ttsContext) bool {
+	if c.id == "" {
 		return false
 	}
 	payload := map[string]interface{}{
-		"context_id": t.currentContextId,
+		"context_id": c.id,
 		"cancel":     true,
 	}
 	if err := t.currentConn().WriteJSON(payload); err != nil {
@@ -727,113 +651,80 @@ func (t *TTSProcessor) CancelTTSContext() bool {
 	return true
 }
 
-func (t *TTSProcessor) isActiveContext(contextId string) bool {
-	active, _ := t.activeContextId.Load().(string)
-	return active != "" && active == contextId
-}
-
-func (t *TTSProcessor) isCurrentContext(contextID string) bool {
-	return t.currentContextId != "" && t.currentContextId == contextID
-}
-
-// handleTTSEvent processes a Cartesia event. Called only from the
-// orchestrator goroutine. Returns true if a done event was processed
-// (which the orchestrator uses to clear cartesiaTextSent and potentially
-// forward a pendingEnd).
-func (t *TTSProcessor) handleTTSEvent(event ttsEvent) bool {
-	if !t.isCurrentContext(event.contextID) {
-		if event.eventType == ttsEventDone {
-			t.taskCtx.Logger.Printf("TTS ignoring stale done: context_id=%s\n", event.contextID)
-		}
-		return false
+// Provider context IDs are validated by the state-owning orchestrator, not
+// against a single active ID in the reader. B may finish before A.
+func (t *TTSProcessor) handleTTSEvent(event ttsEvent) {
+	c := t.contextsByID[event.contextID]
+	if c == nil || c.done {
+		return
 	}
-
 	switch event.eventType {
 	case ttsEventAudioChunk:
-		t.handleAudioChunkData(event.audioData)
+		if !c.firstAudio {
+			c.firstAudio = true
+			if mf := t.metrics.Stop(MetricTTFB); mf != nil {
+				t.emit(c, *mf)
+			}
+		}
+		c.pcmBuffer = append(c.pcmBuffer, event.audioData...)
+		for len(c.pcmBuffer) >= t.frameBytes() {
+			t.emit(c, NewAudioFrame(t.nextPCMFrame(c)))
+			c.audioTimePushed += 0.02
+			t.emitPendingWords(c)
+		}
 	case ttsEventWordTimestamps:
-		t.pendingWords = append(t.pendingWords, event.words...)
-		t.emitPendingWords()
+		c.pendingWords = append(c.pendingWords, event.words...)
+		t.emitPendingWords(c)
 	case ttsEventDone:
-		t.taskCtx.Logger.Printf("TTS synthesis done: context_id=%s\n", event.contextID)
-		t.pushRemainingAudioFrames()
-		t.PushFrame(NewTTSDoneFrame(), Downstream)
-		return true
+		t.finishContext(c)
 	}
-	return false
 }
 
-func (t *TTSProcessor) handleAudioChunkData(audioData []byte) {
-	if t.currentContextId == "" {
+func (t *TTSProcessor) emitWord(c *ttsContext, word string) {
+	f := NewWordTimestampFrame([]string{word})
+	f.ContextID = c.id
+	t.emit(c, f)
+}
+
+func (t *TTSProcessor) emitPendingWords(c *ttsContext) {
+	if c.audioTimePushed == 0 {
 		return
 	}
-	if !t.firstAudioReceived {
-		t.firstAudioReceived = true
-		if mf := t.metrics.Stop(MetricTTFB); mf != nil {
-			t.PushFrame(*mf, Downstream)
-		}
-	}
-	t.pcmBuffer = append(t.pcmBuffer, audioData...)
-
-	frameBytes := t.frameBytes()
-	for len(t.pcmBuffer) >= frameBytes {
-		pcmFrame := t.nextPCMFrame()
-		if pcmFrame == nil {
-			break
-		}
-		t.PushFrame(NewAudioFrame(pcmFrame), Downstream)
-		t.audioTimePushed += 0.02 // 20ms per PCM frame
-		t.emitPendingWords()
+	for len(c.pendingWords) > 0 && c.pendingWords[0].start <= c.audioTimePushed {
+		w := c.pendingWords[0]
+		c.pendingWords = c.pendingWords[1:]
+		t.emitWord(c, w.word)
 	}
 }
 
-// emitPendingWords sends WordTimestampFrames for words whose start time
-// has been reached by the audio pushed so far.
-func (t *TTSProcessor) emitPendingWords() {
-	for len(t.pendingWords) > 0 && t.pendingWords[0].start <= t.audioTimePushed {
-		w := t.pendingWords[0]
-		t.pendingWords = t.pendingWords[1:]
-		t.PushFrame(NewWordTimestampFrame([]string{w.word}), Downstream)
+func (t *TTSProcessor) pushRemainingAudioFrames(c *ttsContext) {
+	if len(c.pcmBuffer) > 0 {
+		for len(c.pcmBuffer) < t.frameBytes() {
+			c.pcmBuffer = append(c.pcmBuffer, 0)
+		}
+		t.emit(c, NewAudioFrame(t.nextPCMFrame(c)))
+		c.audioTimePushed += 0.02
 	}
+	t.emitPendingWords(c)
+	c.pendingWords = nil
 }
 
-func (t *TTSProcessor) pushRemainingAudioFrames() {
-	if t.currentContextId == "" {
-		return
+func (t *TTSProcessor) nextPCMFrame(c *ttsContext) []byte {
+	if !t.audioTimingEnabled() {
+		return c.nextPCMFrame(t.frameBytes())
 	}
-	if len(t.pcmBuffer) > 0 {
-		frameBytes := t.frameBytes()
-		for len(t.pcmBuffer) < frameBytes {
-			t.pcmBuffer = append(t.pcmBuffer, 0)
-		}
-		pcmFrame := t.nextPCMFrame()
-		if pcmFrame != nil {
-			t.PushFrame(NewAudioFrame(pcmFrame), Downstream)
-			t.audioTimePushed += 0.02
-		}
-	}
-	for _, w := range t.pendingWords {
-		t.PushFrame(NewWordTimestampFrame([]string{w.word}), Downstream)
-	}
-	t.pendingWords = nil
+	startedAt := time.Now()
+	frame := c.nextPCMFrame(t.frameBytes())
+	t.recordAudioTiming("go_tts_pcm_frame_copy", time.Since(startedAt))
+	return frame
 }
 
-func (t *TTSProcessor) nextPCMFrame() []byte {
-	frameBytes := t.frameBytes()
-	if len(t.pcmBuffer) < frameBytes {
+func (c *ttsContext) nextPCMFrame(frameBytes int) []byte {
+	if len(c.pcmBuffer) < frameBytes {
 		return nil
 	}
-	timingEnabled := t.audioTimingEnabled()
-	var start time.Time
-	if timingEnabled {
-		start = time.Now()
-	}
-	frame := make([]byte, frameBytes)
-	copy(frame, t.pcmBuffer[:frameBytes])
-	t.pcmBuffer = t.pcmBuffer[frameBytes:]
-	if timingEnabled {
-		t.recordAudioTiming("go_tts_pcm_frame_copy", time.Since(start))
-	}
+	frame := append([]byte(nil), c.pcmBuffer[:frameBytes]...)
+	c.pcmBuffer = c.pcmBuffer[frameBytes:]
 	return frame
 }
 
@@ -971,9 +862,6 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			if timingEnabled {
 				t.recordAudioTiming("go_tts_audio_json_unmarshal", time.Since(start))
 			}
-			if !t.isActiveContext(audioMsg.ContextId) {
-				continue
-			}
 			if timingEnabled {
 				start = time.Now()
 			}
@@ -998,9 +886,6 @@ func (t *TTSProcessor) readTTSConnectionData() {
 				t.taskCtx.Logger.Println("TTS word timestamp unmarshal error:", err)
 				continue
 			}
-			if !t.isActiveContext(tsMsg.ContextId) {
-				continue
-			}
 			words := make([]pendingWord, 0, len(tsMsg.WordTimestamps.Words))
 			for i, w := range tsMsg.WordTimestamps.Words {
 				if i < len(tsMsg.WordTimestamps.Start) {
@@ -1020,10 +905,6 @@ func (t *TTSProcessor) readTTSConnectionData() {
 			var doneMsg CartesiaTTSDoneMessage
 			if err := json.Unmarshal(msg, &doneMsg); err != nil {
 				t.taskCtx.Logger.Println("TTS done message unmarshal error:", err)
-				continue
-			}
-			if !t.isActiveContext(doneMsg.ContextId) {
-				t.taskCtx.Logger.Printf("TTS ignoring stale done: context_id=%s\n", doneMsg.ContextId)
 				continue
 			}
 			if !t.pushTTSEvent(ttsEvent{

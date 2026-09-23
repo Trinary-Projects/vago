@@ -291,7 +291,7 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 	events := pl.Callbacks.Events()
 	turnAt := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
 	events.OnUserTurnCommitted("mujhe neend nahi aati", turnAt, pl.PromptKey)
-	events.OnAssistantTurnCommitted("samajh gayi", turnAt.Add(time.Second), voicepipelinecore.TurnMetrics{}, pl.PromptKey)
+	events.OnAssistantTurnCommitted("samajh gayi", turnAt.Add(time.Second), voicepipelinecore.TurnMetrics{}, pl.PromptKey, voicepipelinecore.AssistantTurnCompletion{})
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-ob", conversationID))
 	if err != nil {

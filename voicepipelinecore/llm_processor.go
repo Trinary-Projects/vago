@@ -81,9 +81,10 @@ type LLMProcessor struct {
 	taskCtx   *TaskContext
 	client    LLMClient
 	metrics   *ProcessorMetrics
-	cancelMu  sync.Mutex
-	cancelLLM context.CancelFunc
 	closeOnce sync.Once
+
+	messagesEnricher MessagesEnricher
+	enrichMetrics    *ProcessorMetrics
 
 	tools      []ToolDefinition
 	toolChoice any
@@ -97,10 +98,11 @@ func NewLLMProcessorWithClient(taskCtx *TaskContext, client LLMClient) *LLMProce
 		panic("voicepipelinecore: LLMClient is required")
 	}
 	p := &LLMProcessor{
-		taskCtx: taskCtx,
-		client:  client,
-		metrics: NewProcessorMetrics("llm"),
-		toolMap: make(map[string]registeredTool),
+		taskCtx:       taskCtx,
+		client:        client,
+		metrics:       NewProcessorMetrics("llm"),
+		enrichMetrics: NewProcessorMetrics("context_enricher"),
+		toolMap:       make(map[string]registeredTool),
 	}
 	p.BaseProcessor = NewBaseProcessor("LLM", p, taskCtx)
 	return p
@@ -122,6 +124,12 @@ func (p *LLMProcessor) SetToolChoice(toolChoice any) {
 	p.toolChoice = toolChoice
 }
 
+// SetMessagesEnricher configures request-only enrichment before the pipeline starts.
+// The callback receives a private copy and runs before LLM timing begins.
+func (p *LLMProcessor) SetMessagesEnricher(enrich MessagesEnricher) {
+	p.messagesEnricher = enrich
+}
+
 func appendOrReplaceToolDefinition(tools []ToolDefinition, def ToolDefinition) []ToolDefinition {
 	for i, existing := range tools {
 		if existing.Function.Name == def.Function.Name {
@@ -135,31 +143,26 @@ func appendOrReplaceToolDefinition(tools []ToolDefinition, def ToolDefinition) [
 func (p *LLMProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
 	switch f := frame.(type) {
 	case EndFrame:
-		p.taskCtx.Logger.Printf("EndFrame at LLMProcessor, cancelling LLM: reason=%q\n", f.Reason)
-		p.cancelInFlight()
+		p.taskCtx.Logger.Printf("EndFrame at LLMProcessor: reason=%q\n", f.Reason)
 		p.closeClient("end")
 		p.metrics.Reset()
+		p.enrichMetrics.Reset()
 		p.PushFrame(f, dir)
+	case LLMContextFrame:
+		p.processMessages(ctx, f.Context.GetMessages())
 	case LLMMessagesFrame:
-		runCtx, cancel := context.WithCancel(ctx)
-		p.cancelMu.Lock()
-		if p.cancelLLM != nil {
-			p.cancelLLM()
-		}
-		p.cancelLLM = cancel
-		p.cancelMu.Unlock()
-		p.Go(func() { p.runLLM(runCtx, f.Messages) })
+		p.processMessages(ctx, f.Messages)
 	case InterruptFrame:
 		// Base has already cancelled the previous procCtx, which cancels any
 		// in-flight runLLM transitively. A persistent client also needs an
 		// explicit response-chain reset here because barge-in can arrive after
 		// generation completed while its audio is still playing. The client
 		// decides whether its transport also needs to be closed.
-		p.cancelInFlight()
 		if client, ok := p.client.(interruptibleLLMClient); ok {
 			client.Interrupt()
 		}
 		p.metrics.Reset()
+		p.enrichMetrics.Reset()
 		p.PushFrame(frame, dir)
 	default:
 		p.PushFrame(frame, dir)
@@ -168,10 +171,9 @@ func (p *LLMProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direct
 
 // Stop mirrors the persistent STT/TTS processors: cancel processor work first,
 // then close the transport so any blocked WebSocket read is released. EndFrame
-// also closes eagerly, while this path covers aborts and root-context teardown.
+// closes after queued inference finishes; this path covers aborts and teardown.
 func (p *LLMProcessor) Stop() {
 	p.BaseProcessor.Stop()
-	p.cancelInFlight()
 	p.closeClient("stop")
 }
 
@@ -185,26 +187,42 @@ func (p *LLMProcessor) closeClient(reason string) {
 	})
 }
 
-func (p *LLMProcessor) cancelInFlight() {
-	p.cancelMu.Lock()
-	defer p.cancelMu.Unlock()
-	if p.cancelLLM != nil {
-		p.cancelLLM()
-		p.cancelLLM = nil
+// Like Pipecat's OpenAI service, inference is awaited on the normal process loop.
+func (p *LLMProcessor) processMessages(ctx context.Context, messages []Message) {
+	if ctx.Err() != nil {
+		return
+	}
+	if p.messagesEnricher != nil {
+		p.enrichMetrics.Start(MetricContextEnrich)
+		enriched := p.messagesEnricher(ctx, cloneMessages(messages))
+		if mf := p.enrichMetrics.Stop(MetricContextEnrich); mf != nil {
+			p.PushFrame(*mf, Downstream)
+		}
+		if len(enriched) > 0 {
+			messages = enriched
+		}
+	}
+	calls := p.runLLM(ctx, messages)
+	if len(calls) > 0 {
+		p.executeToolCalls(ctx, calls)
 	}
 }
 
-func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
+func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) []ToolCall {
+	if ctx.Err() != nil {
+		return nil
+	}
 	p.metrics.Start(MetricTTFB)
 	p.metrics.Start(MetricProcessing)
 	startedAt := time.Now()
-	p.PushFrame(NewLLMResponseStartFrame(startedAt), Downstream)
+	start := NewLLMResponseStartFrame(startedAt)
+	p.pushGenerationFrame(ctx, start, Downstream)
 
 	var ttfbMs *float64
 	var responseText strings.Builder
 	firstToken := true
 	onToken := func(content string) {
-		if content == "" {
+		if content == "" || ctx.Err() != nil {
 			return
 		}
 		if firstToken {
@@ -215,7 +233,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 			}
 		}
 		responseText.WriteString(content)
-		p.PushFrame(NewTextFrame(content), Downstream)
+		p.pushGenerationFrame(ctx, NewTextFrame(content), Downstream)
 	}
 
 	req := LLMRequest{
@@ -230,13 +248,13 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 	}
 	totalMs := float64Ptr(millisecondsSince(startedAt))
 
-	// Cancellation (barge-in / EndFrame) takes precedence: the interrupt/
+	// Cancellation (barge-in / Stop) takes precedence: the interrupt/
 	// end path already reset TTS + playback, so we must NOT emit terminal
 	// frames here (they'd be processed after the reset).
 	if ctx.Err() != nil || (result.Interrupted && errors.Is(err, context.Canceled)) {
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
-		p.fireLLMCallCompleted(responseText.String(), true)
-		return
+		p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), Interrupted: true})
+		return nil
 	}
 	if err != nil {
 		_ = p.metrics.Stop(MetricTTFB)
@@ -268,7 +286,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 				"had_first_token": ttfbMs != nil,
 			},
 		})
-		p.PushFrame(NewLLMResponseEndFrame(), Downstream)
+		p.pushGenerationFrame(ctx, NewLLMResponseEndFrame(), Downstream)
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		// A transport failure is not a user interruption. Whatever text
 		// arrived before the stream broke was already aggregated, spoken
@@ -279,75 +297,49 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) {
 		// stage tracker skip a fully delivered assistant utterance (a
 		// stage could then never advance). A failure that produced no
 		// text has nothing to evaluate and stays interrupted. Real
-		// cancellation (barge-in, EndFrame) is handled above and keeps
+		// cancellation (barge-in, Stop) is handled above and keeps
 		// Python's skip, because the model usually generates past what
 		// the user actually heard.
-		p.fireLLMCallCompleted(responseText.String(), responseText.Len() == 0)
-		return
+		p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), Interrupted: responseText.Len() == 0, HasToolCalls: len(result.ToolCalls) > 0})
+		return nil
 	}
 
 	if mf := p.metrics.Stop(MetricProcessing); mf != nil {
 		totalMs = float64Ptr(mf.Data[0].ValueMs)
 		p.PushFrame(*mf, Downstream)
 	}
-	p.PushFrame(NewLLMResponseEndFrame(), Downstream)
+	p.pushGenerationFrame(ctx, NewLLMResponseEndFrame(), Downstream)
 	p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "completed")
-	p.fireLLMCallCompleted(responseText.String(), false)
-	if len(result.ToolCalls) > 0 {
-		p.Go(func() { p.executeToolCalls(ctx, result.ToolCalls) })
-	}
+	p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), HasToolCalls: len(result.ToolCalls) > 0})
+	return result.ToolCalls
 }
 
-type toolExecutionResult struct {
-	frame  FunctionCallResultFrame
-	runLLM bool
+func (p *LLMProcessor) pushGenerationFrame(ctx context.Context, frame Frame, dir Direction) {
+	if ctx.Err() == nil {
+		p.PushFrame(frame, dir)
+	}
 }
 
 func (p *LLMProcessor) executeToolCalls(turnCtx context.Context, toolCalls []ToolCall) {
-	results := make(chan toolExecutionResult, len(toolCalls))
-	runNextLLM := false
-	started := 0
+	p.Broadcast(NewFunctionCallsStartedFrame(toolCalls))
 	for _, call := range toolCalls {
-		name := call.Function.Name
-		tool, ok := p.toolMap[name]
-		if !ok || tool.handler == nil {
-			args, parseErr := parseToolArguments(call.Function.Arguments)
-			if parseErr != nil {
-				p.PushError(fmt.Sprintf("parse tool arguments for %q: %v", name, parseErr), false)
-			}
-			p.PushError(fmt.Sprintf("unregistered tool call %q", name), false)
-			p.PushFrame(NewFunctionCallInProgressFrame(name, call.ID, args, call.Function.Arguments, true), Upstream)
-			results <- toolExecutionResult{
-				frame:  NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, toolErrorResultString(fmt.Sprintf("unregistered tool call %q", name)), false),
-				runLLM: true,
-			}
-			started++
-			continue
-		}
+		tool, ok := p.toolMap[call.Function.Name]
 		args, parseErr := parseToolArguments(call.Function.Arguments)
 		if parseErr != nil {
-			p.PushError(fmt.Sprintf("parse tool arguments for %q: %v", name, parseErr), false)
+			p.PushError(fmt.Sprintf("parse tool arguments for %q: %v", call.Function.Name, parseErr), false)
 		}
-		p.PushFrame(NewFunctionCallInProgressFrame(name, call.ID, args, call.Function.Arguments, tool.options.CancelOnInterruption), Upstream)
-		started++
-		go func(call ToolCall, tool registeredTool, args map[string]any) {
-			results <- p.executeOneToolCall(turnCtx, call, tool, args)
-		}(call, tool, args)
-	}
-
-	for remaining := started; remaining > 0; remaining-- {
-		result := <-results
-		if result.runLLM {
-			runNextLLM = true
+		if !ok || tool.handler == nil {
+			p.Broadcast(NewFunctionCallInProgressFrame(call.Function.Name, call.ID, args, call.Function.Arguments, true))
+			p.PushError(fmt.Sprintf("unregistered tool call %q", call.Function.Name), false)
+			p.Broadcast(NewFunctionCallResultFrame(call.Function.Name, call.ID, args, call.Function.Arguments, toolErrorResultString("unregistered tool call"), true))
+			continue
 		}
-		if remaining == 1 && runNextLLM {
-			result.frame.RunLLM = true
-		}
-		p.PushFrame(result.frame, Upstream)
+		p.Broadcast(NewFunctionCallInProgressFrame(call.Function.Name, call.ID, args, call.Function.Arguments, tool.options.CancelOnInterruption))
+		p.Go(func() { p.executeOneToolCall(turnCtx, call, tool, args) })
 	}
 }
 
-func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall, tool registeredTool, args map[string]any) toolExecutionResult {
+func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall, tool registeredTool, args map[string]any) {
 	name := call.Function.Name
 	parent := turnCtx
 	if !tool.options.CancelOnInterruption && p.taskCtx != nil && p.taskCtx.Ctx != nil {
@@ -365,11 +357,14 @@ func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall
 		RawArguments: call.Function.Arguments,
 	})
 	cancel()
+	if tool.options.CancelOnInterruption && turnCtx.Err() != nil {
+		p.Broadcast(NewFunctionCallCancelFrame(name, call.ID))
+		return
+	}
 	if err != nil {
 		p.PushError(fmt.Sprintf("execute tool %q: %v", name, err), false)
-		return toolExecutionResult{
-			frame: NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, toolErrorResultString(err.Error()), false),
-		}
+		p.Broadcast(NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, toolErrorResultString(err.Error()), false))
+		return
 	}
 	result, resultErr := toolResultString(resp.Result)
 	if resultErr != nil {
@@ -377,10 +372,7 @@ func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall
 		result = toolErrorResultString(resultErr.Error())
 		resp.RunLLM = false
 	}
-	return toolExecutionResult{
-		frame:  NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, result, false),
-		runLLM: resp.RunLLM,
-	}
+	p.Broadcast(NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, result, resp.RunLLM))
 }
 
 func parseToolArguments(raw string) (map[string]any, error) {
@@ -449,11 +441,11 @@ func (p *LLMProcessor) reportToolResultError(functionName, toolCallID string, er
 // fireLLMCallCompleted forwards the finished call's generated text to
 // the OnLLMCallCompleted call event (Python's on_llm_call_complete with
 // is_interrupted = not completed).
-func (p *LLMProcessor) fireLLMCallCompleted(text string, interrupted bool) {
+func (p *LLMProcessor) fireLLMCallCompleted(completion LLMCallCompletion) {
 	if p.taskCtx == nil || p.taskCtx.callEvents == nil {
 		return
 	}
-	p.taskCtx.callEvents.fireLLMCallCompleted(text, interrupted)
+	p.taskCtx.callEvents.fireLLMCallCompleted(completion)
 }
 
 // emitLLMCallResult publishes the Python-compatible RTVI server-message

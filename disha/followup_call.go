@@ -231,14 +231,12 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 		userIdle,
 		contextAggregators.User(),
 	}
-	// Protocol retrieval sits upstream of the LLM so its latency lands in its
-	// own MetricContextEnrich rather than inside llm_ttfb_ms. Absent on every
-	// non-dynamic call, leaving the processor list identical to before.
+	// Enrich only the outgoing request, before LLM timing starts. Shared
+	// conversation history remains owned by the context aggregators.
 	if pl.ProtocolEnricher != nil {
 		pl.ProtocolEnricher.SetInfrastructure(routerPromptMetadataSetter(llmClient), taskCtx.UIEvents)
 		pl.ProtocolEnricher.SetSentryHub(taskCtx.SentryHub())
-		processors = append(processors,
-			voicepipelinecore.NewContextEnricherProcessor(taskCtx, pl.ProtocolEnricher.Enrich))
+		llm.SetMessagesEnricher(pl.ProtocolEnricher.Enrich)
 		enricher := pl.ProtocolEnricher
 		go enricher.warmUp(taskCtx.Ctx)
 	}

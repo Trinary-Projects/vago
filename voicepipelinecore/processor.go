@@ -111,11 +111,12 @@ type BaseProcessor struct {
 
 	// Per-processor cancellation tree:
 	//   taskCtx.Ctx  ->  ctx (per-processor)  ->  procCtx (per-interrupt)
-	ctx        context.Context
-	cancel     context.CancelFunc
-	procCtx    context.Context
-	procCancel context.CancelFunc
-	procMu     sync.Mutex // guards procCtx/procCancel swap on interrupt
+	ctx         context.Context
+	cancel      context.CancelFunc
+	procCtx     context.Context
+	procCancel  context.CancelFunc
+	procCurrent Frame      // Pipecat __process_current_frame; guarded by procMu.
+	procMu      sync.Mutex // guards procCtx/procCancel swap on interrupt
 
 	procWG sync.WaitGroup // tracks processLoop only, for cancel-and-recreate
 
@@ -350,7 +351,17 @@ func (b *BaseProcessor) processLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case env := <-b.procCh:
+			b.procMu.Lock()
+			if ctx.Err() != nil {
+				b.procMu.Unlock()
+				return
+			}
+			b.procCurrent = env.Frame
+			b.procMu.Unlock()
 			b.self.ProcessFrame(ctx, env.Frame, env.Direction)
+			b.procMu.Lock()
+			b.procCurrent = nil
+			b.procMu.Unlock()
 		}
 	}
 }
@@ -374,27 +385,30 @@ func (b *BaseProcessor) handleSystem(env Envelope) {
 // only frames marked !IsInterruptible.
 func (b *BaseProcessor) interruptProcessLoop() {
 	b.procMu.Lock()
+	// Pipecat preserves an in-flight UninterruptibleFrame and only resets
+	// queued work in that case (frame_processor.py::_start_interruption).
+	preserveCurrent := b.procCurrent != nil && !b.procCurrent.IsInterruptible()
 	cancel := b.procCancel
-	b.procMu.Unlock()
-	if cancel != nil {
+	if !preserveCurrent && cancel != nil {
 		cancel()
 	}
-
-	// Bounded wait for the cancelled processLoop to exit so the next
-	// startProcessLoop sees a clean WaitGroup.
-	done := make(chan struct{})
-	go func() {
-		b.procWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(procLoopExitTimeout):
-		if b.taskCtx != nil && b.taskCtx.Logger != nil {
-			b.taskCtx.Logger.Printf("%s: processLoop did not exit within %s after interrupt; continuing anyway", b.name, procLoopExitTimeout)
+	b.procMu.Unlock()
+	if !preserveCurrent {
+		// Bounded wait for the cancelled processLoop to exit so the next
+		// startProcessLoop sees a clean WaitGroup.
+		done := make(chan struct{})
+		go func() {
+			b.procWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(procLoopExitTimeout):
+			if b.taskCtx != nil && b.taskCtx.Logger != nil {
+				b.taskCtx.Logger.Printf("%s: processLoop did not exit within %s after interrupt; continuing anyway", b.name, procLoopExitTimeout)
+			}
 		}
 	}
-
 	// Drain procCh, keeping frames that must survive an interrupt.
 	var keep []Envelope
 drain:
@@ -409,8 +423,10 @@ drain:
 		}
 	}
 
-	// Start a fresh processLoop and push the kept frames back.
-	b.startProcessLoop()
+	// Restart only when the current process task was cancelled.
+	if !preserveCurrent {
+		b.startProcessLoop()
+	}
 	for _, env := range keep {
 		select {
 		case b.procCh <- env:

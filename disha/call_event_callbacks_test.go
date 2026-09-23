@@ -105,7 +105,7 @@ func TestCallEventCallbacksConversationStateUploadOnCommittedTurns(t *testing.T)
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
 	events.OnUserTurnCommitted("hello doctor", at, "")
-	events.OnAssistantTurnCommitted("hi, let's begin", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "")
+	events.OnAssistantTurnCommitted("hi, let's begin", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "", voicepipelinecore.AssistantTurnCompletion{})
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -384,7 +384,7 @@ func TestCallEventCallbacksConversationStateUploadNilForNonOnboardingBots(t *tes
 
 	events := callbacks.Events()
 	events.OnUserTurnCommitted("hello", time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "")
-	events.OnAssistantTurnCommitted("hi", time.Date(2026, 7, 8, 10, 0, 1, 0, time.UTC), voicepipelinecore.TurnMetrics{}, "")
+	events.OnAssistantTurnCommitted("hi", time.Date(2026, 7, 8, 10, 0, 1, 0, time.UTC), voicepipelinecore.TurnMetrics{}, "", voicepipelinecore.AssistantTurnCompletion{})
 
 	chunkItems, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))
 	if err != nil {
@@ -506,21 +506,22 @@ func TestCallEventCallbacksLLMCallCompletedDelegation(t *testing.T) {
 	}
 
 	// No handler set: must be a safe no-op.
-	events.OnLLMCallCompleted("ignored text", false)
+	events.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "ignored text", Interrupted: false})
 
 	type call struct {
 		text        string
 		interrupted bool
 	}
 	var got []call
-	callbacks.SetLLMCallCompletedHandler(func(text string, interrupted bool) {
+	callbacks.SetLLMCallCompletedHandler(func(completion voicepipelinecore.LLMCallCompletion) {
+		text, interrupted := completion.Text, completion.Interrupted
 		got = append(got, call{text, interrupted})
 	})
 
 	// Fire through the Events() mapping, not the handler directly, so the
 	// delegation path is what's exercised.
-	events.OnLLMCallCompleted("namaste, kaise hain aap", false)
-	events.OnLLMCallCompleted("half a sen", true)
+	events.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "namaste, kaise hain aap", Interrupted: false})
+	events.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "half a sen", Interrupted: true})
 
 	want := []call{
 		{"namaste, kaise hain aap", false},
@@ -533,6 +534,25 @@ func TestCallEventCallbacksLLMCallCompletedDelegation(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("handler call %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestCallEventCallbacksEmptyAssistantCompletionDoesNotPersist(t *testing.T) {
+	redisServer, redisClient := newRedisTestClient(t)
+	callbacks := NewCallEventCallbacks(CallStartup{
+		ConversationID: "conv-1", UserID: "user-1", BotType: OnboardingCallBotType,
+	}, redisClient, nil, nil)
+	var got voicepipelinecore.AssistantTurnCompletion
+	callbacks.SetAssistantTurnCommittedHandler(func(_ string, _ time.Time, turn voicepipelinecore.AssistantTurnCompletion) {
+		got = turn
+	})
+	want := voicepipelinecore.AssistantTurnCompletion{Reason: voicepipelinecore.AssistantTurnInterrupted}
+	callbacks.Events().OnAssistantTurnCommitted("", time.Now(), voicepipelinecore.TurnMetrics{}, "", want)
+	if got != want {
+		t.Fatalf("completion = %+v, want %+v", got, want)
+	}
+	if redisServer.Exists(conversationChunksKey("user-1", "conv-1")) {
+		t.Fatal("empty completion persisted a conversation chunk")
 	}
 }
 
@@ -748,7 +768,7 @@ func TestCallEventCallbacksUserAfterAssistantAppendsNewChunk(t *testing.T) {
 	events := callbacks.Events()
 	at := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
 	events.OnUserTurnCommitted("a", at, "")
-	events.OnAssistantTurnCommitted("reply", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "")
+	events.OnAssistantTurnCommitted("reply", at.Add(time.Second), voicepipelinecore.TurnMetrics{}, "", voicepipelinecore.AssistantTurnCompletion{})
 	events.OnUserTurnCommitted("b", at.Add(2*time.Second), "")
 
 	items, err := redisServer.List(conversationChunksKey("user-1", "conv-1"))

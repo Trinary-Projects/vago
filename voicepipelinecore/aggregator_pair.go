@@ -6,7 +6,7 @@ type ContextAggregatorPair struct {
 }
 
 func NewContextAggregatorPair(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *ContextAggregatorPair {
-	state := newAggregatorSharedState(taskCtx, initialMessages, mainAgentSystemPromptLangfuseKey)
+	state := newLLMContext(taskCtx, initialMessages, mainAgentSystemPromptLangfuseKey)
 	return &ContextAggregatorPair{
 		user:      newUserContextAggregatorWithState(taskCtx, state),
 		assistant: newAssistantContextAggregatorWithState(taskCtx, state),

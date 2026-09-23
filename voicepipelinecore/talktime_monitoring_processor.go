@@ -86,8 +86,8 @@ func (p *TalkTimeMonitoringProcessor) ProcessFrame(ctx context.Context, frame Fr
 			return
 		}
 		p.PushFrame(f, dir)
-	case LLMMessagesFrame:
-		// UserContextAggregator only emits LLMMessagesFrame after a committed
+	case LLMMessagesFrame, LLMContextFrame:
+		// UserContextAggregator emits a context frame after a committed
 		// user turn (post-`<end>`), so this is the cleanest equivalent
 		// of Pipecat's UserStartedSpeakingFrame for arming the budget.
 		p.armOnFirstSpeech()

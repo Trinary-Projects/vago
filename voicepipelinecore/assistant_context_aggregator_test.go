@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage verifies
+// TestAssistantContextAggregator_ResponseEndCommitsAssistantMessage verifies
 // the Pipecat shape: played words flow downstream out of playback, and
-// BotStoppedSpeakingFrame flushes them into shared assistant history.
-func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing.T) {
+// LLMResponseEndFrame flushes them into shared assistant history.
+func TestAssistantContextAggregator_ResponseEndCommitsAssistantMessage(t *testing.T) {
 	fix := newTestFixture(t)
 	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
 	user := pair.User()
@@ -31,9 +31,9 @@ func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing
 	source.QueueFrame(TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
 	time.Sleep(20 * time.Millisecond)
 
-	mid.QueueFrame(NewWordTimestampFrame([]string{"hi"}), Downstream)
-	mid.QueueFrame(NewWordTimestampFrame([]string{"there"}), Downstream)
-	mid.QueueFrame(NewBotStoppedSpeakingFrame(), Downstream)
+	mid.QueueFrame(playedWordsFrame([]string{"hi"}), Downstream)
+	mid.QueueFrame(playedWordsFrame([]string{"there"}), Downstream)
+	mid.QueueFrame(NewLLMResponseEndFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 
 	source.QueueFrame(EndFrame{}, Downstream)
@@ -49,7 +49,7 @@ func TestAssistantContextAggregator_BotStoppedCommitsAssistantMessage(t *testing
 		}
 	}
 	if !sawAssistant {
-		t.Error("expected an assistant message after BotStoppedSpeakingFrame")
+		t.Error("expected an assistant message after LLMResponseEndFrame")
 	}
 }
 
@@ -65,8 +65,8 @@ func TestAssistantContextAggregator_CommitsBeforeEndFrameReachesSink(t *testing.
 	assistant.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
-	source.QueueFrame(NewWordTimestampFrame([]string{"goodbye"}), Downstream)
-	source.QueueFrame(NewWordTimestampFrame([]string{"."}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"goodbye"}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"."}), Downstream)
 	source.QueueFrame(NewEndFrame(string(EndReasonUnspecified)), Downstream)
 
 	deadline := time.Now().Add(time.Second)
@@ -100,7 +100,12 @@ func TestAssistantContextAggregator_InterruptCommitsPlayedAssistantText(t *testi
 	assistant.Start(fix.RootCtx)
 	sink.Start(fix.RootCtx)
 
-	source.QueueFrame(NewWordTimestampFrame([]string{"partial"}), Downstream)
+	source.QueueFrame(playedWordsFrame([]string{"partial"}), Downstream)
+	awaitSpeechCondition(t, "text reached assistant before interruption", func() bool {
+		assistant.mu.Lock()
+		defer assistant.mu.Unlock()
+		return len(assistant.playedWords) > 0
+	})
 	source.QueueFrame(NewInterruptFrame(), Downstream)
 	time.Sleep(20 * time.Millisecond)
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, assistant, sink)
@@ -121,7 +126,7 @@ func TestAssistantContextAggregator_EmitsCommittedTurnCallEventsWithMetrics(t *t
 	var metrics []TurnMetrics
 	var assistantPromptKeys []string
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnAssistantTurnCommitted: func(text string, at time.Time, m TurnMetrics, promptKey string) {
+		OnAssistantTurnCommitted: func(text string, at time.Time, m TurnMetrics, promptKey string, turn AssistantTurnCompletion) {
 			assistants = append(assistants, text)
 			metrics = append(metrics, m)
 			assistantPromptKeys = append(assistantPromptKeys, promptKey)
@@ -136,7 +141,7 @@ func TestAssistantContextAggregator_EmitsCommittedTurnCallEventsWithMetrics(t *t
 		{Processor: "tts", Label: MetricTTFB, ValueMs: 34},
 	}))
 	assistant.appendPlayedAssistantWords([]string{"hi", "there"})
-	assistant.commitPlayedAssistantText(false)
+	assistant.commitPlayedAssistantText(AssistantTurnCompletion{Reason: AssistantTurnPlaybackCompleted})
 	fix.TaskCtx.callEvents.stopAndDrain()
 
 	if len(assistants) != 1 || assistants[0] != "hi there" {

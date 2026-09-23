@@ -45,12 +45,9 @@ func TestTTS_ForwardsEndFrameWhenIdle(t *testing.T) {
 	// cancelled b.ctx.
 }
 
-// TestTTS_ForwardsInterruptDownstreamImmediately verifies that
-// InterruptFrame is forwarded downstream by ProcessFrame BEFORE being
-// relayed to the orchestrator. This is the intended behaviour because
-// the InterruptFrame needs to reach PlaybackSink quickly to stop
-// playback even if the orchestrator is busy.
-func TestTTS_ForwardsInterruptDownstreamImmediately(t *testing.T) {
+// Interruption must reach playback even while the initial provider connection
+// is unavailable: no synthesis contexts can exist yet.
+func TestTTS_ForwardsInterruptBeforeInitialConnection(t *testing.T) {
 	fix := newTestFixture(t)
 	p := NewTTSProcessor(fix.TaskCtx, nil, "")
 
@@ -146,8 +143,8 @@ func TestTTS_NextPCMFrameUsesRawPCMBytes(t *testing.T) {
 		input[i] = byte(i % 251)
 	}
 
-	p := &TTSProcessor{pcmBuffer: append([]byte(nil), input...)}
-	frame := p.nextPCMFrame()
+	p := &ttsContext{pcmBuffer: append([]byte(nil), input...)}
+	frame := p.nextPCMFrame(framePCMBytes)
 
 	if len(frame) != framePCMBytes {
 		t.Fatalf("expected %d-byte PCM frame, got %d", framePCMBytes, len(frame))

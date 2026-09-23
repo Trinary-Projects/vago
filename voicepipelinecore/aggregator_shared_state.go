@@ -11,13 +11,13 @@ const minBargeInWords = 3
 
 var errEmptyInitialMessages = errors.New("voicepipelinecore: aggregator pair requires non-empty initial messages")
 
-type aggregatorSharedState struct {
+type LLMContext struct {
 	mu                               sync.Mutex
 	messages                         []Message
 	mainAgentSystemPromptLangfuseKey string
 }
 
-func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *aggregatorSharedState {
+func newLLMContext(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *LLMContext {
 	messages := messagesFromInitial(initialMessages)
 	if len(messages) == 0 {
 		if taskCtx != nil && taskCtx.Logger != nil {
@@ -37,7 +37,7 @@ func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, m
 		})
 		panic(errEmptyInitialMessages)
 	}
-	return &aggregatorSharedState{
+	return &LLMContext{
 		messages:                         messages,
 		mainAgentSystemPromptLangfuseKey: mainAgentSystemPromptLangfuseKey,
 	}
@@ -49,7 +49,7 @@ func newAggregatorSharedState(taskCtx *TaskContext, initialMessages []Message, m
 // otherwise a system message is inserted at the front. Used by the
 // onboarding stage machine on every stage transition / deep-thinking
 // recompile.
-func (s *aggregatorSharedState) replaceSystemMessage(text string) {
+func (s *LLMContext) replaceSystemMessage(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.messages) > 0 && s.messages[0].Role == "system" {
@@ -63,12 +63,32 @@ func (s *aggregatorSharedState) replaceSystemMessage(text string) {
 // mutex-guarded the same as replaceSystemMessage. Callers own the
 // returned slice/messages outright; mutating them (including a
 // message's ToolCalls) cannot affect shared state.
-func (s *aggregatorSharedState) snapshot() []Message {
+func (s *LLMContext) snapshot() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneMessages(s.messages)
 }
 
-func (s *aggregatorSharedState) messagesForTest() []Message {
+func (s *LLMContext) messagesForTest() []Message {
 	return s.snapshot()
+}
+
+// NewLLMContext creates the shared conversation object carried by LLMContextFrame.
+func NewLLMContext(messages []Message) *LLMContext {
+	return &LLMContext{messages: cloneMessages(messages)}
+}
+
+// GetMessages returns an owned snapshot for a provider invocation or reader.
+func (s *LLMContext) GetMessages() []Message { return s.snapshot() }
+
+func (s *LLMContext) AddMessages(messages []Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = append(s.messages, cloneMessages(messages)...)
+}
+
+func (s *LLMContext) SetMessages(messages []Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = cloneMessages(messages)
 }

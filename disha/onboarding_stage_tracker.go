@@ -40,6 +40,8 @@ const (
 	// transcriptAllTurns is the "no windowing" sentinel for
 	// onboardingTranscript (Python's max_turns=None).
 	transcriptAllTurns = -1
+
+	stageContinuationInstruction = "<system_message>The system prompt has been updated for the next stage. Continue the conversation naturally using the new instructions, without repeating what you just said.</system_message>"
 )
 
 // serverMessageEmitter is the narrow RTVI surface the tracker/manager
@@ -50,10 +52,17 @@ type serverMessageEmitter interface {
 }
 
 // stageTransitionProcessor is the tracker's consumer-side view of the
-// stage manager. The manager handles its own failure paths internally
-// (Sentry + RTVI), so the method reports nothing back.
+// stage manager. A true result means the new system prompt was applied.
 type stageTransitionProcessor interface {
-	processTransition(ctx context.Context, nextStageName, toolCallID, transcript string)
+	processTransition(ctx context.Context, nextStageName, toolCallID, transcript string) bool
+}
+
+type stageTrackerEvaluation struct {
+	stage                   *StageConfig
+	latestTranscript        string
+	fullTranscript          string
+	latestAssistantResponse string
+	continueConversation    bool
 }
 
 // promptMetadataSetter is satisfied by *llmrouter.Router. The tracker
@@ -143,7 +152,7 @@ func (t *OnboardingStageTracker) infrastructure() (context.Context, *voicepipeli
 // port of on_llm_call_complete (tracker side of
 // onboarding_pipeline_manager.on_llm_call_complete, which computes the
 // transcripts, plus the processor's own queueing/skip logic).
-func (t *OnboardingStageTracker) OnLLMCallCompleted(text string, interrupted bool) {
+func (t *OnboardingStageTracker) OnLLMCallCompleted(completion voicepipelinecore.LLMCallCompletion) {
 	if t == nil {
 		return
 	}
@@ -153,19 +162,30 @@ func (t *OnboardingStageTracker) OnLLMCallCompleted(text string, interrupted boo
 		return
 	}
 
-	stageName := t.state.CurrentStage().Name
-	if interrupted {
+	stage := t.state.CurrentStage()
+	stageName := stage.Name
+	if completion.Interrupted {
 		t.sendRTVI(fmt.Sprintf("%s Skipped interrupted LLM response for stage=%s", stageTrackerLogPrefix, stageName))
 		return
 	}
 
-	latestAssistantResponse := strings.TrimSpace(text)
+	latestAssistantResponse := strings.TrimSpace(completion.Text)
+	if latestAssistantResponse == "" {
+		return
+	}
 	messages := pair.MessagesSnapshot()
 	latestTranscript := onboardingTranscript(messages, stageTrackerTranscriptTurns-1)
-	if latestAssistantResponse != "" {
-		latestTranscript = latestTranscript + "\ndisha: " + latestAssistantResponse
-	}
+	latestTranscript += "\ndisha: " + latestAssistantResponse
 	fullTranscript := onboardingTranscript(messages, transcriptAllTurns)
+	evaluation := stageTrackerEvaluation{
+		stage:                   stage,
+		latestTranscript:        latestTranscript,
+		fullTranscript:          fullTranscript,
+		latestAssistantResponse: latestAssistantResponse,
+	}
+	if !strings.ContainsAny(latestAssistantResponse, "?？؟") && !completion.HasToolCalls {
+		evaluation.continueConversation = true
+	}
 
 	t.sendRTVI(fmt.Sprintf("%s Queued after LLM response for stage=%s", stageTrackerLogPrefix, stageName))
 
@@ -177,13 +197,14 @@ func (t *OnboardingStageTracker) OnLLMCallCompleted(text string, interrupted boo
 		if ctx.Err() != nil {
 			return
 		}
-		t.run(ctx, latestTranscript, fullTranscript, latestAssistantResponse)
+		t.run(ctx, evaluation)
 	}()
 }
 
 // run mirrors StageTransitionTrackerProcessor._run.
-func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, fullTranscript, latestAssistantResponse string) {
-	currentStage := t.state.CurrentStage()
+func (t *OnboardingStageTracker) run(ctx context.Context, evaluation stageTrackerEvaluation) {
+	currentStage := evaluation.stage
+	latestTranscript, fullTranscript, latestAssistantResponse := evaluation.latestTranscript, evaluation.fullTranscript, evaluation.latestAssistantResponse
 	currentStageName := currentStage.Name
 	allowedNextStages := append([]string(nil), currentStage.NextStages...)
 
@@ -250,7 +271,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, full
 	case StageTransitionDecisionYes:
 		t.sendRTVI(fmt.Sprintf("%s Fuzzy matched %s => %s; skipping LLM",
 			stageTrackerLogPrefix, currentStageName, result.Output))
-		t.processOutput(ctx, result.Output, currentStageName, allowedNextStages, fullTranscript)
+		t.processOutput(ctx, result.Output, currentStageName, allowedNextStages, fullTranscript, evaluation.continueConversation)
 	case StageTransitionDecisionNo:
 		t.sendRTVI(fmt.Sprintf("%s Fuzzy no transition for stage=%s; skipping LLM",
 			stageTrackerLogPrefix, currentStageName))
@@ -262,7 +283,7 @@ func (t *OnboardingStageTracker) run(ctx context.Context, latestTranscript, full
 			t.reportRunError(ctx, currentStageName, llmErr)
 			return
 		}
-		t.processOutput(ctx, output, currentStageName, allowedNextStages, fullTranscript)
+		t.processOutput(ctx, output, currentStageName, allowedNextStages, fullTranscript, evaluation.continueConversation)
 	}
 }
 
@@ -342,7 +363,7 @@ func (t *OnboardingStageTracker) logFuzzyResult(currentStageName string, result 
 }
 
 // processOutput mirrors _process_output.
-func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, startedStageName string, allowedNextStages []string, fullTranscript string) {
+func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, startedStageName string, allowedNextStages []string, fullTranscript string, continueConversation bool) {
 	if strings.ToLower(output) == "no" {
 		t.sendRTVI(fmt.Sprintf("%s No transition for stage=%s", stageTrackerLogPrefix, startedStageName))
 		return
@@ -368,6 +389,9 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 
 	t.transitionMu.Lock()
 	defer t.transitionMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	if current := t.state.CurrentStage().Name; current != startedStageName {
 		t.logf("%s Stale tracker result ignored: started_stage=%s, current_stage=%s",
 			stageTrackerLogPrefix, startedStageName, current)
@@ -377,8 +401,27 @@ func (t *OnboardingStageTracker) processOutput(ctx context.Context, output, star
 	}
 
 	t.sendRTVI(fmt.Sprintf("%s Transitioning %s => %s", stageTrackerLogPrefix, startedStageName, output))
-	t.manager.processTransition(ctx, output, "stage_transition_tracker_"+uuid.NewString(), fullTranscript)
+	if !t.manager.processTransition(ctx, output, "stage_transition_tracker_"+uuid.NewString(), fullTranscript) {
+		return
+	}
 	t.sendRTVI(fmt.Sprintf("%s Transition complete %s => %s", stageTrackerLogPrefix, startedStageName, output))
+	if continueConversation {
+		t.queueContinuation()
+	}
+}
+
+// Let the assistant aggregator consume the append after TTS/playback have
+// delivered the preceding response-end and committed the spoken text. Pipecat
+// serializes ordinary downstream frames behind speech in the same way.
+func (t *OnboardingStageTracker) queueContinuation() {
+	ctx, pair, _ := t.infrastructure()
+	if ctx == nil || ctx.Err() != nil || pair == nil {
+		return
+	}
+	frame := voicepipelinecore.NewLLMMessagesAppendFrame([]voicepipelinecore.Message{
+		{Role: "user", Content: stageContinuationInstruction},
+	}, true)
+	pair.User().PushFrame(frame, voicepipelinecore.Downstream)
 }
 
 // reportRunError is _run's generic `except Exception` arm: log + RTVI +

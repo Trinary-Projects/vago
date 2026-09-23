@@ -349,7 +349,7 @@ func TestSalesCallBotPlanAssemblesDishaCall(t *testing.T) {
 		TTSTTFBMs:            22.2,
 		E2ELatencyMs:         33.3,
 		TTSTextAggregationMs: 44.4,
-	}, pl.PromptKey)
+	}, pl.PromptKey, voicepipelinecore.AssistantTurnCompletion{})
 	chunkItems, err := redisServer.List(conversationChunksKey(userID, conversationID))
 	if err != nil {
 		t.Fatalf("List chunks: %v", err)

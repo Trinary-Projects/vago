@@ -229,7 +229,7 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 		stageTestUserID, stageTestConversationID, stageTestPatientInfo)
 	threshold := NewOnboardingStageThresholdMonitor(state, api, logger,
 		stageTestUserID, stageTestConversationID)
-	callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time) {
+	callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time, voicepipelinecore.AssistantTurnCompletion) {
 		threshold.OnAssistantTurnCommitted()
 	})
 
@@ -401,7 +401,7 @@ func TestStageTrackerFuzzyYesTransitionHappyPath(t *testing.T) {
 	// (with the [Name] placeholder dropped, one of the matcher's trigger
 	// variants) → fuzzy decision "yes", no classifier call.
 	response := strings.ReplaceAll(startStageTriggerStatement(t), "[Name]", "")
-	h.tracker.OnLLMCallCompleted(response, false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: response, Interrupted: false})
 
 	waitForCondition(t, 5*time.Second, "stage advance", func() bool {
 		return h.state.CurrentStage().Name == stageTestNextStage
@@ -515,7 +515,7 @@ func TestStageTrackerMaybePathRunsClassifier(t *testing.T) {
 	h := newStageMachineHarness(t, classifier)
 	installMaybeStage(t, h)
 
-	h.tracker.OnLLMCallCompleted("alpha beta gamma", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "alpha beta gamma", Interrupted: false})
 
 	waitForCondition(t, 5*time.Second, "maybe-path stage advance", func() bool {
 		return h.state.CurrentStage().Name == stageTestNextStage
@@ -574,7 +574,7 @@ func TestStageTrackerInvalidClassifierOutput(t *testing.T) {
 	h := newStageMachineHarness(t, classifier)
 	installMaybeStage(t, h)
 
-	h.tracker.OnLLMCallCompleted("alpha beta gamma", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "alpha beta gamma", Interrupted: false})
 
 	h.waitForRTVI(`Invalid output="bogus_stage" for stage=intro_maybe`)
 	if h.state.CurrentStage().Name != "intro_maybe" {
@@ -598,7 +598,7 @@ func TestStageTrackerClassifierNoOutput(t *testing.T) {
 	h := newStageMachineHarness(t, classifier)
 	installMaybeStage(t, h)
 
-	h.tracker.OnLLMCallCompleted("alpha beta gamma", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "alpha beta gamma", Interrupted: false})
 
 	h.waitForRTVI("No transition for stage=intro_maybe")
 	if h.state.CurrentStage().Name != "intro_maybe" {
@@ -626,7 +626,7 @@ func TestStageTrackerStaleResultDropped(t *testing.T) {
 	}
 
 	systemBefore := h.pair.MessagesSnapshot()[0].Content
-	h.tracker.OnLLMCallCompleted("alpha beta gamma", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "alpha beta gamma", Interrupted: false})
 
 	h.waitForRTVI("Stale output ignored: started=intro_maybe, current=" + stageTestNextStage)
 	if h.hasRTVI("Transitioning") {
@@ -649,7 +649,7 @@ func TestStageTrackerSkipsInterruptedResponse(t *testing.T) {
 	classifier := &stubStageClassifier{output: stageTestNextStage}
 	h := newStageMachineHarness(t, classifier)
 
-	h.tracker.OnLLMCallCompleted("half a sentence", true)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "half a sentence", Interrupted: true})
 
 	// The skip path is synchronous — no goroutine is spawned.
 	if !h.hasRTVI("Skipped interrupted LLM response for stage=introduction") {
@@ -677,7 +677,7 @@ func TestStageTrackerSkipsClosingStage(t *testing.T) {
 		NextStages: []string{stageTestNextStage},
 	})
 
-	h.tracker.OnLLMCallCompleted("dhanyavaad, call khatam karte hain", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "dhanyavaad, call khatam karte hain", Interrupted: false})
 
 	waitForCondition(t, 5*time.Second, "closing-stage skip log", func() bool {
 		return strings.Contains(h.logBuf.String(), "Stage=closing_and_assurance is a closing stage, skipping")
@@ -705,7 +705,7 @@ func TestStageTrackerConfigErrorPath(t *testing.T) {
 		NextStages: []string{stageTestNextStage},
 	})
 
-	h.tracker.OnLLMCallCompleted("hello there", false)
+	h.tracker.OnLLMCallCompleted(voicepipelinecore.LLMCallCompletion{Text: "hello there", Interrupted: false})
 
 	h.waitForRTVI("Invalid stage transition config for stage=no_trigger: next_stages config has no valid trigger statements")
 	if h.state.CurrentStage().Name != "no_trigger" {
