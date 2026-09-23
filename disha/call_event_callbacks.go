@@ -421,28 +421,6 @@ func (c *CallEventCallbacks) enqueueDailyMetrics(stats voicepipelinecore.CallSta
 	}
 }
 
-func (c *CallEventCallbacks) enqueueChunkSync() {
-	if c == nil || c.api == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), postCallRequestTimeout)
-	defer cancel()
-	req := EnqueueJobRequest{
-		ModuleName: "services.conversation_chunk_manager",
-		FuncName:   "sync_conversation_chunks_to_db",
-		Kwargs: map[string]any{
-			"user_id":         c.userID,
-			"conversation_id": c.conversationID,
-			"bot_type":        c.botType,
-		},
-		SQSQueue: "p1-fast-l1",
-	}
-	ic := c.idempotency(opSyncConversationChunks, c.conversationID)
-	if err := c.api.EnqueueJobKeyed(ctx, opSyncConversationChunks, req, ic); err != nil && c.logger != nil {
-		c.logger.Printf("disha: enqueue chunk sync failed conversation=%s user=%s: %v\n", c.conversationID, c.userID, err)
-	}
-}
-
 func optionalTime(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil

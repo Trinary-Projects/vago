@@ -63,6 +63,6 @@ func (e *APIStatusError) IsServerSide() bool {
 		e.Status >= 500
 }
 
-// captureOutboxSentry is a package-var seam so tests can count exactly
-// how many events a flow produces.
-var captureOutboxSentry = sentryutil.Capture
+// captureSentry is a package-var seam so tests can count exactly how
+// many events a flow produces.
+var captureSentry = sentryutil.Capture

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -17,14 +18,24 @@ func recordSentryEvents(t *testing.T) *[]sentryutil.Event {
 	t.Helper()
 	var mu sync.Mutex
 	events := []sentryutil.Event{}
-	original := captureOutboxSentry
-	captureOutboxSentry = func(e sentryutil.Event) {
+	original := captureSentry
+	captureSentry = func(e sentryutil.Event) {
 		mu.Lock()
 		defer mu.Unlock()
 		events = append(events, e)
 	}
-	t.Cleanup(func() { captureOutboxSentry = original })
+	t.Cleanup(func() { captureSentry = original })
 	return &events
+}
+
+// hubTags returns the scope tags a captured event would carry, so a test
+// can assert the identity that makes a report searchable in Sentry.
+func hubTags(t *testing.T, hub *sentry.Hub) map[string]string {
+	t.Helper()
+	if hub == nil {
+		t.Fatal("no hub; the event would lose its call identity")
+	}
+	return hub.Scope().ApplyToEvent(sentry.NewEvent(), nil, nil).Tags
 }
 
 // resetSentryRateLimiter clears the per-subject window so one test's
@@ -46,6 +57,7 @@ func resetSentryRateLimiter(t *testing.T) {
 // attached. The stub 503s both hops.
 func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 	resetSentryRateLimiter(t)
+	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -72,11 +84,11 @@ func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 	if ev.Tags["operation"] != opRunPostCallOperations {
 		t.Fatalf("operation tag = %q", ev.Tags["operation"])
 	}
-	if ev.Details["conversation_id"] != "conv-1" {
-		t.Fatalf("details missing conversation_id: %+v", ev.Details)
+	if ev.Details["idempotency_key"] != "vago:postcall:conv-1" {
+		t.Fatalf("details missing the key: %+v", ev.Details)
 	}
-	if ev.Hub == nil {
-		t.Fatal("no hub; the event would lose its call identity")
+	if got := hubTags(t, ev.Hub); got["conversation_id"] != "conv-1" || got["user_id"] != "user-1" {
+		t.Fatalf("report lost its call identity: %+v", got)
 	}
 }
 
@@ -85,6 +97,7 @@ func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 // during it.
 func TestAPIClientRateLimitsUndeliveredReports(t *testing.T) {
 	resetSentryRateLimiter(t)
+	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -119,29 +132,6 @@ func TestAPIClientSuccessIsSilentAndCarriesTheKey(t *testing.T) {
 	}
 	if len(*events) != 0 {
 		t.Fatalf("a successful call reported %d events, want 0", len(*events))
-	}
-}
-
-// The job envelope carries the key for paths that are not plain routes.
-func TestAPIClientEnqueueJobKeyedPutsKeyInEnvelope(t *testing.T) {
-	server, requests := captureAPIRequest(t, http.StatusOK)
-	client := NewAPIClient(server.URL, time.Second, nil)
-
-	err := client.EnqueueJobKeyed(context.Background(), opSyncConversationChunks, EnqueueJobRequest{
-		ModuleName: "services.conversation_chunk_manager",
-		FuncName:   "sync_conversation_chunks_to_db",
-		Kwargs:     map[string]any{"conversation_id": "conv-1"},
-		SQSQueue:   "p1-fast-l1",
-	}, IdempotencyContext{IdempotencyKey: "vago:chunksync:conv-1"})
-	if err != nil {
-		t.Fatalf("EnqueueJobKeyed: %v", err)
-	}
-	got := <-requests
-	if got.Path != enqueueJobPath {
-		t.Fatalf("path = %q, want %q", got.Path, enqueueJobPath)
-	}
-	if got.Body["idempotency_key"] != "vago:chunksync:conv-1" {
-		t.Fatalf("envelope idempotency_key = %v", got.Body["idempotency_key"])
 	}
 }
 
@@ -208,7 +198,7 @@ func TestIdempotencyKeyDistinguishesInputs(t *testing.T) {
 		"different operation":      idempotencyKey(opUpdateConversation, "conv-1"),
 		"update bot_joined":        idempotencyKey(opUpdateConversation, "conv-1", "bot_joined"),
 		"update user_first_speech": idempotencyKey(opUpdateConversation, "conv-1", "user_first_speech"),
-		"chunk sync same conv":     idempotencyKey(opSyncConversationChunks, "conv-1"),
+		"careplan same conv":       idempotencyKey(opSetUserCareplan, "conv-1"),
 	}
 	for name, key := range cases {
 		if prev, ok := seen[key]; ok {

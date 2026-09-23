@@ -25,8 +25,8 @@ var (
 // allowSentryReport reports whether a capture for subject should be
 // emitted now, keeping at most one per subject per window. Used for
 // sites that can fail repeatedly for a single underlying cause — a
-// best-effort job on every turn, or the drainer's claim on a 5s timer
-// while Redis is unhealthy.
+// best-effort job firing on every turn, or an operation that fails the
+// same way on every call for as long as Disha is down.
 func allowSentryReport(subject string, now time.Time) bool {
 	sentryReportMu.Lock()
 	defer sentryReportMu.Unlock()
@@ -42,7 +42,7 @@ func reportTelemetryDrop(job, conversationID string, cause error) {
 	if cause == nil || !allowSentryReport("job_dropped:"+job, time.Now()) {
 		return
 	}
-	captureOutboxSentry(sentryutil.Event{
+	captureSentry(sentryutil.Event{
 		Err: cause,
 		Tags: map[string]string{
 			"component": "disha_api",

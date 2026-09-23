@@ -38,11 +38,10 @@ const (
 // Operation names. These become the Sentry `operation` tag, so they are
 // what separates one actionable issue from another — keep them stable.
 const (
-	opUpdateConversation     = "update_conversation"
-	opRunPostCallOperations  = "run_post_call_operations"
-	opSetUserCareplan        = "set_user_careplan"
-	opAddTagToUser           = "add_tag_to_user"
-	opSyncConversationChunks = "sync_conversation_chunks_to_db"
+	opUpdateConversation    = "update_conversation"
+	opRunPostCallOperations = "run_post_call_operations"
+	opSetUserCareplan       = "set_user_careplan"
+	opAddTagToUser          = "add_tag_to_user"
 )
 
 // apiFallbackRetryDelays caps the wait before each fallback retry, so
@@ -53,8 +52,9 @@ var apiFallbackRetryDelays = []time.Duration{100 * time.Millisecond, 200 * time.
 
 // jobFallbackFunc maps an operation to the module-level Python function
 // that performs the same work off SQS. An operation absent from this map
-// has no fallback: opSyncConversationChunks IS an enqueue_job, so
-// queueing it again would just repeat the call that has already failed.
+// has no fallback and its route error is already final — notably
+// anything that is itself an enqueue_job, where queueing again would
+// just repeat the call that has already failed.
 var jobFallbackFunc = map[string]string{
 	opUpdateConversation:    "update_conversation",
 	opRunPostCallOperations: "run_post_call_operations",
@@ -119,14 +119,6 @@ func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error
 	return c.send(ctx, http.MethodPost, enqueueJobPath, req, "")
 }
 
-// EnqueueJobKeyed posts a job whose replay must be suppressed. The key
-// travels inside the envelope, where disha-backend's worker dispatcher
-// reads it.
-func (c *APIClient) EnqueueJobKeyed(ctx context.Context, operation string, req EnqueueJobRequest, ic IdempotencyContext) error {
-	req.IdempotencyKey = ic.IdempotencyKey
-	return c.call(ctx, operation, http.MethodPost, enqueueJobPath, req, ic)
-}
-
 // call sends the operation to its route and, if that fails, queues the
 // same work as a background job. Sentry hears about it only when BOTH
 // have failed — that is the point at which the operation is genuinely
@@ -141,24 +133,24 @@ func (c *APIClient) EnqueueJobKeyed(ctx context.Context, operation string, req E
 // a backend that honours it runs the work at most once even when the
 // route in fact succeeded and only its response was lost.
 func (c *APIClient) call(ctx context.Context, operation, method, path string, body any, ic IdempotencyContext) error {
-	start := time.Now()
 	err := c.send(ctx, method, path, body, ic.IdempotencyKey)
 	if err == nil {
-		// TODO: remove this when merging PR
-		apiLogf(c.logger, "delivered operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s",
-			operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"])
 		return nil
 	}
 
 	fallbackErr := c.enqueueAPIFallback(operation, body, ic, err)
 	if fallbackErr == nil {
-		apiLogf(c.logger, "queued fallback job operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s after: %v",
-			operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], err)
+		if c.logger != nil {
+			c.logger.Printf("disha: api queued fallback job operation=%s conversation=%s after: %v\n",
+				operation, ic.SentryTags["conversation_id"], err)
+		}
 		return nil
 	}
 
-	apiLogf(c.logger, "NOT DELIVERED operation=%s %s %s duration_ms=%d idempotency_key=%s conversation=%s: %v",
-		operation, method, path, time.Since(start).Milliseconds(), ic.IdempotencyKey, ic.SentryTags["conversation_id"], fallbackErr)
+	if c.logger != nil {
+		c.logger.Printf("disha: api NOT DELIVERED operation=%s conversation=%s: %v\n",
+			operation, ic.SentryTags["conversation_id"], fallbackErr)
+	}
 	c.reportUndelivered(operation, ic, fallbackErr)
 	return fallbackErr
 }
@@ -198,13 +190,22 @@ func (c *APIClient) enqueueAPIFallback(operation string, body any, ic Idempotenc
 	// safe to repeat: the envelope carries the idempotency key, so a
 	// request that in fact landed and only lost its response cannot run
 	// the work twice on a backend that honours it.
+	//
+	// The caller's context is normally already dead here — a timeout is
+	// exactly when this path runs — so the whole loop runs on a fresh
+	// budget of its own rather than inheriting it. That budget is the
+	// only thing bounding this hop, so the backoff waits on it too: a
+	// bare sleep would let the last wait run past the deadline and
+	// nothing could cut it.
 	maxAttempts := len(apiFallbackRetryDelays) + 1
+	budget, cancelBudget := context.WithTimeout(context.Background(), fallbackBudget())
+	defer cancelBudget()
+
 	var enqueueErr error
+	attempts := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// The caller's context is normally already dead here — a timeout
-		// is exactly when this path runs — so each attempt gets its own
-		// budget.
-		ctx, cancel := context.WithTimeout(context.Background(), defaultAPITimeout)
+		attempts = attempt
+		ctx, cancel := context.WithTimeout(budget, defaultAPITimeout)
 		enqueueErr = c.EnqueueJob(ctx, job)
 		cancel()
 		if enqueueErr == nil {
@@ -214,12 +215,45 @@ func (c *APIClient) enqueueAPIFallback(operation string, body any, ic Idempotenc
 			break
 		}
 		delay := fullJitter(apiFallbackRetryDelays[attempt-1])
-		apiLogf(c.logger, "transient fallback enqueue failure operation=%s attempt=%d/%d retrying_in=%s idempotency_key=%s conversation=%s: %v",
-			operation, attempt, maxAttempts, delay, ic.IdempotencyKey, ic.SentryTags["conversation_id"], enqueueErr)
-		time.Sleep(delay)
+		if c.logger != nil {
+			c.logger.Printf("disha: api transient fallback enqueue failure operation=%s attempt=%d/%d retrying_in=%s conversation=%s: %v\n",
+				operation, attempt, maxAttempts, delay, ic.SentryTags["conversation_id"], enqueueErr)
+		}
+		if !sleepCtx(budget, delay) {
+			break
+		}
 	}
 	return fmt.Errorf("disha: %s API failed (%v) and fallback enqueue failed after %d attempts: %w",
-		operation, cause, maxAttempts, enqueueErr)
+		operation, cause, attempts, enqueueErr)
+}
+
+// fallbackBudget is what the whole fallback hop is allowed to take:
+// every attempt's request timeout plus every backoff wait. Derived from
+// the retry plan rather than hardcoded so shortening the delays in a
+// test shortens the budget with them.
+func fallbackBudget() time.Duration {
+	budget := time.Duration(len(apiFallbackRetryDelays)+1) * defaultAPITimeout
+	for _, delay := range apiFallbackRetryDelays {
+		budget += delay
+	}
+	return budget
+}
+
+// sleepCtx waits for d and reports whether it completed. It returns
+// false as soon as ctx is done, so a backoff wait cannot outlive the
+// budget it is backing off inside.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // retryableAPIError reports whether another identical attempt could
@@ -268,11 +302,9 @@ func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, c
 	if !allowSentryReport("api_undelivered:"+operation, time.Now()) {
 		return
 	}
-	details := map[string]any{"idempotency_key": ic.IdempotencyKey}
-	for k, v := range ic.SentryTags {
-		details[k] = v
-	}
-	captureOutboxSentry(sentryutil.Event{
+	// The call identity rides the hub as scope tags, so it is searchable;
+	// Details carries only what is not a tag.
+	captureSentry(sentryutil.Event{
 		Hub: sentryutil.NewTaskHub(ic.SentryTags),
 		Err: cause,
 		Tags: map[string]string{
@@ -280,34 +312,22 @@ func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, c
 			"operation": operation,
 			"reason":    "not_delivered",
 		},
-		Details: details,
+		Details: map[string]any{"idempotency_key": ic.IdempotencyKey},
 	})
 }
 
-// apiLogf mirrors the outbox line format that preceded it.
-// TODO: remove this when merging PR
-func apiLogf(logger *log.Logger, format string, v ...any) {
-	if logger == nil {
-		return
-	}
-	logger.Printf("disha: api "+format+"\n", v...)
-}
-
-func (c *APIClient) send(ctx context.Context, method, path string, body any, idempotencyKey string) error {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("disha: marshal %s %s request: %w", method, path, err)
-	}
-	return c.sendRaw(ctx, method, path, payload, idempotencyKey)
-}
-
-// sendRaw performs exactly one HTTP attempt.
+// send performs exactly one HTTP attempt.
 // It deliberately does NOT capture to Sentry. It used to, which is what
 // made VAGO-6 and VAGO-7 fire on every transient blip — including ones
 // the fallback then recovered from — and collapsed nine unrelated job
 // call sites into a single ungroupable issue. Reporting belongs to
 // whoever runs out of ways to deliver the work.
-func (c *APIClient) sendRaw(ctx context.Context, method, path string, payload []byte, idempotencyKey string) error {
+func (c *APIClient) send(ctx context.Context, method, path string, body any, idempotencyKey string) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("disha: marshal %s %s request: %w", method, path, err)
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("disha: build %s %s request: %w", method, path, err)

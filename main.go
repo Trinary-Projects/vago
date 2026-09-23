@@ -165,11 +165,10 @@ func newDishaDeps() disha.Deps {
 			}
 		}()
 	}
-	api := disha.NewAPIClient(firstNonEmpty(os.Getenv("DISHA_API_URL"), os.Getenv("API_BASE_URL")), 10*time.Second, logger)
 	return disha.Deps{
 		Logger:       logger,
 		Redis:        redis,
-		API:          api,
+		API:          disha.NewAPIClient(firstNonEmpty(os.Getenv("DISHA_API_URL"), os.Getenv("API_BASE_URL")), 10*time.Second, logger),
 		Documents:    disha.NewDocumentStore(redis, logger),
 		PhoneticDict: phonetic,
 		S3:           disha.NewS3GetClientFromEnv(logger, "AWS_BUCKET_NAME", "AWS_MAIN_REGION"),

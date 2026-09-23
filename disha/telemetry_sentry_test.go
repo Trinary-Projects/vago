@@ -5,19 +5,19 @@ import (
 	"time"
 )
 
-// A Redis blip makes the drainer's claim fail every ~5s on every pod.
-// Without a bucket that alone would out-noise the issues this change
-// exists to remove.
+// A Disha outage makes the same operation fail on every call that ends
+// during it. Without a bucket that alone would out-noise the issues this
+// change exists to remove.
 func TestSentryReportBucketKeepsOnePerWindow(t *testing.T) {
 	now := time.Now()
 	// The bucket is package-level state, so each test uses its own
 	// subject rather than leaking a window into the next test.
-	subject := "test:window:OUTBOX_CLAIM"
+	subject := "test:window:api_undelivered"
 
 	if !allowSentryReport(subject, now) {
 		t.Fatal("first report should be allowed")
 	}
-	// 5s apart, the real drainer rate, for the rest of the minute.
+	// 5s apart, faster than calls realistically end, for the rest of the minute.
 	for i := 1; i*5 < int(sentryReportWindow/time.Second); i++ {
 		at := now.Add(time.Duration(i) * 5 * time.Second)
 		if allowSentryReport(subject, at) {
@@ -32,8 +32,8 @@ func TestSentryReportBucketKeepsOnePerWindow(t *testing.T) {
 func TestSentryReportBucketIsPerSubject(t *testing.T) {
 	now := time.Now()
 	subjects := []string{
-		"test:subject:OUTBOX_CLAIM",
-		"test:subject:OUTBOX_PARK",
+		"test:subject:api_undelivered",
+		"test:subject:telemetry_drop",
 		"test:subject:job_dropped",
 	}
 	// Each subject gets its own window; one noisy subject must not

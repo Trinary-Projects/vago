@@ -123,10 +123,6 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 	}
 }
 
-// Durability moved to disha-backend: each operation makes exactly one
-// attempt and a failure surfaces to the caller. Nothing may fall back to
-// a /common/enqueue_job retry any more, so a failing route must produce
-// exactly one request.
 // A route failure queues the same work as a job. The caller sees success
 // because the operation is still going to run.
 func TestAPIClientFailureQueuesFallbackJob(t *testing.T) {
@@ -244,35 +240,6 @@ func TestAPIClientPermanentStatusSkipsFallback(t *testing.T) {
 	}
 	if len(paths) != 1 {
 		t.Fatalf("paths = %v, want the route only", paths)
-	}
-	if len(*events) != 1 {
-		t.Fatalf("captured %d events, want 1", len(*events))
-	}
-}
-
-// Chunk sync IS an enqueue_job; re-queueing it would repeat the call
-// that just failed, so it reports on the first failure.
-func TestAPIClientEnqueueJobKeyedHasNoFallback(t *testing.T) {
-	resetSentryRateLimiter(t)
-	events := recordSentryEvents(t)
-	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewAPIClient(server.URL, time.Second, nil)
-	err := client.EnqueueJobKeyed(context.Background(), opSyncConversationChunks, EnqueueJobRequest{
-		ModuleName: "services.conversation_chunk_manager",
-		FuncName:   "sync_conversation_chunks_to_db",
-		SQSQueue:   "p1-fast-l1",
-	}, IdempotencyContext{})
-	if err == nil {
-		t.Fatal("expected the 503 to surface")
-	}
-	if len(paths) != 1 {
-		t.Fatalf("paths = %v, want one attempt", paths)
 	}
 	if len(*events) != 1 {
 		t.Fatalf("captured %d events, want 1", len(*events))
@@ -526,7 +493,53 @@ func TestAPIClientFallbackPermanentStatusIsNotRetried(t *testing.T) {
 		t.Fatalf("captured %d events, want exactly 1", len(*events))
 	}
 	ev := (*events)[0]
-	if ev.Details["idempotency_key"] != "vago:updateconv:conv-1" || ev.Details["conversation_id"] != "conv-1" {
-		t.Fatalf("report lost its identity: %+v", ev.Details)
+	if ev.Details["idempotency_key"] != "vago:updateconv:conv-1" {
+		t.Fatalf("report lost the key: %+v", ev.Details)
+	}
+	if got := hubTags(t, ev.Hub); got["conversation_id"] != "conv-1" {
+		t.Fatalf("report lost its call identity: %+v", got)
+	}
+}
+
+// The backoff wait is what the fallback budget has to be able to cut:
+// a bare sleep would let the last wait run past the deadline with
+// nothing able to stop it.
+func TestSleepCtxCompletesAndCancels(t *testing.T) {
+	if !sleepCtx(context.Background(), time.Millisecond) {
+		t.Fatal("a wait that fits should complete")
+	}
+
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepCtx(done, time.Hour) {
+		t.Fatal("an expired budget must cut the wait")
+	}
+
+	mid, cancelMid := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		cancelMid()
+	}()
+	start := time.Now()
+	if sleepCtx(mid, time.Hour) {
+		t.Fatal("a budget expiring mid-wait must cut it")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s after cancellation; the wait is not selecting on the budget", elapsed)
+	}
+}
+
+// The budget has to cover the whole plan, or it would silently drop the
+// retries it is supposed to be bounding.
+func TestFallbackBudgetCoversEveryAttempt(t *testing.T) {
+	want := time.Duration(len(apiFallbackRetryDelays)+1) * defaultAPITimeout
+	for _, delay := range apiFallbackRetryDelays {
+		want += delay
+	}
+	if got := fallbackBudget(); got != want {
+		t.Fatalf("fallbackBudget() = %s, want %s", got, want)
+	}
+	if fallbackBudget() <= defaultAPITimeout {
+		t.Fatal("budget must leave room for more than one attempt")
 	}
 }
