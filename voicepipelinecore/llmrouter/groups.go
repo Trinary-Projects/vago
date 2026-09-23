@@ -104,7 +104,7 @@ const (
 )
 
 // GroupGPT56LunaNonReasoning mirrors Disha's
-// LLMFailoverConfigName.gpt_5_6_luna_non_reasoning target set. It is exported
+// LLMFailoverConfigName.gpt_5_6_luna_non_reasoning target set (OpenAI-first). It is exported
 // for the Responses WebSocket client; the Chat-Completions-only New
 // constructor intentionally rejects it while NewClient dispatches it.
 const GroupGPT56LunaNonReasoning = "gpt-5.6-luna-non-reasoning"
@@ -388,15 +388,17 @@ var hedgedPairs = map[string]hedgedPair{
 // modelGroups: modelGroups is health-ranked from Python poller Redis keys,
 // while Disha's Luna configuration is an ordered LLMFailoverService list and
 // is not registered with that poller. ResponsesWebSocketClient retains this
-// Azure-first order for connection attempts.
+// order for connection attempts. Direct OpenAI leads (deliberate delta from
+// Disha's Azure-first list, 2026-09-23) because Azure Luna tail latency was
+// tripping the 4s event deadline; Azure regions remain ordered failover.
 var responsesWebSocketGroups = map[string]modelGroup{
 	GroupGPT56LunaNonReasoning: {
 		Configs: []string{
+			"openai_gpt_5_6_luna_non_reasoning",
 			"azure_gpt_5_6_luna_non_reasoning_eastus",
 			"azure_gpt_5_6_luna_non_reasoning_eastus2",
 			"azure_gpt_5_6_luna_non_reasoning_westus",
 			"azure_gpt_5_6_luna_non_reasoning_northcentralus",
-			"openai_gpt_5_6_luna_non_reasoning",
 		},
 		Fallback: "openai_gpt_5_6_luna_non_reasoning",
 	},

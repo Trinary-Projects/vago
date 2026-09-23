@@ -124,11 +124,11 @@ func TestGPT56LunaNonReasoningGroupMirrorsDishaTargets(t *testing.T) {
 		t.Fatalf("group name = %q, want dashed model-group convention", GroupGPT56LunaNonReasoning)
 	}
 	want := []string{
+		"openai_gpt_5_6_luna_non_reasoning",
 		"azure_gpt_5_6_luna_non_reasoning_eastus",
 		"azure_gpt_5_6_luna_non_reasoning_eastus2",
 		"azure_gpt_5_6_luna_non_reasoning_westus",
 		"azure_gpt_5_6_luna_non_reasoning_northcentralus",
-		"openai_gpt_5_6_luna_non_reasoning",
 	}
 	group, ok := responsesWebSocketGroups[GroupGPT56LunaNonReasoning]
 	if !ok {
