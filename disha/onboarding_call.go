@@ -216,8 +216,9 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		config:      config,
 		patientInfo: startup.Data.Conversation.PatientInfo,
 		profileVars: map[string]any{
-			"gender":           startup.Data.UserProfile.Gender,
-			"ed_pe_rx_variant": derefString(startup.Data.UserProfile.EDPeRXVariant),
+			"gender":             startup.Data.UserProfile.Gender,
+			"ed_pe_rx_variant":   derefString(startup.Data.UserProfile.EDPeRXVariant),
+			"patient_first_name": derefString(startup.Data.UserProfile.PatientFirstName),
 		},
 	}
 	compiled, err := compiler.CompileSystemPrompt(ctx, stage, state.VariableStoreSnapshot())

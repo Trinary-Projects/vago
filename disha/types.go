@@ -37,6 +37,7 @@ type UserProfileData struct {
 	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
 	OnboardingCallVariant             *string        `json:"onboarding_call_variant"`
 	EDPeRXVariant                     *string        `json:"ed_pe_rx_variant"`
+	PatientFirstName                  *string        `json:"patient_first_name"`
 	ActiveChatContext                 *string        `json:"active_chat_context"`
 	Recent1HrTranscript               *string        `json:"recent_1hr_transcript"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
