@@ -340,3 +340,9 @@ func countFrames[T Frame](frames []Frame) int {
 	}
 	return count
 }
+
+// Word frames delivered after output retain ordinary data priority.
+func playedWordsFrame(words []string) WordTimestampFrame {
+	f := NewWordTimestampFrame(words)
+	return f
+}

@@ -72,13 +72,11 @@ func TestErrorFrame_Construction(t *testing.T) {
 	}
 }
 
-func TestPostPlaybackFramesUseSystemPriority(t *testing.T) {
+func TestBotSpeakingFramesUseSystemPriority(t *testing.T) {
 	frames := []struct {
 		name  string
 		frame Frame
 	}{
-		{name: "WordTimestampFrame", frame: NewWordTimestampFrame([]string{"hi"})},
-		{name: "TTSDoneFrame", frame: NewTTSDoneFrame()},
 		{name: "BotStartedSpeakingFrame", frame: NewBotStartedSpeakingFrame()},
 		{name: "BotStoppedSpeakingFrame", frame: NewBotStoppedSpeakingFrame()},
 	}
@@ -89,6 +87,14 @@ func TestPostPlaybackFramesUseSystemPriority(t *testing.T) {
 		}
 		if tc.frame.IsInterruptible() {
 			t.Errorf("%s should survive interrupt purges", tc.name)
+		}
+	}
+}
+
+func TestSpeechTextAndBoundariesUseOrdinaryQueue(t *testing.T) {
+	for _, frame := range []Frame{NewWordTimestampFrame([]string{"hello"}), NewTTSDoneFrame(), NewTTSStartedFrame("tts-1"), NewLLMResponseEndFrame(), NewLLMAssistantPushAggregationFrame()} {
+		if frame.IsSystem() || !frame.IsInterruptible() {
+			t.Fatalf("%T must use the ordinary interruptible queue", frame)
 		}
 	}
 }

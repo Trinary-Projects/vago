@@ -212,7 +212,7 @@ func TestAssistantTurnCommittedHandlerUnsetIsNoOp(t *testing.T) {
 
 	// No SetAssistantTurnCommittedHandler call: the chunk is still written
 	// and nothing panics.
-	callbacks.OnAssistantTurnCommitted("hello", time.Now(), voicepipelinecore.TurnMetrics{}, "")
+	callbacks.OnAssistantTurnCommitted("hello", time.Now(), voicepipelinecore.TurnMetrics{}, "", voicepipelinecore.AssistantTurnCompletion{})
 
 	items, err := redisServer.List(conversationChunksKey(stageTestUserID, stageTestConversationID))
 	if err != nil {

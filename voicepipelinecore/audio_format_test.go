@@ -35,8 +35,8 @@ func TestTTSUsesRoomOutputSampleRateForFrames(t *testing.T) {
 		input[i] = byte(i % 251)
 	}
 
-	p.pcmBuffer = append([]byte(nil), input...)
-	frame := p.nextPCMFrame()
+	c := &ttsContext{pcmBuffer: append([]byte(nil), input...)}
+	frame := c.nextPCMFrame(p.frameBytes())
 
 	if len(frame) != wantFrameBytes {
 		t.Fatalf("expected %d-byte PCM frame, got %d", wantFrameBytes, len(frame))
@@ -44,7 +44,7 @@ func TestTTSUsesRoomOutputSampleRateForFrames(t *testing.T) {
 	if !bytes.Equal(frame, input[:wantFrameBytes]) {
 		t.Fatal("PCM frame bytes were modified")
 	}
-	if !bytes.Equal(p.pcmBuffer, input[wantFrameBytes:]) {
+	if !bytes.Equal(c.pcmBuffer, input[wantFrameBytes:]) {
 		t.Fatal("PCM buffer was not advanced by exactly one frame")
 	}
 }

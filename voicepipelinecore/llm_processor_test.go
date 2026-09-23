@@ -192,11 +192,11 @@ func TestLLM_InterruptBeforeFirstTokenEmitsLatencyShape(t *testing.T) {
 	}
 }
 
-// TestLLM_EndFrameCancelsInFlight verifies EndFrame cancels the
-// in-flight LLM request via the stored cancel func.
-func TestLLM_EndFrameCancelsInFlight(t *testing.T) {
+// EndFrame follows the in-flight generation on the ordinary processor queue.
+func TestLLM_EndFrameWaitsForGeneration(t *testing.T) {
 	blockUntil := make(chan struct{})
-	defer close(blockUntil)
+	var release sync.Once
+	defer release.Do(func() { close(blockUntil) })
 
 	fix := newTestFixture(t)
 	p := NewLLMProcessorWithClient(fix.TaskCtx, &stubLLMClient{
@@ -234,9 +234,17 @@ func TestLLM_EndFrameCancelsInFlight(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// EndFrame should cancel the in-flight request.
+	// A graceful EndFrame must wait; interruption/Stop provide cancellation.
 	source.QueueFrame(EndFrame{Reason: "test"}, Downstream)
 	time.Sleep(50 * time.Millisecond)
+	if countFrames[EndFrame](sink.Captured()) != 0 {
+		t.Fatal("EndFrame overtook generation")
+	}
+	release.Do(func() { close(blockUntil) })
+	awaitSpeechCondition(t, "end after generation", func() bool { return countFrames[EndFrame](sink.Captured()) == 1 })
+	if countFrames[LLMResponseEndFrame](sink.Captured()) != 1 {
+		t.Fatal("generation was cancelled by EndFrame")
+	}
 	stopProcessorsAndWait(t, fix, 3*time.Second, source, p, sink)
 
 	// Verify EndFrame reached the sink.

@@ -402,7 +402,7 @@ func TestBaseProcessor_QueueFrameDirectionRouting(t *testing.T) {
 
 	// Send a data frame and a system frame and verify both are received.
 	pt.QueueFrame(TextFrame{Text: "data"}, Downstream)
-	pt.QueueFrame(InterruptFrame{}, Downstream)
+	pt.QueueFrame(BotStartedSpeakingFrame{}, Downstream)
 
 	// Wait for them to be processed
 	deadline := time.Now().Add(time.Second)
@@ -430,7 +430,7 @@ func TestBaseProcessor_QueueFrameDirectionRouting(t *testing.T) {
 		switch r.frame.(type) {
 		case TextFrame:
 			sawData = true
-		case InterruptFrame:
+		case BotStartedSpeakingFrame:
 			sawSystem = true
 		}
 	}
@@ -506,4 +506,54 @@ func (b *broadcastEmitter) ProcessFrame(ctx context.Context, frame Frame, dir Di
 		b.Broadcast(BotStartedSpeakingFrame{})
 	}
 	b.PushFrame(frame, dir)
+}
+
+type endBlockingProcessor struct {
+	*BaseProcessor
+	started     chan context.Context
+	release     chan struct{}
+	interrupted chan struct{}
+}
+
+func (p *endBlockingProcessor) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
+	switch frame.(type) {
+	case EndFrame:
+		p.started <- ctx
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+		}
+	case InterruptFrame:
+		close(p.interrupted)
+	}
+	p.PushFrame(frame, dir)
+}
+
+func TestBaseProcessorInterruptionPreservesInFlightUninterruptibleFrame(t *testing.T) {
+	fix := newTestFixture(t)
+	p := &endBlockingProcessor{started: make(chan context.Context, 1), release: make(chan struct{}), interrupted: make(chan struct{})}
+	p.BaseProcessor = NewBaseProcessor("end-blocking", p, fix.TaskCtx)
+	sink := newQueueProcessor(fix.TaskCtx, "sink", Downstream)
+	p.Link(sink)
+	sink.Start(fix.RootCtx)
+	p.Start(fix.RootCtx)
+	defer stopProcessorsAndWait(t, fix, time.Second, p, sink)
+	p.QueueFrame(NewEndFrame("graceful"), Downstream)
+	var endCtx context.Context
+	select {
+	case endCtx = <-p.started:
+	case <-time.After(time.Second):
+		t.Fatal("EndFrame did not start")
+	}
+	p.QueueFrame(NewInterruptFrame(), Downstream)
+	select {
+	case <-p.interrupted:
+	case <-time.After(time.Second):
+		t.Fatal("interruption blocked behind EndFrame")
+	}
+	if endCtx.Err() != nil {
+		t.Fatal("in-flight uninterruptible frame was cancelled")
+	}
+	close(p.release)
+	awaitSpeechCondition(t, "EndFrame completes normally", func() bool { return countFrames[EndFrame](sink.Captured()) == 1 })
 }

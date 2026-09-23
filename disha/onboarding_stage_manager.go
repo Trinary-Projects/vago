@@ -99,10 +99,9 @@ func (m *OnboardingStageManager) SetInfrastructure(pair *voicepipelinecore.Conte
 	m.ui = ui
 }
 
-// processTransition mirrors StageManager.process_transition (phase-4
-// scope: no careplan detection, no deep thinking).
-func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStageName, toolCallID, transcript string) {
-	_ = transcript // consumed by the phase-5 careplan/deep-thinking port
+// processTransition mirrors StageManager.process_transition and reports
+// success only after compiling and applying the next stage's prompt.
+func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStageName, toolCallID, transcript string) bool {
 	start := time.Now()
 
 	m.infraMu.Lock()
@@ -113,7 +112,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		// guarantees infrastructure before the pipeline runs, so a call in
 		// that window can only be a test/teardown artifact — no-op safely.
 		m.logf("disha: stage manager transition before infrastructure set; ignoring next_stage=%s", nextStageName)
-		return
+		return false
 	}
 
 	currentName := m.state.CurrentStage().Name
@@ -157,7 +156,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 					},
 				})
 			}
-			return
+			return false
 		}
 		m.state.SetSelectedCarePlan(m.careplan.Activate(ctx, name, detected))
 	}
@@ -178,7 +177,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 				"current_stage":   currentName,
 			},
 		})
-		return
+		return false
 	}
 
 	// Blocking deep thinking for the stage being ENTERED: run and wait
@@ -198,6 +197,9 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	dtBlockingMs := float64(time.Since(dtStart)) / float64(time.Millisecond)
 	m.state.MergeVariables(dtResults)
 
+	if ctx.Err() != nil {
+		return false
+	}
 	m.state.AdvanceStage(nextStage)
 
 	compiled, err := m.compiler.CompileSystemPrompt(ctx, nextStage, m.state.VariableStoreSnapshot())
@@ -220,7 +222,10 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 		})
 		m.sendRTVI(fmt.Sprintf("[ERROR] System prompt update failed for stage %s: %s",
 			nextStageName, runePrefix(err.Error(), 80)))
-		return
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
 	}
 	pair.ReplaceSystemMessage(compiled.Text)
 	if router != nil {
@@ -246,6 +251,7 @@ func (m *OnboardingStageManager) processTransition(ctx context.Context, nextStag
 	// enqueue from a create_task too (fire-and-forget, best-effort).
 	totalMs := float64(time.Since(start)) / float64(time.Millisecond)
 	go m.enqueueStageTransitionTimingLog(currentName, nextStageName, totalMs, dtBlockingMs, isDTBlockingLLMCall)
+	return true
 }
 
 // onNonBlockingDTComplete returns the RunNonBlocking completion callback

@@ -2,20 +2,16 @@ package voicepipelinecore
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
 type UserContextAggregator struct {
 	*BaseProcessor
 	mu                sync.Mutex
 	taskCtx           *TaskContext
-	state             *aggregatorSharedState
+	state             *LLMContext
 	currentTranscript string
 	interimTranscript string
 	interimResponseID int
@@ -24,10 +20,10 @@ type UserContextAggregator struct {
 }
 
 func NewUserContextAggregator(taskCtx *TaskContext, initialMessages []Message, mainAgentSystemPromptLangfuseKey string) *UserContextAggregator {
-	return newUserContextAggregatorWithState(taskCtx, newAggregatorSharedState(taskCtx, initialMessages, mainAgentSystemPromptLangfuseKey))
+	return newUserContextAggregatorWithState(taskCtx, newLLMContext(taskCtx, initialMessages, mainAgentSystemPromptLangfuseKey))
 }
 
-func newUserContextAggregatorWithState(taskCtx *TaskContext, state *aggregatorSharedState) *UserContextAggregator {
+func newUserContextAggregatorWithState(taskCtx *TaskContext, state *LLMContext) *UserContextAggregator {
 	a := &UserContextAggregator{
 		taskCtx: taskCtx,
 		state:   state,
@@ -91,23 +87,7 @@ func (a *UserContextAggregator) updateFinalTranscript(f TranscriptFrame) (string
 	return "", false
 }
 
-func (a *UserContextAggregator) appendMessages(messages []Message) {
-	added := messagesFromInitial(messages)
-	if len(added) == 0 {
-		return
-	}
-	a.state.mu.Lock()
-	a.state.messages = append(a.state.messages, added...)
-	a.state.mu.Unlock()
-}
-
-func (a *UserContextAggregator) snapshotMessages() []Message {
-	a.state.mu.Lock()
-	defer a.state.mu.Unlock()
-	return cloneMessages(a.state.messages)
-}
-
-func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Message, promptKey string, concatenated string) {
+func (a *UserContextAggregator) recordUserMessage(text string) (promptKey string, concatenated string) {
 	a.state.mu.Lock()
 	defer a.state.mu.Unlock()
 
@@ -119,13 +99,12 @@ func (a *UserContextAggregator) recordUserMessage(text string) (snapshot []Messa
 		a.state.messages = append(a.state.messages, Message{Role: "user", Content: text})
 	}
 	promptKey = a.state.mainAgentSystemPromptLangfuseKey
-	snapshot = cloneMessages(a.state.messages)
-	return snapshot, promptKey, concatenated
+	return promptKey, concatenated
 }
 
 func (a *UserContextAggregator) addUserMessage(text string) {
 	at := time.Now()
-	_, promptKey, concatenated := a.recordUserMessage(text)
+	promptKey, concatenated := a.recordUserMessage(text)
 	committed := text
 	if concatenated != "" {
 		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
@@ -137,91 +116,13 @@ func (a *UserContextAggregator) addUserMessage(text string) {
 	}
 }
 
-func toolCallFromFunctionFrame(functionName, toolCallID string, arguments map[string]any, rawArguments string) ToolCall {
-	rawArgs := rawArguments
-	if rawArgs == "" {
-		rawArgs = "{}"
-		if len(arguments) > 0 {
-			if encoded, err := json.Marshal(arguments); err == nil {
-				rawArgs = string(encoded)
-			}
-		}
-	}
-	return ToolCall{
-		ID:   toolCallID,
-		Type: "function",
-		Function: ToolCallFunction{
-			Name:      functionName,
-			Arguments: rawArgs,
-		},
-	}
-}
-
-func assistantToolCallMessageFromFrame(functionName, toolCallID string, arguments map[string]any, rawArguments string) Message {
-	toolCall := toolCallFromFunctionFrame(functionName, toolCallID, arguments, rawArguments)
-	return Message{
-		Role:      "assistant",
-		ToolCalls: []ToolCall{toolCall},
-	}
-}
-
-func (a *UserContextAggregator) addFunctionCallInProgress(f FunctionCallInProgressFrame) {
-	assistantToolCall := assistantToolCallMessageFromFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments)
-	toolMessage := Message{
-		Role:       "tool",
-		Content:    "IN_PROGRESS",
-		ToolCallID: f.ToolCallID,
-	}
-	a.state.mu.Lock()
-	a.state.messages = append(a.state.messages, assistantToolCall, toolMessage)
-	a.state.mu.Unlock()
-}
-
-func (a *UserContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (Message, Message) {
-	result := strings.TrimSpace(f.Result)
-	if result == "" {
-		err := errors.New("empty tool result")
-		a.PushError("empty tool result", false)
-		sentryutil.Capture(sentryutil.Event{
-			Hub: a.taskCtx.SentryHub(),
-			Err: err,
-			Tags: map[string]string{
-				"component": "user_context_aggregator",
-				"operation": "tool_result",
-			},
-			Details: map[string]any{
-				"function_name": f.FunctionName,
-				"tool_call_id":  f.ToolCallID,
-			},
-		})
-		result = toolErrorResultString(err.Error())
-	}
-	assistantToolCall := assistantToolCallMessageFromFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments)
-	toolResult := Message{
-		Role:       "tool",
-		Content:    result,
-		ToolCallID: f.ToolCallID,
-	}
-	a.state.mu.Lock()
-	defer a.state.mu.Unlock()
-	for i := len(a.state.messages) - 1; i >= 0; i-- {
-		msg := &a.state.messages[i]
-		if msg.Role == "tool" && msg.ToolCallID == f.ToolCallID {
-			msg.Content = result
-			return assistantToolCall, toolResult
-		}
-	}
-	a.state.messages = append(a.state.messages, toolResult)
-	return assistantToolCall, toolResult
-}
-
 func (a *UserContextAggregator) submitUserMessage(text string) {
 	a.taskCtx.Logger.Printf("Final transcript received: %s\n", text)
 	if a.taskCtx.callEvents != nil {
 		a.taskCtx.callEvents.fireUserFirstSpeech(time.Now())
 	}
 	at := time.Now()
-	messages, promptKey, concatenated := a.recordUserMessage(text)
+	promptKey, concatenated := a.recordUserMessage(text)
 	committed := text
 	if concatenated != "" {
 		a.taskCtx.Logger.Printf("Concatenated user message: %s\n", concatenated)
@@ -234,7 +135,7 @@ func (a *UserContextAggregator) submitUserMessage(text string) {
 	a.interruptSent = false
 	a.resetInterimTranscript()
 	a.resetFinalTranscript()
-	a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
+	a.PushFrame(NewLLMContextFrame(a.state), Downstream)
 }
 
 func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, dir Direction) {
@@ -252,30 +153,11 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 		// context (system prompt + "hello?" for a fresh call, or prior
 		// chunks + resume note). Consumed here, not forwarded.
 		if len(f.Messages) > 0 {
-			a.appendMessages(f.Messages)
+			a.state.AddMessages(f.Messages)
 		}
 		if f.RunLLM {
-			messages := a.snapshotMessages()
-			if len(messages) == 0 {
-				a.taskCtx.Logger.Println("LLMMessagesAppend run skipped: empty context")
-				return
-			}
 			a.taskCtx.Logger.Println("Running LLM turn from appended context (greet-first / injected)")
-			a.PushFrame(NewLLMMessagesFrame(messages), Downstream)
-		}
-	case FunctionCallInProgressFrame:
-		a.taskCtx.Logger.Printf("Function call in progress: %s tool_call_id=%s\n", f.FunctionName, f.ToolCallID)
-		a.addFunctionCallInProgress(f)
-		a.PushFrame(f, Upstream)
-	case FunctionCallResultFrame:
-		a.taskCtx.Logger.Printf("Function call result: %s tool_call_id=%s run_llm=%v\n", f.FunctionName, f.ToolCallID, f.RunLLM)
-		assistantToolCall, toolResult := a.applyFunctionCallResult(f)
-		if a.taskCtx.callEvents != nil {
-			a.taskCtx.callEvents.fireToolResultCommitted(assistantToolCall, toolResult, time.Now())
-		}
-		a.PushFrame(f, Upstream)
-		if f.RunLLM {
-			a.PushFrame(NewLLMMessagesFrame(a.snapshotMessages()), Downstream)
+			a.PushFrame(NewLLMContextFrame(a.state), Downstream)
 		}
 	case TranscriptFrame:
 		interimTranscript := a.updateInterimTranscript(f)
@@ -290,7 +172,7 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 				// on_user_turn_started as soon as the (bot-speaking) 3-word
 				// threshold is crossed (base_pipeline_manager.py:425-431).
 				a.taskCtx.UIEvents.ServerMessage("User turn started", time.Now())
-				a.PushFrame(NewInterruptFrame(), Downstream)
+				a.Broadcast(NewInterruptFrame())
 				a.interruptSent = true
 				a.botSpeaking = false
 			}
@@ -310,6 +192,7 @@ func (a *UserContextAggregator) ProcessFrame(ctx context.Context, frame Frame, d
 						// above) — this is Go's equivalent of Pipecat's
 						// min_words=1-when-bot-silent threshold crossing.
 						a.taskCtx.UIEvents.ServerMessage("User turn started", time.Now())
+						a.Broadcast(NewInterruptFrame())
 					}
 					a.submitUserMessage(text)
 				}

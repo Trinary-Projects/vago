@@ -92,16 +92,35 @@ type CallEvents struct {
 	OnBotFirstSpeech         func(time.Time)
 	OnFirstUserAudio         func(time.Time)
 	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
-	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string)
+	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string, turn AssistantTurnCompletion)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the
 	// generated response text (not the played text) and whether the call
-	// was cut short (barge-in/EndFrame cancellation or a stream error).
+	// was cut short (interruption/Stop or a stream error without text).
 	// Mirrors Python CustomOpenAILLMService's on_llm_call_complete event
 	// (is_interrupted = not completed); the onboarding stage-transition
 	// tracker consumes it.
-	OnLLMCallCompleted func(text string, interrupted bool)
+	OnLLMCallCompleted func(LLMCallCompletion)
 	OnCallEnded        func(reason EndReason, stats CallStats)
+}
+
+// LLMCallCompletion reports generated text to application integrations.
+type LLMCallCompletion struct {
+	Text         string
+	Interrupted  bool
+	HasToolCalls bool
+}
+
+type AssistantTurnEndReason string
+
+const (
+	AssistantTurnPlaybackCompleted AssistantTurnEndReason = "playback_completed"
+	AssistantTurnInterrupted       AssistantTurnEndReason = "interrupted"
+	AssistantTurnEnding            AssistantTurnEndReason = "ending"
+)
+
+type AssistantTurnCompletion struct {
+	Reason AssistantTurnEndReason
 }
 
 // TurnMetrics is a per-assistant-turn snapshot assembled from the

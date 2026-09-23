@@ -42,13 +42,13 @@ type CallEventCallbacks struct {
 	// OnboardingPipelineManager.on_llm_call_complete delegating to the
 	// stage-transition tracker). Nil for bots without a stage tracker;
 	// OnLLMCallCompleted then no-ops.
-	llmCallCompleted func(text string, interrupted bool)
+	llmCallCompleted func(voicepipelinecore.LLMCallCompletion)
 
 	// assistantTurnCommitted receives each committed assistant turn
 	// (Python's OnboardingPipelineManager.on_assistant_turn_stopped
 	// delegating to the stage-threshold monitor). Nil for bots without a
 	// stage machine; OnAssistantTurnCommitted then only persists the chunk.
-	assistantTurnCommitted func(text string, at time.Time)
+	assistantTurnCommitted func(text string, at time.Time, turn voicepipelinecore.AssistantTurnCompletion)
 
 	// chunkDecorator lets bot-specific code enrich a chunk immediately
 	// before it is written to Redis (e.g. onboarding calls attach the
@@ -105,7 +105,7 @@ func (c *CallEventCallbacks) SetPostCallDecorator(fn func(*PostCallOperationsReq
 
 // SetLLMCallCompletedHandler wires the onboarding stage tracker's
 // LLM-completion hook; other bots leave it unset.
-func (c *CallEventCallbacks) SetLLMCallCompletedHandler(fn func(text string, interrupted bool)) {
+func (c *CallEventCallbacks) SetLLMCallCompletedHandler(fn func(voicepipelinecore.LLMCallCompletion)) {
 	if c == nil {
 		return
 	}
@@ -114,18 +114,18 @@ func (c *CallEventCallbacks) SetLLMCallCompletedHandler(fn func(text string, int
 
 // OnLLMCallCompleted delegates a finished LLM generation to the
 // registered handler (the onboarding stage tracker); no-op when unset.
-func (c *CallEventCallbacks) OnLLMCallCompleted(text string, interrupted bool) {
+func (c *CallEventCallbacks) OnLLMCallCompleted(completion voicepipelinecore.LLMCallCompletion) {
 	if c.llmCallCompleted == nil {
 		return
 	}
-	c.llmCallCompleted(text, interrupted)
+	c.llmCallCompleted(completion)
 }
 
 // SetAssistantTurnCommittedHandler wires bot-specific work that must run
 // after a committed assistant turn is persisted; other bots leave it unset.
 // Example: onboarding calls use this to advance the per-stage turn count
 // for stuck-stage alerting.
-func (c *CallEventCallbacks) SetAssistantTurnCommittedHandler(fn func(text string, at time.Time)) {
+func (c *CallEventCallbacks) SetAssistantTurnCommittedHandler(fn func(text string, at time.Time, turn voicepipelinecore.AssistantTurnCompletion)) {
 	if c == nil {
 		return
 	}
@@ -176,10 +176,12 @@ func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, prom
 	c.appendConversationChunk(text, "user", at, voicepipelinecore.TurnMetrics{}, promptKey)
 }
 
-func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string) {
-	c.appendConversationChunk(text, "assistant", at, metrics, promptKey)
+func (c *CallEventCallbacks) OnAssistantTurnCommitted(text string, at time.Time, metrics voicepipelinecore.TurnMetrics, promptKey string, turn voicepipelinecore.AssistantTurnCompletion) {
+	if text != "" {
+		c.appendConversationChunk(text, "assistant", at, metrics, promptKey)
+	}
 	if c.assistantTurnCommitted != nil {
-		c.assistantTurnCommitted(text, at)
+		c.assistantTurnCommitted(text, at, turn)
 	}
 }
 

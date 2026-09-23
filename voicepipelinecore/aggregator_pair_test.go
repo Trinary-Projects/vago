@@ -3,6 +3,7 @@ package voicepipelinecore
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplaceSystemMessageSwapsContent(t *testing.T) {
@@ -46,20 +47,12 @@ func TestReplaceSystemMessageInsertsWhenNoSystemMessage(t *testing.T) {
 
 // The stage tracker replaces the system message from a background
 // goroutine while the user aggregator is running LLM turns. This drives
-// real transcript → LLMMessagesFrame traffic through the aggregator
+// real transcript → LLMContextFrame traffic through the aggregator
 // while hammering ReplaceSystemMessage; the race detector fails the
 // build if the shared-state lock does not cover both sides.
 func TestReplaceSystemMessageConcurrentWithLLMRuns(t *testing.T) {
 	fix := newTestFixture(t)
 	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
-
-	frames := make([]Frame, 0, 40)
-	for i := 0; i < 20; i++ {
-		frames = append(frames,
-			TranscriptFrame{Text: "hello", IsFinal: true},
-			TranscriptFrame{Text: "<end>", IsFinal: true},
-		)
-	}
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -77,16 +70,12 @@ func TestReplaceSystemMessageConcurrentWithLLMRuns(t *testing.T) {
 		}
 	}()
 
-	down, _ := runProcessorTest(t, fix, runConfig{
-		processor:    pair.User(),
-		framesToSend: frames,
-		sendEndFrame: true,
-	})
+	down := runContextOnlyTurns(t, fix, pair)
 	close(stop)
 	wg.Wait()
 
-	if _, ok := findFrame[LLMMessagesFrame](down); !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+	if _, ok := findFrame[LLMContextFrame](down); !ok {
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
 	messages := pair.User().messagesForTest()
 	if messages[0].Role != "system" || messages[0].Content != "prompt revision" {
@@ -153,14 +142,6 @@ func TestMessagesSnapshotConcurrentWithReplaceSystemMessage(t *testing.T) {
 	fix := newTestFixture(t)
 	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
 
-	frames := make([]Frame, 0, 40)
-	for i := 0; i < 20; i++ {
-		frames = append(frames,
-			TranscriptFrame{Text: "hello", IsFinal: true},
-			TranscriptFrame{Text: "<end>", IsFinal: true},
-		)
-	}
-
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -192,19 +173,32 @@ func TestMessagesSnapshotConcurrentWithReplaceSystemMessage(t *testing.T) {
 		}
 	}()
 
-	down, _ := runProcessorTest(t, fix, runConfig{
-		processor:    pair.User(),
-		framesToSend: frames,
-		sendEndFrame: true,
-	})
+	down := runContextOnlyTurns(t, fix, pair)
 	close(stop)
 	wg.Wait()
 
-	if _, ok := findFrame[LLMMessagesFrame](down); !ok {
-		t.Fatalf("expected LLMMessagesFrame, got %s", describeFrameTypes(down))
+	if _, ok := findFrame[LLMContextFrame](down); !ok {
+		t.Fatalf("expected LLMContextFrame, got %s", describeFrameTypes(down))
 	}
 	messages := pair.MessagesSnapshot()
 	if messages[0].Role != "system" || messages[0].Content != "prompt revision" {
 		t.Fatalf("messages[0] = %+v, want final replaced prompt", messages[0])
 	}
+}
+
+func runContextOnlyTurns(t *testing.T, fix *testFixture, pair *ContextAggregatorPair) []Frame {
+	t.Helper()
+	sink := newQueueProcessor(fix.TaskCtx, "requests", Downstream)
+	pair.User().Link(sink)
+	sink.Start(fix.RootCtx)
+	for i := 0; i < 20; i++ {
+		pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "hello", IsFinal: true}, Downstream)
+		pair.User().ProcessFrame(fix.RootCtx, TranscriptFrame{Text: "<end>", IsFinal: true}, Downstream)
+	}
+	deadline := time.Now().Add(time.Second)
+	for countFrames[LLMContextFrame](sink.Captured()) < 20 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	stopProcessorsAndWait(t, fix, time.Second, sink)
+	return sink.Captured()
 }

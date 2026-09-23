@@ -373,8 +373,10 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	// delegating) so the mapping below stays the plain Events() used by
 	// sales/follow-up.
 	pl.Callbacks.SetLLMCallCompletedHandler(stageTracker.OnLLMCallCompleted)
-	pl.Callbacks.SetAssistantTurnCommittedHandler(func(string, time.Time) {
-		thresholdMonitor.OnAssistantTurnCommitted()
+	pl.Callbacks.SetAssistantTurnCommittedHandler(func(text string, _ time.Time, _ voicepipelinecore.AssistantTurnCompletion) {
+		if text != "" {
+			thresholdMonitor.OnAssistantTurnCommitted()
+		}
 	})
 
 	task, err := voicepipelinecore.NewPipelineTask(ctx, voicepipelinecore.TaskConfig{
@@ -480,7 +482,7 @@ func onboardingEndCallTool() voicepipelinecore.ToolDefinition {
 		Type: "function",
 		Function: voicepipelinecore.ToolFunction{
 			Name:        endCallToolName,
-			Description: "End the call when the onboarding consultation is complete or the patient asks to end the call.",
+			Description: "Used to disconnect the call. It should be called only after goodbyes have been exchanged.",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
