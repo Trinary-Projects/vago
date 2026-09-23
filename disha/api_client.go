@@ -22,21 +22,12 @@ const (
 
 	enqueueJobPath = "/common/enqueue_job"
 
-	// fallbackJobModule holds the module-level Python equivalents of the
-	// four bot routes; fallbackJobQueue is the same queue Disha's own
-	// callers use for them.
 	fallbackJobModule = "bots.operations.voice_bot_operations"
 	fallbackJobQueue  = "p0-fast-l1"
 
-	// idempotencyHeader carries the envelope key on the direct HTTP
-	// routes. The job path carries the same key inside
-	// EnqueueJobRequest instead, so disha-backend can honour one notion
-	// of "already did this" from either direction.
 	idempotencyHeader = "Idempotency-Key"
 )
 
-// Operation names. These become the Sentry `operation` tag, so they are
-// what separates one actionable issue from another — keep them stable.
 const (
 	opUpdateConversation    = "update_conversation"
 	opRunPostCallOperations = "run_post_call_operations"
@@ -44,17 +35,8 @@ const (
 	opAddTagToUser          = "add_tag_to_user"
 )
 
-// apiFallbackRetryDelays caps the wait before each fallback retry, so
-// the fallback makes len+1 attempts in total. Exponential full jitter,
-// mirroring the S3 uploader's policy. A package var so tests can
-// shorten it.
 var apiFallbackRetryDelays = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}
 
-// jobFallbackFunc maps an operation to the module-level Python function
-// that performs the same work off SQS. An operation absent from this map
-// has no fallback and its route error is already final — notably
-// anything that is itself an enqueue_job, where queueing again would
-// just repeat the call that has already failed.
 var jobFallbackFunc = map[string]string{
 	opUpdateConversation:    "update_conversation",
 	opRunPostCallOperations: "run_post_call_operations",
@@ -62,14 +44,6 @@ var jobFallbackFunc = map[string]string{
 	opAddTagToUser:          "add_tag_to_user",
 }
 
-// IdempotencyContext is the per-operation metadata a caller supplies:
-// the deterministic key that lets disha-backend recognise a replay, and
-// the call identity to tag a failure report with.
-//
-// The key travels on both delivery hops — the route's Idempotency-Key
-// header and the fallback job's envelope — so a backend that honours it
-// cannot run the same operation twice when vago falls back after a
-// request whose response was lost rather than whose work never ran.
 type IdempotencyContext struct {
 	IdempotencyKey string
 	SentryTags     map[string]string
