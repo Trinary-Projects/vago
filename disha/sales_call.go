@@ -141,7 +141,7 @@ func (b SalesCallBot) BuildTask(ctx context.Context, req BotTaskRequest, deps De
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
 	task.AttachSource(source)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
-	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
+	stt := newSTTProcessor(taskCtx, pl.Startup.Data.UserProfile.CartesiaCallSTTVariantFlag, taskCtx.Logger)
 
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {

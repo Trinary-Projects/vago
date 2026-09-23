@@ -398,7 +398,7 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
 	task.AttachSource(source)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
-	stt := voicepipelinecore.NewSTTProcessor(taskCtx)
+	stt := newSTTProcessor(taskCtx, pl.Startup.Data.UserProfile.CartesiaCallSTTVariantFlag, taskCtx.Logger)
 
 	// Onboarding ends the call when the participant leaves, like
 	// sales/follow-up — a deliberate delta from Python's rejoin-tolerant

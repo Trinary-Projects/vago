@@ -7,5 +7,6 @@ package voicepipelinecore
 // before the cap is reached.
 func init() {
 	sttDialURL = "ws://127.0.0.1:1/test-no-soniox"
+	cartesiaSTTDialURL = "ws://127.0.0.1:1/test-no-cartesia-stt"
 	ttsDialURL = "ws://127.0.0.1:1/test-no-cartesia?key="
 }
