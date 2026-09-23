@@ -186,9 +186,11 @@ func TestAPIClientFailureQueuesFallbackJob(t *testing.T) {
 	}
 }
 
-// Both hops failing is the ultimate failure, and reports exactly once.
+// Both hops failing is the ultimate failure, and reports exactly once —
+// after the fallback has exhausted its retries, not on the first one.
 func TestAPIClientQueuedFallbackFailureReportsOnce(t *testing.T) {
 	resetSentryRateLimiter(t)
+	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -204,8 +206,14 @@ func TestAPIClientQueuedFallbackFailureReportsOnce(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the loss to surface once both hops failed")
 	}
-	if len(paths) != 2 || paths[1] != enqueueJobPath {
-		t.Fatalf("paths = %v, want the route then %s", paths, enqueueJobPath)
+	wantPaths := 1 + len(apiFallbackRetryDelays) + 1
+	if len(paths) != wantPaths {
+		t.Fatalf("paths = %v, want the route then %d fallback attempts", paths, wantPaths-1)
+	}
+	for _, path := range paths[1:] {
+		if path != enqueueJobPath {
+			t.Fatalf("paths = %v, want every retry on %s", paths, enqueueJobPath)
+		}
 	}
 	if len(*events) != 1 {
 		t.Fatalf("captured %d events for one lost operation, want 1", len(*events))
@@ -433,5 +441,92 @@ func TestNewAPIClientDefaults(t *testing.T) {
 	}
 	if client.httpClient.Timeout != defaultAPITimeout {
 		t.Fatalf("timeout = %s, want %s", client.httpClient.Timeout, defaultAPITimeout)
+	}
+}
+
+// shortenFallbackRetries keeps the retry shape but removes the wall
+// time, so tests exercise the loop without sleeping for it.
+func shortenFallbackRetries(t *testing.T) {
+	t.Helper()
+	original := apiFallbackRetryDelays
+	apiFallbackRetryDelays = []time.Duration{0, 0}
+	t.Cleanup(func() { apiFallbackRetryDelays = original })
+}
+
+// A transient failure on the fallback hop is not the ultimate failure:
+// the retry takes the work, so nothing is lost and nothing is reported.
+func TestAPIClientFallbackRetrySucceeds(t *testing.T) {
+	resetSentryRateLimiter(t)
+	shortenFallbackRetries(t)
+	events := recordSentryEvents(t)
+	var paths []string
+	enqueueAttempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == enqueueJobPath {
+			enqueueAttempts++
+			if enqueueAttempts < 2 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, time.Second, nil)
+	err := client.UpdateConversation(context.Background(),
+		UpdateConversationRequest{ConversationID: "conv-1"},
+		IdempotencyContext{IdempotencyKey: "vago:updateconv:conv-1"})
+	if err != nil {
+		t.Fatalf("a retried fallback must read as delivered, got %v", err)
+	}
+	if enqueueAttempts != 2 {
+		t.Fatalf("enqueue attempts = %d, want 2", enqueueAttempts)
+	}
+	if len(*events) != 0 {
+		t.Fatalf("a recovered failure reported %d events, want 0", len(*events))
+	}
+}
+
+// A permanent status on the fallback hop would be rejected identically
+// every time, so it is not retried.
+func TestAPIClientFallbackPermanentStatusIsNotRetried(t *testing.T) {
+	resetSentryRateLimiter(t)
+	shortenFallbackRetries(t)
+	events := recordSentryEvents(t)
+	enqueueAttempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == enqueueJobPath {
+			enqueueAttempts++
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewAPIClient(server.URL, time.Second, nil)
+	err := client.UpdateConversation(context.Background(),
+		UpdateConversationRequest{ConversationID: "conv-1"},
+		IdempotencyContext{
+			IdempotencyKey: "vago:updateconv:conv-1",
+			SentryTags:     map[string]string{"conversation_id": "conv-1"},
+		})
+	if err == nil {
+		t.Fatal("expected the loss to surface")
+	}
+	if enqueueAttempts != 1 {
+		t.Fatalf("enqueue attempts = %d, want 1", enqueueAttempts)
+	}
+	if len(*events) != 1 {
+		t.Fatalf("captured %d events, want exactly 1", len(*events))
+	}
+	ev := (*events)[0]
+	if ev.Details["idempotency_key"] != "vago:updateconv:conv-1" || ev.Details["conversation_id"] != "conv-1" {
+		t.Fatalf("report lost its identity: %+v", ev.Details)
 	}
 }

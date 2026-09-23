@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -43,6 +44,12 @@ const (
 	opAddTagToUser           = "add_tag_to_user"
 	opSyncConversationChunks = "sync_conversation_chunks_to_db"
 )
+
+// apiFallbackRetryDelays caps the wait before each fallback retry, so
+// the fallback makes len+1 attempts in total. Exponential full jitter,
+// mirroring the S3 uploader's policy. A package var so tests can
+// shorten it.
+var apiFallbackRetryDelays = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}
 
 // jobFallbackFunc maps an operation to the module-level Python function
 // that performs the same work off SQS. An operation absent from this map
@@ -169,8 +176,7 @@ func (c *APIClient) enqueueAPIFallback(operation string, body any, ic Idempotenc
 	// so queueing it only moves the failure to the DLQ. Only a response
 	// the backend may yet recover from — or no response at all — is
 	// worth a second hop.
-	var status *APIStatusError
-	if errors.As(cause, &status) && !status.IsServerSide() {
+	if !retryableAPIError(cause) {
 		return cause
 	}
 
@@ -179,20 +185,62 @@ func (c *APIClient) enqueueAPIFallback(operation string, body any, ic Idempotenc
 		return fmt.Errorf("disha: %s API failed (%v) and building fallback kwargs failed: %w", operation, cause, err)
 	}
 
-	// The caller's context is normally already dead here — a timeout is
-	// exactly when this path runs — so the fallback gets its own budget.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultAPITimeout)
-	defer cancel()
-	if err := c.EnqueueJob(ctx, EnqueueJobRequest{
+	job := EnqueueJobRequest{
 		ModuleName:     fallbackJobModule,
 		FuncName:       funcName,
 		Kwargs:         kwargs,
 		SQSQueue:       fallbackJobQueue,
 		IdempotencyKey: ic.IdempotencyKey,
-	}); err != nil {
-		return fmt.Errorf("disha: %s API failed (%v) and fallback enqueue failed: %w", operation, cause, err)
 	}
-	return nil
+
+	// This is the last hop the operation has, so a transient failure here
+	// is worth another try before declaring the work lost. Attempts are
+	// safe to repeat: the envelope carries the idempotency key, so a
+	// request that in fact landed and only lost its response cannot run
+	// the work twice on a backend that honours it.
+	maxAttempts := len(apiFallbackRetryDelays) + 1
+	var enqueueErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// The caller's context is normally already dead here — a timeout
+		// is exactly when this path runs — so each attempt gets its own
+		// budget.
+		ctx, cancel := context.WithTimeout(context.Background(), defaultAPITimeout)
+		enqueueErr = c.EnqueueJob(ctx, job)
+		cancel()
+		if enqueueErr == nil {
+			return nil
+		}
+		if !retryableAPIError(enqueueErr) || attempt == maxAttempts {
+			break
+		}
+		delay := fullJitter(apiFallbackRetryDelays[attempt-1])
+		apiLogf(c.logger, "transient fallback enqueue failure operation=%s attempt=%d/%d retrying_in=%s idempotency_key=%s conversation=%s: %v",
+			operation, attempt, maxAttempts, delay, ic.IdempotencyKey, ic.SentryTags["conversation_id"], enqueueErr)
+		time.Sleep(delay)
+	}
+	return fmt.Errorf("disha: %s API failed (%v) and fallback enqueue failed after %d attempts: %w",
+		operation, cause, maxAttempts, enqueueErr)
+}
+
+// retryableAPIError reports whether another identical attempt could
+// plausibly succeed: a transport failure or timeout (no response at
+// all), or a status the backend may yet recover from. A permanent 4xx
+// would be rejected the same way every time.
+func retryableAPIError(err error) bool {
+	var status *APIStatusError
+	if errors.As(err, &status) {
+		return status.IsServerSide()
+	}
+	return true
+}
+
+// fullJitter picks a delay uniformly in [0, max], matching the S3
+// uploader's backoff so two retrying callers cannot resynchronise.
+func fullJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(max) + 1))
 }
 
 // requestAsMap turns a typed request into the job kwargs. The JSON tags
