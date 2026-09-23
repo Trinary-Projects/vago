@@ -482,7 +482,7 @@ func onboardingEndCallTool() voicepipelinecore.ToolDefinition {
 		Type: "function",
 		Function: voicepipelinecore.ToolFunction{
 			Name:        endCallToolName,
-			Description: "Used to disconnect the call.",
+			Description: "Used to disconnect the call. It should be called only after goodbyes have been exchanged.",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},

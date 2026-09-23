@@ -166,7 +166,7 @@ func sttConfigPayload() map[string]interface{} {
 		"language_hints":                    []string{"hi"},
 		"enable_endpoint_detection":         true,
 		"endpoint_latency_adjustment_level": 0,
-		"endpoint_sensitivity":              0.0,
+		"endpoint_sensitivity":              -0.3,
 		"max_endpoint_delay_ms":             2000,
 	}
 }
