@@ -43,7 +43,7 @@ func captureAPIRequest(t *testing.T, status int) (*httptest.Server, <-chan captu
 			Path:           r.URL.Path,
 			ContentType:    r.Header.Get("Content-Type"),
 			Authorization:  r.Header.Get("Authorization"),
-			IdempotencyKey: r.Header.Get(idempotencyHeader),
+			IdempotencyKey: r.Header.Get("Idempotency-Key"),
 			Body:           body,
 		}
 		w.WriteHeader(status)
@@ -126,7 +126,6 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 // A route failure queues the same work as a job. The caller sees success
 // because the operation is still going to run.
 func TestAPIClientFailureQueuesFallbackJob(t *testing.T) {
-	resetSentryRateLimiter(t)
 	events := recordSentryEvents(t)
 	requests := make(chan capturedAPIRequest, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +184,6 @@ func TestAPIClientFailureQueuesFallbackJob(t *testing.T) {
 // Both hops failing is the ultimate failure, and reports exactly once —
 // after the fallback has exhausted its retries, not on the first one.
 func TestAPIClientQueuedFallbackFailureReportsOnce(t *testing.T) {
-	resetSentryRateLimiter(t)
 	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	var paths []string
@@ -222,7 +220,6 @@ func TestAPIClientQueuedFallbackFailureReportsOnce(t *testing.T) {
 // A permanent 4xx would fail identically in the worker, so it is not
 // worth a second hop — it reports straight away.
 func TestAPIClientPermanentStatusSkipsFallback(t *testing.T) {
-	resetSentryRateLimiter(t)
 	events := recordSentryEvents(t)
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +313,6 @@ func TestAPIClientNon2xxReturnsError(t *testing.T) {
 // cancel. The work is still wanted either way, so the fallback runs on
 // its own budget rather than inheriting the context that just died.
 func TestAPIClientContextCancellationStillQueuesFallback(t *testing.T) {
-	resetSentryRateLimiter(t)
 	events := recordSentryEvents(t)
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -423,7 +419,6 @@ func shortenFallbackRetries(t *testing.T) {
 // A transient failure on the fallback hop is not the ultimate failure:
 // the retry takes the work, so nothing is lost and nothing is reported.
 func TestAPIClientFallbackRetrySucceeds(t *testing.T) {
-	resetSentryRateLimiter(t)
 	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	var paths []string
@@ -462,7 +457,6 @@ func TestAPIClientFallbackRetrySucceeds(t *testing.T) {
 // A permanent status on the fallback hop would be rejected identically
 // every time, so it is not retried.
 func TestAPIClientFallbackPermanentStatusIsNotRetried(t *testing.T) {
-	resetSentryRateLimiter(t)
 	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	enqueueAttempts := 0

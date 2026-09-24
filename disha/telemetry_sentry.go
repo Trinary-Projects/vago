@@ -1,45 +1,15 @@
 package disha
 
 import (
-	"sync"
-	"time"
-
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
-// Telemetry jobs (per-turn LLM logs, Daily metrics, stage analytics) are
-// best-effort by decision: they have no retry, so their first failure is
-// also their last and reporting it is correct. The problem was never
-// correctness but volume — these sites produced the bulk of VAGO-7's
-// 3,936 events, drowning the failures that actually lost call data.
-//
-// A token bucket per job keeps one representative event per minute, so a
-// sustained outage still surfaces without burying everything else.
-const sentryReportWindow = time.Minute
-
-var (
-	sentryReportMu   sync.Mutex
-	sentryReportLast = map[string]time.Time{}
-)
-
-// allowSentryReport reports whether a capture for subject should be
-// emitted now, keeping at most one per subject per window. Used for
-// sites that can fail repeatedly for a single underlying cause — a
-// best-effort job firing on every turn, or an operation that fails the
-// same way on every call for as long as Disha is down.
-func allowSentryReport(subject string, now time.Time) bool {
-	sentryReportMu.Lock()
-	defer sentryReportMu.Unlock()
-	if last, ok := sentryReportLast[subject]; ok && now.Sub(last) < sentryReportWindow {
-		return false
-	}
-	sentryReportLast[subject] = now
-	return true
-}
-
-// reportTelemetryDrop captures at most one event per job per minute.
+// reportTelemetryDrop captures a dropped best-effort telemetry job
+// (per-turn LLM logs, Daily metrics, stage analytics). These have no
+// retry by decision, so their first failure is also their last and
+// reporting it is correct.
 func reportTelemetryDrop(job, conversationID string, cause error) {
-	if cause == nil || !allowSentryReport("job_dropped:"+job, time.Now()) {
+	if cause == nil {
 		return
 	}
 	captureSentry(sentryutil.Event{
@@ -51,7 +21,6 @@ func reportTelemetryDrop(job, conversationID string, cause error) {
 		Details: map[string]any{
 			"job":             job,
 			"conversation_id": conversationID,
-			"note":            "best-effort telemetry job; rate-limited to 1 report per minute per job",
 		},
 	})
 }

@@ -24,8 +24,6 @@ const (
 
 	fallbackJobModule = "bots.operations.voice_bot_operations"
 	fallbackJobQueue  = "p0-fast-l1"
-
-	idempotencyHeader = "Idempotency-Key"
 )
 
 const (
@@ -90,7 +88,7 @@ func (c *APIClient) AddTagToUser(ctx context.Context, req AddTagToUserRequest, i
 // for best-effort telemetry (LLM logs, Daily metrics) where a duplicate
 // is harmless and a loss is acceptable.
 func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error {
-	return c.send(ctx, http.MethodPost, enqueueJobPath, req, "")
+	return c.send(ctx, http.MethodPost, enqueueJobPath, req)
 }
 
 // call sends the operation to its route and, if that fails, queues the
@@ -102,12 +100,12 @@ func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error
 // path is virtually every call: queueing all of them would add four SQS
 // messages per call for the update_conversation lifecycle alone.
 //
-// The deterministic idempotency key travels on both hops — as the
-// Idempotency-Key header on the route, and inside the job envelope — so
-// a backend that honours it runs the work at most once even when the
-// route in fact succeeded and only its response was lost.
+// The route hop carries no idempotency key: it makes exactly one
+// attempt, so there is no replay of it for a key to suppress. The key
+// belongs to the fallback job, which is the only hop that can repeat
+// work the route may already have done.
 func (c *APIClient) call(ctx context.Context, operation, method, path string, body any, ic IdempotencyContext) error {
-	err := c.send(ctx, method, path, body, ic.IdempotencyKey)
+	err := c.send(ctx, method, path, body)
 	if err == nil {
 		return nil
 	}
@@ -273,9 +271,6 @@ func requestAsMap(req any) (map[string]any, error) {
 // one per operation per call, which is how VAGO-6 and VAGO-7 became
 // unreadable.
 func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, cause error) {
-	if !allowSentryReport("api_undelivered:"+operation, time.Now()) {
-		return
-	}
 	// The call identity rides the hub as scope tags, so it is searchable;
 	// Details carries only what is not a tag.
 	captureSentry(sentryutil.Event{
@@ -296,7 +291,7 @@ func (c *APIClient) reportUndelivered(operation string, ic IdempotencyContext, c
 // the fallback then recovered from — and collapsed nine unrelated job
 // call sites into a single ungroupable issue. Reporting belongs to
 // whoever runs out of ways to deliver the work.
-func (c *APIClient) send(ctx context.Context, method, path string, body any, idempotencyKey string) error {
+func (c *APIClient) send(ctx context.Context, method, path string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("disha: marshal %s %s request: %w", method, path, err)
@@ -307,9 +302,6 @@ func (c *APIClient) send(ctx context.Context, method, path string, body any, ide
 		return fmt.Errorf("disha: build %s %s request: %w", method, path, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if idempotencyKey != "" {
-		httpReq.Header.Set(idempotencyHeader, idempotencyKey)
-	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

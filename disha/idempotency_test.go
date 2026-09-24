@@ -38,25 +38,10 @@ func hubTags(t *testing.T, hub *sentry.Hub) map[string]string {
 	return hub.Scope().ApplyToEvent(sentry.NewEvent(), nil, nil).Tags
 }
 
-// resetSentryRateLimiter clears the per-subject window so one test's
-// report cannot suppress the next one's.
-func resetSentryRateLimiter(t *testing.T) {
-	t.Helper()
-	sentryReportMu.Lock()
-	sentryReportLast = map[string]time.Time{}
-	sentryReportMu.Unlock()
-	t.Cleanup(func() {
-		sentryReportMu.Lock()
-		sentryReportLast = map[string]time.Time{}
-		sentryReportMu.Unlock()
-	})
-}
-
 // When neither the route nor the fallback job takes the work, that IS
 // the loss and must be reported — with the conversation identity
 // attached. The stub 503s both hops.
 func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
-	resetSentryRateLimiter(t)
 	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -92,11 +77,9 @@ func TestAPIClientReportsUndeliveredOperation(t *testing.T) {
 	}
 }
 
-// A Disha outage takes both hops down together and must not reproduce
-// VAGO-7: one event per operation per minute, however many calls end
-// during it.
-func TestAPIClientRateLimitsUndeliveredReports(t *testing.T) {
-	resetSentryRateLimiter(t)
+// Every lost operation is its own incident: there is no rate limiter,
+// so a Disha outage that takes both hops down reports once per call.
+func TestAPIClientReportsEveryUndeliveredOperation(t *testing.T) {
 	shortenFallbackRetries(t)
 	events := recordSentryEvents(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -109,14 +92,15 @@ func TestAPIClientRateLimitsUndeliveredReports(t *testing.T) {
 		_ = client.RunPostCallOperations(context.Background(),
 			PostCallOperationsRequest{ConversationID: "conv-1"}, IdempotencyContext{})
 	}
-	if len(*events) != 1 {
-		t.Fatalf("captured %d events for one outage, want 1", len(*events))
+	if len(*events) != 20 {
+		t.Fatalf("captured %d events for 20 lost operations, want 20", len(*events))
 	}
 }
 
-// A successful call is silent, and carries the key the backend dedupes on.
-func TestAPIClientSuccessIsSilentAndCarriesTheKey(t *testing.T) {
-	resetSentryRateLimiter(t)
+// A successful call is silent. It also carries no idempotency key: the
+// route is attempted exactly once, so there is no replay to suppress —
+// the key belongs to the fallback job alone.
+func TestAPIClientSuccessIsSilentAndSendsNoKey(t *testing.T) {
 	events := recordSentryEvents(t)
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, time.Second, nil)
@@ -127,8 +111,8 @@ func TestAPIClientSuccessIsSilentAndCarriesTheKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateConversation: %v", err)
 	}
-	if got := <-requests; got.IdempotencyKey != "vago:updateconv:conv-1:bot_joined" {
-		t.Fatalf("Idempotency-Key header = %q", got.IdempotencyKey)
+	if got := <-requests; got.IdempotencyKey != "" {
+		t.Fatalf("Idempotency-Key header = %q, want empty", got.IdempotencyKey)
 	}
 	if len(*events) != 0 {
 		t.Fatalf("a successful call reported %d events, want 0", len(*events))
