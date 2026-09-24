@@ -124,15 +124,20 @@ func TestGPT56LunaNonReasoningGroupMirrorsDishaTargets(t *testing.T) {
 		t.Fatalf("group name = %q, want dashed model-group convention", GroupGPT56LunaNonReasoning)
 	}
 	want := []string{
-		"openai_gpt_5_6_luna_non_reasoning",
 		"azure_gpt_5_6_luna_non_reasoning_eastus",
 		"azure_gpt_5_6_luna_non_reasoning_eastus2",
 		"azure_gpt_5_6_luna_non_reasoning_westus",
 		"azure_gpt_5_6_luna_non_reasoning_northcentralus",
+		"openai_gpt_5_6_luna_non_reasoning",
 	}
-	group, ok := responsesWebSocketGroups[GroupGPT56LunaNonReasoning]
+	// Luna is a health-selected group: the Python poller writes health for
+	// exactly these config keys, so they must match Disha's enum values.
+	group, ok := modelGroups[GroupGPT56LunaNonReasoning]
 	if !ok {
 		t.Fatalf("missing model group %q", GroupGPT56LunaNonReasoning)
+	}
+	if group.FallbackGroup != "" {
+		t.Fatalf("fallback group = %q, want none", group.FallbackGroup)
 	}
 	if !slices.Equal(group.Configs, want) {
 		t.Fatalf("configs = %v, want %v", group.Configs, want)
@@ -148,10 +153,78 @@ func TestGPT56LunaNonReasoningGroupMirrorsDishaTargets(t *testing.T) {
 	}
 }
 
+func TestGPT6LunaNonReasoningGroupMatchesDishaKeys(t *testing.T) {
+	if GroupGPT6LunaNonReasoning != "gpt-6-luna-non-reasoning" {
+		t.Fatalf("group name = %q, want dashed model-group convention", GroupGPT6LunaNonReasoning)
+	}
+	// The Python poller writes health for exactly these config keys, so they
+	// must match Disha's enum values.
+	want := []string{
+		"azure_gpt_6_luna_non_reasoning_eastus",
+		"azure_gpt_6_luna_non_reasoning_eastus2",
+		"azure_gpt_6_luna_non_reasoning_westus",
+		"azure_gpt_6_luna_non_reasoning_northcentralus",
+		"openai_gpt_6_luna_non_reasoning",
+	}
+	group, ok := modelGroups[GroupGPT6LunaNonReasoning]
+	if !ok {
+		t.Fatalf("missing model group %q", GroupGPT6LunaNonReasoning)
+	}
+	if !slices.Equal(group.Configs, want) || group.Fallback != "openai_gpt_6_luna_non_reasoning" || group.FallbackGroup != "" {
+		t.Fatalf("group = %+v, want configs %v with direct OpenAI fallback and no fallback group", group, want)
+	}
+	for _, key := range group.Configs {
+		cfg := endpointConfigs[key]
+		gpt56 := endpointConfigs[strings.Replace(key, "gpt_6", "gpt_5_6", 1)]
+		if cfg.Model != "gpt-6-luna" || cfg.APIMode != apiModeResponsesWebSocket || cfg.ReasoningEffort != "none" {
+			t.Fatalf("config %q = %+v, want GPT-6 Luna Responses WebSocket with reasoning none", key, cfg)
+		}
+		if cfg.Provider != gpt56.Provider || cfg.APIKeyEnv != gpt56.APIKeyEnv || cfg.EndpointEnv != gpt56.EndpointEnv || cfg.BaseURL != gpt56.BaseURL {
+			t.Fatalf("config %q = %+v, want the same resource as GPT-5.6 Luna %+v", key, cfg, gpt56)
+		}
+	}
+	client, err := NewClient(Config{Group: GroupGPT6LunaNonReasoning})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := client.(*ResponsesWebSocketClient); !ok {
+		t.Fatalf("NewClient = %T, want *ResponsesWebSocketClient", client)
+	}
+}
+
 func TestChatRouterRejectsGPT56LunaResponsesWebSocketGroup(t *testing.T) {
 	_, err := New(Config{Group: GroupGPT56LunaNonReasoning, Redis: newFakeRedis()})
 	if err == nil || !strings.Contains(err.Error(), "requires the Responses WebSocket client") {
 		t.Fatalf("New error = %v, want Responses WebSocket client guard", err)
+	}
+	client, err := NewClient(Config{Group: GroupGPT56LunaNonReasoning, Redis: newFakeRedis()})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	responses, ok := client.(*ResponsesWebSocketClient)
+	if !ok {
+		t.Fatalf("NewClient = %T, want *ResponsesWebSocketClient", client)
+	}
+	_ = responses.Close()
+	if _, err := NewResponsesWebSocket(Config{Group: groupGrokSales}); err == nil || !strings.Contains(err.Error(), "does not use Responses WebSocket") {
+		t.Fatalf("NewResponsesWebSocket(chat group) error = %v", err)
+	}
+}
+
+func TestModelGroupsDoNotMixAPIModes(t *testing.T) {
+	for name, group := range modelGroups {
+		for _, key := range group.Configs {
+			cfg, ok := endpointConfigs[key]
+			if !ok {
+				t.Fatalf("group %q references unknown config %q", name, key)
+			}
+			if (cfg.APIMode == apiModeResponsesWebSocket) != groupUsesResponsesWebSocket(group) {
+				t.Fatalf("group %q mixes API modes at %q", name, key)
+			}
+		}
+		if group.Fallback != "" && (endpointConfigs[group.Fallback].APIMode == apiModeResponsesWebSocket) != groupUsesResponsesWebSocket(group) {
+			t.Fatalf("group %q fallback %q uses a different API mode", name, group.Fallback)
+		}
 	}
 }
 

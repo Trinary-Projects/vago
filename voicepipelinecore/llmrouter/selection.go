@@ -51,17 +51,27 @@ func getFastestForGroup(ctx context.Context, store RedisStore, group, region str
 	return selection{}, false
 }
 
-// fastestAvailable reads the health of every config via one MGET, drops
-// blacklisted endpoints and those with no latency data, and returns the
-// key with the lowest selection latency.
+// fastestAvailable returns the key with the lowest selection latency among
+// the available configs (see rankAvailable).
 func fastestAvailable(ctx context.Context, store RedisStore, configs []endpointConfig) (string, bool) {
+	ranked := rankAvailable(ctx, store, configs)
+	if len(ranked) == 0 {
+		return "", false
+	}
+	return ranked[0], true
+}
+
+// rankAvailable reads the health of every config via one MGET, drops
+// blacklisted endpoints and those with no latency data, and returns the
+// remaining keys fastest first. A Redis error yields no ranking.
+func rankAvailable(ctx context.Context, store RedisStore, configs []endpointConfig) []string {
 	keys := make([]string, len(configs))
 	for i, cfg := range configs {
 		keys[i] = healthKey(cfg.Key)
 	}
 	raws, err := store.MGetCache(ctx, keys...)
 	if err != nil || len(raws) != len(configs) {
-		return "", false
+		return nil
 	}
 
 	type candidate struct {
@@ -80,11 +90,12 @@ func fastestAvailable(ctx context.Context, store RedisStore, configs []endpointC
 		}
 		candidates = append(candidates, candidate{key: cfg.Key, latency: latency})
 	}
-	if len(candidates) == 0 {
-		return "", false
-	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].latency < candidates[j].latency
 	})
-	return candidates[0].key, true
+	ranked := make([]string, len(candidates))
+	for i, c := range candidates {
+		ranked[i] = c.key
+	}
+	return ranked
 }

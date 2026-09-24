@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -74,9 +73,9 @@ type Config struct {
 // endpoint selection, OpenAI-format streaming, blacklisting, and
 // re-poll triggering.
 type Router struct {
-	cfg            Config
-	httpClient     *http.Client
-	pollTriggerURL string
+	cfg        Config
+	httpClient *http.Client
+	poll       pollTrigger
 
 	// promptMetadata starts as Config.PromptMetadata and can be replaced
 	// mid-session with SetPromptMetadata (Python updates
@@ -96,9 +95,10 @@ type Client interface {
 	SetPromptMetadata(map[string]any)
 }
 
-// NewClient selects the transport declared by the model group. Existing
-// Chat-Completions groups still build Router; Responses WebSocket groups build
-// the dedicated persistent client. Call-bot constructors use this factory so
+// NewClient selects the transport declared by the model group's endpoints.
+// Chat-Completions groups build Router; groups whose endpoints use the
+// Responses WebSocket API build the dedicated persistent client. Both share
+// the same health selection, blacklist, and poll trigger. Call-bot constructors use this factory so
 // moving a bot to a WebSocket group is a config change rather than a second
 // wiring path.
 func NewClient(cfg Config) (Client, error) {
@@ -113,8 +113,8 @@ func configUsesResponsesWebSocket(cfg Config) bool {
 		endpoint, ok := endpointConfigs[cfg.FixedEndpoint]
 		return ok && endpoint.APIMode == apiModeResponsesWebSocket
 	}
-	_, ok := responsesWebSocketGroups[cfg.Group]
-	return ok
+	group, ok := modelGroups[cfg.Group]
+	return ok && groupUsesResponsesWebSocket(group)
 }
 
 // New builds a Router for the given model group. The poll-trigger URL is
@@ -138,29 +138,25 @@ func New(cfg Config) (*Router, error) {
 		if cfg.Group == "" {
 			return nil, errors.New("llmrouter: Config.Group is required")
 		}
-		if _, ok := responsesWebSocketGroups[cfg.Group]; ok {
-			return nil, fmt.Errorf("llmrouter: model group %q requires the Responses WebSocket client", cfg.Group)
-		}
 		group, ok := modelGroups[cfg.Group]
 		if !ok {
 			return nil, fmt.Errorf("llmrouter: unknown model group %q", cfg.Group)
 		}
-		for _, key := range group.Configs {
-			if endpointConfigs[key].APIMode == apiModeResponsesWebSocket {
-				return nil, fmt.Errorf("llmrouter: model group %q requires the Responses WebSocket client", cfg.Group)
-			}
+		if groupUsesResponsesWebSocket(group) {
+			return nil, fmt.Errorf("llmrouter: model group %q requires the Responses WebSocket client", cfg.Group)
 		}
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
-	return &Router{
+	r := &Router{
 		cfg:            cfg,
 		httpClient:     httpClient,
-		pollTriggerURL: strings.TrimSpace(os.Getenv(pollTriggerURLEnv)),
 		promptMetadata: cfg.PromptMetadata,
-	}, nil
+	}
+	r.poll = newPollTrigger(cfg, httpClient, r.logf)
+	return r, nil
 }
 
 // SetPromptMetadata replaces the prompt metadata attached to subsequent
@@ -362,9 +358,9 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 
 	switch {
 	case msFromDuration(res.Total) > liveCallSlowThresholdMs:
-		r.triggerPoll("slow_live_call")
+		r.poll.trigger("slow_live_call")
 	case sel.UsingFallback:
-		r.triggerPoll("fallback_recovery")
+		r.poll.trigger("fallback_recovery")
 	}
 	return res, nil
 }
@@ -383,7 +379,7 @@ func (r *Router) handleError(configKey string, statusCode int, errMsg string) {
 	if err := blacklistForLiveError(bgCtx, r.cfg.Redis, configKey, errType, statusCode, errMsg); err != nil {
 		r.logf("blacklist write failed for %s: %v", configKey, err)
 	}
-	r.triggerPoll("live_call_error")
+	r.poll.trigger("live_call_error")
 }
 
 // parseSSEChunk parses one SSE line of an OpenAI-format stream.
