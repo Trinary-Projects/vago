@@ -3,6 +3,7 @@ package llmrouter
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,13 +103,18 @@ func installResponsesTestEndpoint(t *testing.T, key string, endpoint endpointCon
 
 func installResponsesTestGroup(t *testing.T, key string, endpointKeys ...string) {
 	t.Helper()
-	previous, existed := responsesWebSocketGroups[key]
-	responsesWebSocketGroups[key] = modelGroup{Configs: endpointKeys}
+	installResponsesTestModelGroup(t, key, modelGroup{Configs: endpointKeys})
+}
+
+func installResponsesTestModelGroup(t *testing.T, key string, group modelGroup) {
+	t.Helper()
+	previous, existed := modelGroups[key]
+	modelGroups[key] = group
 	t.Cleanup(func() {
 		if existed {
-			responsesWebSocketGroups[key] = previous
+			modelGroups[key] = previous
 		} else {
-			delete(responsesWebSocketGroups, key)
+			delete(modelGroups, key)
 		}
 	})
 }
@@ -465,15 +472,7 @@ func TestResponsesWebSocketOrderedDialFailover(t *testing.T) {
 		Provider: providerOpenAI, APIKeyEnv: "RESPONSES_WS_TEST_MISSING_KEY", BaseURL: server.server.URL + "/first/v1",
 	})
 	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(server.server.URL))
-	previousGroup, existed := responsesWebSocketGroups[groupKey]
-	responsesWebSocketGroups[groupKey] = modelGroup{Configs: []string{firstKey, secondKey}, Fallback: secondKey}
-	t.Cleanup(func() {
-		if existed {
-			responsesWebSocketGroups[groupKey] = previousGroup
-		} else {
-			delete(responsesWebSocketGroups, groupKey)
-		}
-	})
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{firstKey, secondKey}, Fallback: secondKey})
 
 	logs := make(chan CallLog, 1)
 	client, err := NewClient(Config{Group: groupKey, LogSink: func(entry CallLog) { logs <- entry }})
@@ -490,7 +489,9 @@ func TestResponsesWebSocketOrderedDialFailover(t *testing.T) {
 	}
 	select {
 	case entry := <-logs:
-		if entry.ConfigKey != secondKey || !entry.UsingFallback {
+		// Without Redis the dial is ordered failover, not the no-health
+		// Fallback path, so UsingFallback stays false.
+		if entry.ConfigKey != secondKey || entry.UsingFallback {
 			t.Fatalf("fallback log = %#v", entry)
 		}
 	case <-time.After(time.Second):
@@ -542,43 +543,6 @@ func TestResponsesWebSocketDialTimeoutFallsThroughToNextCandidate(t *testing.T) 
 	_, _, _, workingConnections := working.snapshot()
 	if workingConnections != 1 {
 		t.Fatalf("working endpoint connections = %d, want 1", workingConnections)
-	}
-}
-
-func TestResponsesWebSocketEventDeadlineAdvancesCandidate(t *testing.T) {
-	silent := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, _ *websocket.Conn) {})
-	working := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
-		sendResponsesText(t, conn, "resp-after-event-timeout", "OK")
-	})
-	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
-	const (
-		firstKey  = "responses_ws_event_timeout_first"
-		secondKey = "responses_ws_event_timeout_second"
-		groupKey  = "responses_ws_event_timeout_group"
-	)
-	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(silent.server.URL))
-	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(working.server.URL))
-	installResponsesTestGroup(t, groupKey, firstKey, secondKey)
-	client, err := NewResponsesWebSocket(Config{Group: groupKey})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	started := time.Now()
-	result, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hang"}}}, func(string) {})
-	if err == nil || result.Interrupted {
-		t.Fatalf("silent result/error = %#v / %v, want transport timeout", result, err)
-	}
-	if elapsed := time.Since(started); elapsed < responsesWebSocketEventTimeout || elapsed > 2*responsesWebSocketEventTimeout {
-		t.Fatalf("event timeout took %s, want approximately %s", elapsed, responsesWebSocketEventTimeout)
-	}
-	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "retry"}}}, func(string) {}); err != nil {
-		t.Fatal(err)
-	}
-	_, _, _, workingConnections := working.snapshot()
-	if workingConnections != 1 {
-		t.Fatalf("working endpoint connections = %d, want 1 after event-timeout advance", workingConnections)
 	}
 }
 
@@ -665,10 +629,15 @@ func TestResponsesWebSocketRetriesAStaleReusedSocketWithFullHistory(t *testing.T
 	}
 }
 
-func TestResponsesWebSocketCancellationWithoutOutputAdvancesCandidate(t *testing.T) {
-	silent := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, _ *websocket.Conn) {})
-	working := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
-		sendResponsesText(t, conn, "resp-working", "OK")
+func TestResponsesWebSocketCancellationWithoutOutputRetainsCandidate(t *testing.T) {
+	// The first endpoint is silent only for the cancelled request.
+	first := newResponsesWSTestServer(t, func(requestIndex int, _ int, _ map[string]any, conn *websocket.Conn) {
+		if requestIndex > 0 {
+			sendResponsesText(t, conn, "resp-first", "OK")
+		}
+	})
+	second := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
+		sendResponsesText(t, conn, "resp-second", "WRONG")
 	})
 	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
 	const (
@@ -676,8 +645,8 @@ func TestResponsesWebSocketCancellationWithoutOutputAdvancesCandidate(t *testing
 		secondKey = "responses_ws_working_second"
 		groupKey  = "responses_ws_silent_group"
 	)
-	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(silent.server.URL))
-	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(working.server.URL))
+	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(first.server.URL))
+	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(second.server.URL))
 	installResponsesTestGroup(t, groupKey, firstKey, secondKey)
 	client, err := NewResponsesWebSocket(Config{Group: groupKey})
 	if err != nil {
@@ -693,10 +662,8 @@ func TestResponsesWebSocketCancellationWithoutOutputAdvancesCandidate(t *testing
 	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "retry"}}}, func(string) {}); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, silentConnections := silent.snapshot()
-	_, _, _, workingConnections := working.snapshot()
-	if silentConnections != 1 || workingConnections != 1 {
-		t.Fatalf("silent/working connections = %d/%d, want 1/1", silentConnections, workingConnections)
+	if connectionCount(first) != 2 || connectionCount(second) != 0 {
+		t.Fatalf("first/second connections = %d/%d, want 2/0 (cancellation keeps the endpoint)", connectionCount(first), connectionCount(second))
 	}
 }
 
@@ -759,7 +726,7 @@ func TestResponsesWebSocketIncompleteIsSuccessfulAndClearsChain(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketFailedResponseLogsPartialTextAndAdvancesOnServerError(t *testing.T) {
+func TestResponsesWebSocketFailedResponseLogsPartialTextAndSwitchesAfterBlacklist(t *testing.T) {
 	logs := make(chan CallLog, 2)
 	failing := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
 		_ = conn.WriteJSON(map[string]any{"type": "response.output_text.delta", "delta": "HEARD"})
@@ -780,7 +747,10 @@ func TestResponsesWebSocketFailedResponseLogsPartialTextAndAdvancesOnServerError
 	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(failing.server.URL))
 	installResponsesTestEndpoint(t, secondKey, openAIResponsesTestEndpoint(working.server.URL))
 	installResponsesTestGroup(t, groupKey, firstKey, secondKey)
-	client, err := NewResponsesWebSocket(Config{Group: groupKey, LogSink: func(entry CallLog) { logs <- entry }})
+	redis := newFakeRedis()
+	redis.setHealth(firstKey, false, 100)
+	redis.setHealth(secondKey, false, 300)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis, LogSink: func(entry CallLog) { logs <- entry }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,7 +772,7 @@ func TestResponsesWebSocketFailedResponseLogsPartialTextAndAdvancesOnServerError
 	}
 	_, _, _, workingConnections := working.snapshot()
 	if workingConnections != 1 {
-		t.Fatalf("working endpoint connections = %d, want 1 after server-error advance", workingConnections)
+		t.Fatalf("working endpoint connections = %d, want 1 after server-error blacklist", workingConnections)
 	}
 }
 
@@ -1081,7 +1051,12 @@ func TestResponsesWebSocketDialLogsFirstConnectAndInsideTurnOffset(t *testing.T)
 }
 
 func TestResponsesWebSocketDialLogsRedialReasonAfterCancellation(t *testing.T) {
-	silent := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, _ *websocket.Conn) {})
+	// Silent only for the cancelled request; cancellation redials the same endpoint.
+	silent := newResponsesWSTestServer(t, func(requestIndex int, _ int, _ map[string]any, conn *websocket.Conn) {
+		if requestIndex > 0 {
+			sendResponsesText(t, conn, "resp-dial-log-redial", "OK")
+		}
+	})
 	working := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
 		sendResponsesText(t, conn, "resp-dial-log-redial", "OK")
 	})
@@ -1112,8 +1087,11 @@ func TestResponsesWebSocketDialLogsRedialReasonAfterCancellation(t *testing.T) {
 	}
 
 	logged := logBuf.String()
-	if !strings.Contains(logged, "dial_seq=2") || !strings.Contains(logged, "redial=true") || !strings.Contains(logged, "drop_reason=cancellation") {
+	if !strings.Contains(logged, "dial_seq=2 redial=true drop_reason=cancellation cfg="+firstKey) {
 		t.Fatalf("redial log missing expected fields for cancellation drop: %q", logged)
+	}
+	if connectionCount(working) != 0 {
+		t.Fatal("cancellation moved the call to the second endpoint")
 	}
 }
 
@@ -1201,7 +1179,7 @@ func TestLiveGPT56LunaResponsesWebSocketClient(t *testing.T) {
 	client.mu.Lock()
 	activeConn := client.conn
 	client.mu.Unlock()
-	client.dropConnection(activeConn, false, "test_forced_fresh_socket")
+	client.dropConnection(activeConn, "test_forced_fresh_socket")
 	toolCall := first.ToolCalls[0]
 	continuedMessages := append(cloneRouterMessages(firstMessages),
 		vpc.Message{Role: "assistant", ToolCalls: []vpc.ToolCall{toolCall}},
@@ -1254,4 +1232,477 @@ func requestInput(t *testing.T, request map[string]any) []map[string]any {
 		items = append(items, item)
 	}
 	return items
+}
+
+// --- health selection, blacklist, and poll triggers ---
+
+// countingRedis counts MGETs so tests can prove one health read per dial.
+type countingRedis struct {
+	*fakeRedis
+	mgets atomic.Int32
+}
+
+func (c *countingRedis) MGetCache(ctx context.Context, keys ...string) ([][]byte, error) {
+	c.mgets.Add(1)
+	return c.fakeRedis.MGetCache(ctx, keys...)
+}
+
+// newResponsesPollRecorder points LLM_POLL_TRIGGER_URL at a stub and returns
+// the reasons it receives. Construct clients after calling it.
+func newResponsesPollRecorder(t *testing.T) chan string {
+	t.Helper()
+	reasons := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		reason, _ := body["reason"].(string)
+		reasons <- reason
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("LLM_POLL_TRIGGER_URL", server.URL)
+	return reasons
+}
+
+func expectPollReason(t *testing.T, reasons chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-reasons:
+		if got != want {
+			t.Fatalf("poll reason = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for poll reason %q", want)
+	}
+}
+
+func expectNoPoll(t *testing.T, reasons chan string) {
+	t.Helper()
+	select {
+	case got := <-reasons:
+		t.Fatalf("unexpected poll reason %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func expectCallLog(t *testing.T, logs chan CallLog) CallLog {
+	t.Helper()
+	select {
+	case entry := <-logs:
+		return entry
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for call log")
+		return CallLog{}
+	}
+}
+
+func shortenResponsesEventTimeout(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	previous := responsesWebSocketEventTimeout
+	responsesWebSocketEventTimeout = timeout
+	t.Cleanup(func() { responsesWebSocketEventTimeout = previous })
+}
+
+func respondOK(t *testing.T) func(int, int, map[string]any, *websocket.Conn) {
+	return func(requestIndex, _ int, _ map[string]any, conn *websocket.Conn) {
+		sendResponsesText(t, conn, "resp-"+string(rune('1'+requestIndex)), "OK")
+	}
+}
+
+func connectionCount(server *responsesWSTestServer) int {
+	_, _, _, connections := server.snapshot()
+	return connections
+}
+
+func TestResponsesWebSocketDialsFastestHealthyEndpointAndReusesIdleSocket(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	slow := newResponsesWSTestServer(t, respondOK(t))
+	blacklisted := newResponsesWSTestServer(t, respondOK(t))
+	fast := newResponsesWSTestServer(t, respondOK(t))
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		slowKey        = "responses_ws_health_slow"
+		blacklistedKey = "responses_ws_health_blacklisted"
+		fastKey        = "responses_ws_health_fast"
+		groupKey       = "responses_ws_health_group"
+	)
+	installResponsesTestEndpoint(t, slowKey, openAIResponsesTestEndpoint(slow.server.URL))
+	installResponsesTestEndpoint(t, blacklistedKey, openAIResponsesTestEndpoint(blacklisted.server.URL))
+	installResponsesTestEndpoint(t, fastKey, openAIResponsesTestEndpoint(fast.server.URL))
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{slowKey, blacklistedKey, fastKey}, Fallback: slowKey})
+	redis := &countingRedis{fakeRedis: newFakeRedis()}
+	// Six runs: selection averages only the last five (500 → mean 300).
+	redis.setHealth(slowKey, false, 100, 300, 300, 300, 300, 300)
+	redis.setHealth(blacklistedKey, true, 50)
+	redis.setHealth(fastKey, false, 200)
+
+	logs := make(chan CallLog, 2)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis, LogSink: func(entry CallLog) { logs <- entry }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	first := []vpc.Message{{Role: "user", Content: "first"}}
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: first}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if entry := expectCallLog(t, logs); entry.ConfigKey != fastKey || entry.UsingFallback {
+		t.Fatalf("first log = %#v, want health-selected %s", entry, fastKey)
+	}
+
+	// A now-faster endpoint must not break the idle socket or its chain.
+	redis.setHealth(slowKey, false, 10)
+	second := append(cloneRouterMessages(first), vpc.Message{Role: "assistant", Content: "OK"}, vpc.Message{Role: "user", Content: "second"})
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: second}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if entry := expectCallLog(t, logs); entry.ConfigKey != fastKey || entry.ResponseInputMode != "incremental" {
+		t.Fatalf("second log = %#v, want reused %s socket with incremental input", entry, fastKey)
+	}
+	if got := redis.mgets.Load(); got != 1 {
+		t.Fatalf("health MGETs = %d, want one per dial", got)
+	}
+	if connectionCount(fast) != 1 || connectionCount(slow) != 0 || connectionCount(blacklisted) != 0 {
+		t.Fatalf("slow/blacklisted/fast connections = %d/%d/%d, want 0/0/1", connectionCount(slow), connectionCount(blacklisted), connectionCount(fast))
+	}
+	expectNoPoll(t, polls)
+}
+
+func TestResponsesWebSocketNoHealthDialsFallbackFirstAndTriggersRecovery(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	first := newResponsesWSTestServer(t, respondOK(t))
+	fallback := newResponsesWSTestServer(t, respondOK(t))
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		firstKey    = "responses_ws_nohealth_first"
+		fallbackKey = "responses_ws_nohealth_fallback"
+		groupKey    = "responses_ws_nohealth_group"
+	)
+	installResponsesTestEndpoint(t, firstKey, openAIResponsesTestEndpoint(first.server.URL))
+	installResponsesTestEndpoint(t, fallbackKey, openAIResponsesTestEndpoint(fallback.server.URL))
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{firstKey, fallbackKey}, Fallback: fallbackKey})
+	redis := newFakeRedis()
+	// Blacklisted-only health counts as no healthy endpoint.
+	redis.setHealth(firstKey, true, 100)
+
+	logs := make(chan CallLog, 1)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis, LogSink: func(entry CallLog) { logs <- entry }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hi"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if entry := expectCallLog(t, logs); entry.ConfigKey != fallbackKey || !entry.UsingFallback {
+		t.Fatalf("log = %#v, want fallback %s with UsingFallback", entry, fallbackKey)
+	}
+	if connectionCount(first) != 0 || connectionCount(fallback) != 1 {
+		t.Fatalf("first/fallback connections = %d/%d, want 0/1", connectionCount(first), connectionCount(fallback))
+	}
+	expectPollReason(t, polls, "fallback_recovery")
+}
+
+func TestResponsesWebSocketEventDeadlineBlacklistsAndNextDialSkipsEndpoint(t *testing.T) {
+	shortenResponsesEventTimeout(t, 200*time.Millisecond)
+	polls := newResponsesPollRecorder(t)
+	silent := newResponsesWSTestServer(t, func(int, int, map[string]any, *websocket.Conn) {})
+	working := newResponsesWSTestServer(t, respondOK(t))
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		silentKey  = "responses_ws_deadline_silent"
+		workingKey = "responses_ws_deadline_working"
+		groupKey   = "responses_ws_deadline_group"
+	)
+	installResponsesTestEndpoint(t, silentKey, openAIResponsesTestEndpoint(silent.server.URL))
+	installResponsesTestEndpoint(t, workingKey, openAIResponsesTestEndpoint(working.server.URL))
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{silentKey, workingKey}, Fallback: silentKey})
+	redis := newFakeRedis()
+	redis.setHealth(silentKey, false, 100, 120)
+	redis.setHealth(workingKey, false, 300)
+
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if result, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hang"}}}, func(string) {}); err == nil || result.Interrupted {
+		t.Fatalf("silent result/error = %#v / %v, want event-deadline failure", result, err)
+	}
+	health := parseHealth(redis.get(healthKey(silentKey)))
+	if !health.Blacklisted || health.LastLiveCallError == nil || len(health.PollRuns) != 2 {
+		t.Fatalf("silent health = %+v, want blacklisted with poll runs preserved", health)
+	}
+	expectPollReason(t, polls, "live_call_error")
+
+	// The next dial re-ranks from Redis, where the silent endpoint is now blacklisted.
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "retry"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if connectionCount(silent) != 1 || connectionCount(working) != 1 {
+		t.Fatalf("silent/working connections = %d/%d, want 1/1", connectionCount(silent), connectionCount(working))
+	}
+}
+
+func TestResponsesWebSocketDialFailureBlacklistsAndFallsThrough(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	working := newResponsesWSTestServer(t, respondOK(t))
+	t.Setenv("RESPONSES_WS_TEST_MISSING_KEY", "")
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		brokenKey  = "responses_ws_dialfail_broken"
+		workingKey = "responses_ws_dialfail_working"
+		groupKey   = "responses_ws_dialfail_group"
+	)
+	installResponsesTestEndpoint(t, brokenKey, endpointConfig{
+		Provider: providerOpenAI, APIKeyEnv: "RESPONSES_WS_TEST_MISSING_KEY", BaseURL: working.server.URL + "/v1",
+	})
+	installResponsesTestEndpoint(t, workingKey, openAIResponsesTestEndpoint(working.server.URL))
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{brokenKey, workingKey}, Fallback: brokenKey})
+	redis := newFakeRedis()
+	redis.setHealth(brokenKey, false, 100)
+	redis.setHealth(workingKey, false, 300)
+
+	logs := make(chan CallLog, 1)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis, LogSink: func(entry CallLog) { logs <- entry }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hi"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if entry := expectCallLog(t, logs); entry.ConfigKey != workingKey || entry.UsingFallback {
+		t.Fatalf("log = %#v, want %s without fallback", entry, workingKey)
+	}
+	if health := parseHealth(redis.get(healthKey(brokenKey))); !health.Blacklisted {
+		t.Fatalf("broken health = %+v, want blacklisted after dial failure", health)
+	}
+	if health := parseHealth(redis.get(healthKey(workingKey))); health.Blacklisted {
+		t.Fatal("working endpoint unexpectedly blacklisted")
+	}
+	expectPollReason(t, polls, "live_call_error")
+}
+
+func TestResponsesWebSocketProviderErrorBlacklistsButKeepsSocket(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	server := newResponsesWSTestServer(t, func(requestIndex, _ int, _ map[string]any, conn *websocket.Conn) {
+		if requestIndex == 0 {
+			_ = conn.WriteJSON(map[string]any{"type": "error", "status": 400, "code": "invalid_request_error", "message": "bad request"})
+			return
+		}
+		sendResponsesText(t, conn, "resp-fixed", "OK")
+	})
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		endpointKey = "responses_ws_provider_error"
+		groupKey    = "responses_ws_provider_error_group"
+	)
+	installResponsesTestEndpoint(t, endpointKey, openAIResponsesTestEndpoint(server.server.URL))
+	installResponsesTestGroup(t, groupKey, endpointKey)
+	redis := newFakeRedis()
+	redis.setHealth(endpointKey, false, 100)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "bad"}}}, func(string) {}); err == nil {
+		t.Fatal("provider error unexpectedly succeeded")
+	}
+	health := parseHealth(redis.get(healthKey(endpointKey)))
+	if !health.Blacklisted || health.LastLiveCallError == nil || health.LastLiveCallError.StatusCode == nil || *health.LastLiveCallError.StatusCode != 400 {
+		t.Fatalf("health = %+v, want blacklisted with status 400", health)
+	}
+	expectPollReason(t, polls, "live_call_error")
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "fixed"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if connectionCount(server) != 1 {
+		t.Fatalf("connections = %d, want the non-retryable error to keep its socket", connectionCount(server))
+	}
+}
+
+func TestResponsesWebSocketCancellationInterruptAndStaleRetryDoNotBlacklist(t *testing.T) {
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const groupKey = "responses_ws_no_blacklist_group"
+	setup := func(t *testing.T, key string, respond func(int, int, map[string]any, *websocket.Conn)) (*ResponsesWebSocketClient, *fakeRedis, *responsesWSTestServer) {
+		t.Helper()
+		server := newResponsesWSTestServer(t, respond)
+		installResponsesTestEndpoint(t, key, openAIResponsesTestEndpoint(server.server.URL))
+		installResponsesTestGroup(t, groupKey, key)
+		redis := newFakeRedis()
+		redis.setHealth(key, false, 100)
+		client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		return client, redis, server
+	}
+	assertNotBlacklisted := func(t *testing.T, redis *fakeRedis, key string) {
+		t.Helper()
+		if health := parseHealth(redis.get(healthKey(key))); health.Blacklisted || health.LastLiveCallError != nil {
+			t.Fatalf("health = %+v, want untouched", health)
+		}
+	}
+
+	t.Run("context cancellation", func(t *testing.T) {
+		const key = "responses_ws_no_blacklist_cancel"
+		client, redis, _ := setup(t, key, func(int, int, map[string]any, *websocket.Conn) {})
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if result, err := client.Stream(ctx, vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hang"}}}, func(string) {}); err == nil || !result.Interrupted {
+			t.Fatalf("result/error = %#v / %v, want interrupted", result, err)
+		}
+		assertNotBlacklisted(t, redis, key)
+	})
+
+	t.Run("interrupt", func(t *testing.T) {
+		const key = "responses_ws_no_blacklist_interrupt"
+		requestSeen := make(chan struct{}, 1)
+		client, redis, _ := setup(t, key, func(int, int, map[string]any, *websocket.Conn) { requestSeen <- struct{}{} })
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hang"}}}, func(string) {})
+			done <- err
+		}()
+		select {
+		case <-requestSeen:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for request")
+		}
+		client.Interrupt()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("interrupt error = %v, want cancellation", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("interrupt did not release Stream")
+		}
+		assertNotBlacklisted(t, redis, key)
+	})
+
+	t.Run("stale reused socket", func(t *testing.T) {
+		const key = "responses_ws_no_blacklist_stale"
+		client, redis, server := setup(t, key, func(requestIndex, _ int, _ map[string]any, conn *websocket.Conn) {
+			sendResponsesText(t, conn, "resp-"+string(rune('1'+requestIndex)), "OK")
+			if requestIndex == 0 {
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "idle"), time.Now().Add(time.Second))
+				_ = conn.Close()
+			}
+		})
+		first := []vpc.Message{{Role: "user", Content: "first"}}
+		if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: first}, func(string) {}); err != nil {
+			t.Fatal(err)
+		}
+		second := append(cloneRouterMessages(first), vpc.Message{Role: "assistant", Content: "OK"}, vpc.Message{Role: "user", Content: "second"})
+		if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: second}, func(string) {}); err != nil {
+			t.Fatal(err)
+		}
+		if connectionCount(server) != 2 {
+			t.Fatalf("connections = %d, want transparent reconnect", connectionCount(server))
+		}
+		assertNotBlacklisted(t, redis, key)
+	})
+}
+
+func TestResponsesWebSocketSlowTurnTriggersSlowPollOverFallbackRecovery(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	slowDelay := time.Duration(liveCallSlowThresholdMs)*time.Millisecond + 200*time.Millisecond
+	server := newResponsesWSTestServer(t, func(_ int, _ int, _ map[string]any, conn *websocket.Conn) {
+		time.Sleep(slowDelay)
+		sendResponsesText(t, conn, "resp-slow", "OK")
+	})
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		endpointKey = "responses_ws_slow_turn"
+		groupKey    = "responses_ws_slow_turn_group"
+	)
+	installResponsesTestEndpoint(t, endpointKey, openAIResponsesTestEndpoint(server.server.URL))
+	// No health data: the fallback path serves, but slow takes precedence.
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{endpointKey}, Fallback: endpointKey})
+	logs := make(chan CallLog, 1)
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: newFakeRedis(), LogSink: func(entry CallLog) { logs <- entry }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "hi"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if entry := expectCallLog(t, logs); !entry.UsingFallback || entry.TotalMs <= liveCallSlowThresholdMs {
+		t.Fatalf("log = %#v, want slow fallback-served turn", entry)
+	}
+	expectPollReason(t, polls, "slow_live_call")
+}
+
+func TestResponsesWebSocketInterruptBeforeFirstTokenKeepsEndpointAndRedisUntouched(t *testing.T) {
+	polls := newResponsesPollRecorder(t)
+	firstRequestSeen := make(chan struct{}, 1)
+	preferred := newResponsesWSTestServer(t, func(requestIndex int, _ int, _ map[string]any, conn *websocket.Conn) {
+		if requestIndex == 0 {
+			firstRequestSeen <- struct{}{}
+			return
+		}
+		sendResponsesText(t, conn, "resp-preferred", "OK")
+	})
+	other := newResponsesWSTestServer(t, respondOK(t))
+	t.Setenv("RESPONSES_WS_TEST_API_KEY", "secret")
+	const (
+		preferredKey = "responses_ws_interrupt_keep_preferred"
+		otherKey     = "responses_ws_interrupt_keep_other"
+		groupKey     = "responses_ws_interrupt_keep_group"
+	)
+	installResponsesTestEndpoint(t, preferredKey, openAIResponsesTestEndpoint(preferred.server.URL))
+	installResponsesTestEndpoint(t, otherKey, openAIResponsesTestEndpoint(other.server.URL))
+	installResponsesTestModelGroup(t, groupKey, modelGroup{Configs: []string{preferredKey, otherKey}, Fallback: preferredKey})
+	redis := newFakeRedis()
+	redis.setHealth(preferredKey, false, 100)
+	redis.setHealth(otherKey, false, 300)
+	before := map[string]string{
+		preferredKey: string(redis.get(healthKey(preferredKey))),
+		otherKey:     string(redis.get(healthKey(otherKey))),
+	}
+	client, err := NewResponsesWebSocket(Config{Group: groupKey, Redis: redis})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "first"}}}, func(string) {})
+		done <- err
+	}()
+	select {
+	case <-firstRequestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first request")
+	}
+	client.Interrupt()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("interrupt error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not release Stream")
+	}
+
+	if _, err := client.Stream(context.Background(), vpc.LLMRequest{Messages: []vpc.Message{{Role: "user", Content: "again"}}}, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if connectionCount(preferred) != 2 || connectionCount(other) != 0 {
+		t.Fatalf("preferred/other connections = %d/%d, want 2/0", connectionCount(preferred), connectionCount(other))
+	}
+	for key, raw := range before {
+		if got := string(redis.get(healthKey(key))); got != raw {
+			t.Fatalf("health for %s changed after interrupt: %s", key, got)
+		}
+	}
+	expectNoPoll(t, polls)
 }

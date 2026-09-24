@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -21,58 +23,85 @@ const (
 	pollTriggerTimeout = 30 * time.Second
 )
 
-// triggerPoll fires a fire-and-forget re-poll of the (primary) model
-// group, guarded by a Redis lock so concurrent calls/pods don't spam the
-// poller. Mirrors CustomOpenAILLMService._trigger_event_polling: the
-// lock is keyed by the primary group and the poll targets that group
-// even when a fallback group is currently in use, so the exhausted
-// primary endpoints get refreshed.
-func (r *Router) triggerPoll(reason string) {
-	// Fixed-endpoint mode has no group to re-rank (Python's failover
-	// service never touches the poller).
-	if r.cfg.FixedEndpoint != "" {
-		return
+// pollTrigger fires the on-demand re-poll of one model group. Both the
+// Chat-Completions Router and the Responses WebSocket client own one, so
+// every health-selected group refreshes its Redis health the same way.
+// The zero value (and fixed-endpoint mode, which has no group to re-rank:
+// Python's failover service never touches the poller) is disabled.
+type pollTrigger struct {
+	group      string
+	region     string
+	url        string
+	redis      RedisStore
+	httpClient *http.Client
+	logf       func(format string, args ...any)
+}
+
+func newPollTrigger(cfg Config, httpClient *http.Client, logf func(format string, args ...any)) pollTrigger {
+	if cfg.FixedEndpoint != "" {
+		return pollTrigger{}
 	}
-	if r.pollTriggerURL == "" || r.cfg.Redis == nil {
+	region := cfg.Region
+	if region == "" {
+		region = defaultRegion
+	}
+	return pollTrigger{
+		group:      cfg.Group,
+		region:     region,
+		url:        strings.TrimSpace(os.Getenv(pollTriggerURLEnv)),
+		redis:      cfg.Redis,
+		httpClient: httpClient,
+		logf:       logf,
+	}
+}
+
+// trigger fires a fire-and-forget re-poll of the (primary) model group,
+// guarded by a Redis lock so concurrent calls/pods don't spam the poller.
+// Mirrors CustomOpenAILLMService._trigger_event_polling: the lock is keyed
+// by the primary group and the poll targets that group even when a
+// fallback group is currently in use, so the exhausted primary endpoints
+// get refreshed.
+func (p pollTrigger) trigger(reason string) {
+	if p.group == "" || p.url == "" || p.redis == nil {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), pollTriggerTimeout)
 		defer cancel()
 
-		lockKey := pollLockPrefix + ":" + r.cfg.Group
-		acquired, err := r.cfg.Redis.AcquireLock(ctx, lockKey, groupPollLockTTL)
+		lockKey := pollLockPrefix + ":" + p.group
+		acquired, err := p.redis.AcquireLock(ctx, lockKey, groupPollLockTTL)
 		if err != nil {
-			r.logf("poll lock error (group=%s reason=%s): %v", r.cfg.Group, reason, err)
+			p.logf("poll lock error (group=%s reason=%s): %v", p.group, reason, err)
 			return
 		}
 		if !acquired {
-			r.logf("poll skipped, lock held (group=%s reason=%s)", r.cfg.Group, reason)
+			p.logf("poll skipped, lock held (group=%s reason=%s)", p.group, reason)
 			return
 		}
-		r.logf("poll triggered (group=%s reason=%s)", r.cfg.Group, reason)
-		if err := r.postPoll(ctx, reason); err != nil {
-			r.logf("poll trigger failed (group=%s reason=%s): %v", r.cfg.Group, reason, err)
+		p.logf("poll triggered (group=%s reason=%s)", p.group, reason)
+		if err := p.post(ctx, reason); err != nil {
+			p.logf("poll trigger failed (group=%s reason=%s): %v", p.group, reason, err)
 		}
 	}()
 }
 
-func (r *Router) postPoll(ctx context.Context, reason string) error {
+func (p pollTrigger) post(ctx context.Context, reason string) error {
 	payload, err := json.Marshal(map[string]any{
-		"model_group": r.cfg.Group,
-		"region":      r.region(),
+		"model_group": p.group,
+		"region":      p.region,
 		"reason":      reason,
 		"force":       true,
 	})
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.pollTriggerURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := r.httpClient.Do(req)
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return err
 	}

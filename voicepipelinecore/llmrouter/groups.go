@@ -34,8 +34,9 @@ const (
 
 // apiMode identifies the provider API/transport an endpoint requires. The
 // zero value remains Chat Completions so existing endpoint declarations stay
-// unchanged. NewClient dispatches Responses WebSocket endpoints to the
-// dedicated persistent-socket client.
+// unchanged. NewClient dispatches Responses WebSocket endpoints (and groups
+// made of them) to the dedicated persistent-socket client. A group never
+// mixes modes.
 type apiMode string
 
 const (
@@ -103,11 +104,16 @@ const (
 	gpt41Model = "gpt-4.1"
 )
 
-// GroupGPT56LunaNonReasoning mirrors Disha's
-// LLMFailoverConfigName.gpt_5_6_luna_non_reasoning target set (OpenAI-first). It is exported
-// for the Responses WebSocket client; the Chat-Completions-only New
-// constructor intentionally rejects it while NewClient dispatches it.
+// GroupGPT56LunaNonReasoning mirrors Disha's gpt-5.6-luna-non-reasoning
+// target set. It is a health-selected group like the others,
+// but its endpoints use the Responses WebSocket transport: the
+// Chat-Completions-only New constructor rejects it while NewClient
+// dispatches it to ResponsesWebSocketClient.
 const GroupGPT56LunaNonReasoning = "gpt-5.6-luna-non-reasoning"
+
+// GroupGPT6LunaNonReasoning is the GPT-6 Luna counterpart of
+// GroupGPT56LunaNonReasoning, on the same Azure resources plus direct OpenAI.
+const GroupGPT6LunaNonReasoning = "gpt-6-luna-non-reasoning"
 
 // EndpointOpenRouterGemini25FlashLite is the fixed-endpoint config key for
 // the onboarding stage-transition tracker's one-shot classifier (used via
@@ -152,6 +158,41 @@ var endpointConfigs = map[string]endpointConfig{
 	"openai_gpt_5_6_luna_non_reasoning": {
 		Key: "openai_gpt_5_6_luna_non_reasoning", Provider: providerOpenAI,
 		Model: "gpt-5.6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "OPENAI_API_KEY", BaseURL: "https://api.openai.com/v1",
+		ReasoningEffort: "none",
+	},
+
+	// --- GPT-6 Luna, Responses WebSocket, reasoning disabled ---
+	// Same Azure resources and environment variables as GPT-5.6 Luna, with
+	// deployment name gpt-6-luna. The Azure deployments did not exist yet on
+	// 2026-09-23, so their polls fail and keep them blacklisted until created.
+	"azure_gpt_6_luna_non_reasoning_eastus": {
+		Key: "azure_gpt_6_luna_non_reasoning_eastus", Provider: providerAzure,
+		Model: "gpt-6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_EAST_API_KEY", EndpointEnv: "GROK_US_EAST_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_6_luna_non_reasoning_eastus2": {
+		Key: "azure_gpt_6_luna_non_reasoning_eastus2", Provider: providerAzure,
+		Model: "gpt-6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_EAST_2_API_KEY", EndpointEnv: "GROK_US_EAST_2_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_6_luna_non_reasoning_westus": {
+		Key: "azure_gpt_6_luna_non_reasoning_westus", Provider: providerAzure,
+		Model: "gpt-6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "GROK_US_WEST_API_KEY", EndpointEnv: "GROK_US_WEST_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"azure_gpt_6_luna_non_reasoning_northcentralus": {
+		Key: "azure_gpt_6_luna_non_reasoning_northcentralus", Provider: providerAzure,
+		Model: "gpt-6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
+		APIKeyEnv: "AZURE_OPENAI_US_NORTH_CENTRAL_API_KEY", EndpointEnv: "AZURE_OPENAI_US_NORTH_CENTRAL_ENDPOINT",
+		ReasoningEffort: "none",
+	},
+	"openai_gpt_6_luna_non_reasoning": {
+		Key: "openai_gpt_6_luna_non_reasoning", Provider: providerOpenAI,
+		Model: "gpt-6-luna", Region: "us", APIMode: apiModeResponsesWebSocket,
 		APIKeyEnv: "OPENAI_API_KEY", BaseURL: "https://api.openai.com/v1",
 		ReasoningEffort: "none",
 	},
@@ -383,32 +424,40 @@ var hedgedPairs = map[string]hedgedPair{
 	},
 }
 
-// responsesWebSocketGroups holds ordered endpoint candidates for persistent
-// Responses WebSocket clients. These are deliberately separate from
-// modelGroups: modelGroups is health-ranked from Python poller Redis keys,
-// while Disha's Luna configuration is an ordered LLMFailoverService list and
-// is not registered with that poller. ResponsesWebSocketClient retains this
-// order for connection attempts. Direct OpenAI leads (deliberate delta from
-// Disha's Azure-first list, 2026-09-23) because Azure Luna tail latency was
-// tripping the 4s event deadline; Azure regions remain ordered failover.
-var responsesWebSocketGroups = map[string]modelGroup{
-	GroupGPT56LunaNonReasoning: {
-		Configs: []string{
-			"openai_gpt_5_6_luna_non_reasoning",
-			"azure_gpt_5_6_luna_non_reasoning_eastus",
-			"azure_gpt_5_6_luna_non_reasoning_eastus2",
-			"azure_gpt_5_6_luna_non_reasoning_westus",
-			"azure_gpt_5_6_luna_non_reasoning_northcentralus",
-		},
-		Fallback: "openai_gpt_5_6_luna_non_reasoning",
-	},
-}
-
 // modelGroups is the Go port of MODEL_GROUPS for the Disha call bots.
 // The grok groups fall back within their Azure-hosted regions and then to
 // the gemini-flash-3.1-lite group (which itself falls back to gpt-4.1);
 // the Vertex grok endpoint was removed as it is being retired from Vertex.
 var modelGroups = map[string]modelGroup{
+	// GPT-5.6 Luna over the Responses WebSocket transport. NewClient
+	// dispatches it to ResponsesWebSocketClient (its endpoints declare
+	// apiModeResponsesWebSocket), which ranks the dial order with the same
+	// Redis health, blacklist, and poll trigger as every other group. The
+	// configured order (Disha's Azure-first list) only orders the endpoints
+	// left after the health-ranked ones; with no health data the direct
+	// OpenAI Fallback is dialed first. No FallbackGroup: every endpoint serves
+	// the same model.
+	GroupGPT56LunaNonReasoning: {
+		Configs: []string{
+			"azure_gpt_5_6_luna_non_reasoning_eastus",
+			"azure_gpt_5_6_luna_non_reasoning_eastus2",
+			"azure_gpt_5_6_luna_non_reasoning_westus",
+			"azure_gpt_5_6_luna_non_reasoning_northcentralus",
+			"openai_gpt_5_6_luna_non_reasoning",
+		},
+		Fallback: "openai_gpt_5_6_luna_non_reasoning",
+	},
+	// GPT-6 Luna, same shape as the GPT-5.6 Luna group above.
+	GroupGPT6LunaNonReasoning: {
+		Configs: []string{
+			"azure_gpt_6_luna_non_reasoning_eastus",
+			"azure_gpt_6_luna_non_reasoning_eastus2",
+			"azure_gpt_6_luna_non_reasoning_westus",
+			"azure_gpt_6_luna_non_reasoning_northcentralus",
+			"openai_gpt_6_luna_non_reasoning",
+		},
+		Fallback: "openai_gpt_6_luna_non_reasoning",
+	},
 	// Identical membership to grok-4.1-fast-sales in Python's
 	// MODEL_GROUPS — both exist as separate keys so their health polls
 	// and poll locks stay per-group.
@@ -508,4 +557,16 @@ func groupConfigsForRegion(group, region string) ([]endpointConfig, bool) {
 		out = append(out, cfg)
 	}
 	return out, true
+}
+
+// groupUsesResponsesWebSocket reports whether a model group's endpoints use
+// the Responses WebSocket transport. Groups never mix API modes (enforced by
+// TestModelGroupsDoNotMixAPIModes), so checking any member is sufficient.
+func groupUsesResponsesWebSocket(group modelGroup) bool {
+	for _, key := range group.Configs {
+		if endpointConfigs[key].APIMode == apiModeResponsesWebSocket {
+			return true
+		}
+	}
+	return false
 }
