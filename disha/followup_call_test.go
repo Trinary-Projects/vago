@@ -387,6 +387,7 @@ func TestFollowUpGuidancePromptVariablesIncludePatientExecutiveProfile(t *testin
 // `_FOLLOW_UP_PROTOCOL_VARIABLES` in disha-backend bots/bot_session_manager.py.
 var followUpProtocolVariables = []string{
 	"diet_chart_available",
+	"diet_chart_expiration_date",
 	"diet_plan_today",
 	"membership_status",
 	"membership_expiry_date",

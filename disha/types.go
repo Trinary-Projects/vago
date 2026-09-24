@@ -42,6 +42,7 @@ type UserProfileData struct {
 	Recent1HrTranscript               *string        `json:"recent_1hr_transcript"`
 	LastDietChartXML                  string         `json:"last_diet_chart_xml"`
 	DietChartAvailable                bool           `json:"diet_chart_available"`
+	DietChartExpirationDate           *string        `json:"diet_chart_expiration_date"`
 	DietPlanToday                     *string        `json:"diet_plan_today"`
 	MembershipStatus                  *string        `json:"membership_status"`
 	MembershipExpiryDate              *string        `json:"membership_expiry_date"`

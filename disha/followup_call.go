@@ -341,8 +341,9 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		// this same store. Python resolves them in
 		// user_prompt_variable_resolver (_diet_chart_available /
 		// _today_diet_plan) and fetch_conversation forwards them here.
-		"diet_chart_available": user.DietChartAvailable,
-		"diet_plan_today":      derefString(user.DietPlanToday),
+		"diet_chart_available":       user.DietChartAvailable,
+		"diet_chart_expiration_date": user.DietChartExpirationDate,
+		"diet_plan_today":            derefString(user.DietPlanToday),
 
 		// Same deal, from Python's subscription_prompt_variable_resolver.
 		// Deliberately forwarded as pointers rather than dereferenced: a user
