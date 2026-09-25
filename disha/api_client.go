@@ -23,34 +23,19 @@ const (
 	enqueueJobPath       = "/common/enqueue_job"
 	idempotencyKeyHeader = "Idempotency-Key"
 
-	// enqueue_job is the last line of defence: by the time we call it the direct
-	// API call has already failed, so it retries transient failures instead of
-	// dropping the work. Every attempt reuses one idempotency key, so a retry
-	// after an ambiguous failure (timeout, 502) is deduped by Disha rather than
-	// queueing the job twice.
 	enqueueMaxAttempts    = 4 // 1 initial attempt + 3 retries
 	enqueueRetryBaseDelay = time.Second
 
-	// Budget for the detached context the fallback path builds: 4 attempts at
-	// defaultAPITimeout each plus 1s+2s+4s of backoff does not fit, and it
-	// should not — a post-call goroutine must not block for a minute. Attempts
-	// that no longer fit are cut off by the context and reported as exhausted.
 	enqueueFallbackBudget = 30 * time.Second
 )
 
 type APIClient struct {
-	baseURL    string
-	httpClient *http.Client
-	logger     *log.Logger
-	// retryBaseDelay is the first enqueue_job backoff step; tests shrink it so
-	// they do not sit through the real 1s+2s+4s ladder.
+	baseURL        string
+	httpClient     *http.Client
+	logger         *log.Logger
 	retryBaseDelay time.Duration
 }
 
-// apiError is one failed attempt against the Disha API. Status is 0 when the
-// request never produced a response (timeout, connection reset, DNS), which is
-// exactly the ambiguous case the idempotency key exists for: the server may
-// have processed the request anyway.
 type apiError struct {
 	Method string
 	Path   string
@@ -68,10 +53,6 @@ func (e *apiError) Error() string {
 
 func (e *apiError) Unwrap() error { return e.Err }
 
-// transient reports whether retrying the identical request could plausibly
-// succeed. 409 counts: Disha returns it while another attempt of the same
-// idempotency key is still in flight, and that attempt may yet fail and release
-// the key, so we keep asking until it resolves either way.
 func (e *apiError) transient() bool {
 	switch {
 	case e.Status == 0:
@@ -162,23 +143,13 @@ func (c *APIClient) AddTagToUserWithFallback(ctx context.Context, req AddTagToUs
 	return c.enqueueAPIFallback("add_tag_to_user", "bots.operations.voice_bot_operations", "add_tag_to_user", req, err)
 }
 
-// EnqueueJob posts a job to Disha's queue endpoint, retrying transient failures
-// up to enqueueMaxAttempts times. Every attempt carries the same
-// Idempotency-Key, so a retry after an ambiguous failure is deduped server-side
-// instead of queueing the job twice. Sentry is fired exactly once, and only
-// when the job could not be handed over at all.
 func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error {
 	return c.enqueueJob(ctx, req, nil)
 }
 
-// enqueueJob carries primaryErr, the direct-API failure that triggered the
-// fallback, so the Sentry event raised on exhaustion names both failures
-// instead of only the queue one.
 func (c *APIClient) enqueueJob(ctx context.Context, req EnqueueJobRequest, primaryErr error) error {
 	key, err := req.IdempotencyKey()
 	if err != nil {
-		// The job can never be sent — do would fail to marshal the same payload —
-		// so this is dropped work and deserves the same alert as an exhausted retry.
 		sentryutil.Capture(sentryutil.Event{
 			Err: err,
 			Tags: map[string]string{
@@ -262,9 +233,6 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// send reports failures to Sentry itself. Call sites that have a queue fallback
-// use sendQuiet instead: a direct call that fails but is rescued by the fallback
-// is not an incident, so only an exhausted fallback raises an event.
 func (c *APIClient) send(ctx context.Context, method, path string, body any) error {
 	err := c.do(ctx, method, path, body, nil)
 	if err == nil {
