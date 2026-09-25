@@ -219,6 +219,7 @@ func TestCareplanActivateSetsUserCareplanWithExpectedPayload(t *testing.T) {
 	}))
 	defer server.Close()
 	api := NewAPIClient(server.URL, 10*time.Second, nil)
+	api.retryBaseDelay = time.Millisecond // exhaust the enqueue retries without the real backoff
 
 	h := newCPHarness(t, cpTestConfig(), api, nil)
 	plan := h.manager.Activate(context.Background(), "keto", "keto")
@@ -244,6 +245,7 @@ func TestCareplanActivateSwallowsAPIFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	api := NewAPIClient(server.URL, 10*time.Second, nil)
+	api.retryBaseDelay = time.Millisecond // exhaust the enqueue retries without the real backoff
 
 	h := newCPHarness(t, cpTestConfig(), api, nil)
 	plan := h.manager.Activate(context.Background(), "keto", "keto")

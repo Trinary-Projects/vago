@@ -8,16 +8,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type capturedAPIRequest struct {
-	Method        string
-	Path          string
-	ContentType   string
-	Authorization string
-	Body          map[string]any
+	Method         string
+	Path           string
+	ContentType    string
+	Authorization  string
+	IdempotencyKey string
+	Body           map[string]any
 }
 
 func captureAPIRequest(t *testing.T, status int) (*httptest.Server, <-chan capturedAPIRequest) {
@@ -39,11 +41,12 @@ func captureAPIRequest(t *testing.T, status int) (*httptest.Server, <-chan captu
 			}
 		}
 		requests <- capturedAPIRequest{
-			Method:        r.Method,
-			Path:          r.URL.Path,
-			ContentType:   r.Header.Get("Content-Type"),
-			Authorization: r.Header.Get("Authorization"),
-			Body:          body,
+			Method:         r.Method,
+			Path:           r.URL.Path,
+			ContentType:    r.Header.Get("Content-Type"),
+			Authorization:  r.Header.Get("Authorization"),
+			IdempotencyKey: r.Header.Get(idempotencyKeyHeader),
+			Body:           body,
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"success":true}`))
@@ -427,5 +430,228 @@ func TestNewAPIClientDefaults(t *testing.T) {
 	}
 	if client.httpClient.Timeout != defaultAPITimeout {
 		t.Fatalf("timeout = %s, want %s", client.httpClient.Timeout, defaultAPITimeout)
+	}
+}
+
+// enqueueJobServer replies with statuses[i] for the i-th enqueue_job request
+// and 200 for anything past the end of the list, recording every attempt.
+func enqueueJobServer(t *testing.T, statuses ...int) (*httptest.Server, *[]capturedAPIRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []capturedAPIRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		mu.Lock()
+		n := len(seen)
+		seen = append(seen, capturedAPIRequest{
+			Method:         r.Method,
+			Path:           r.URL.Path,
+			IdempotencyKey: r.Header.Get(idempotencyKeyHeader),
+			Body:           body,
+		})
+		mu.Unlock()
+
+		status := http.StatusOK
+		if r.URL.Path == enqueueJobPath && n < len(statuses) {
+			status = statuses[n]
+		} else if r.URL.Path != enqueueJobPath && len(statuses) > 0 {
+			status = statuses[0]
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, &seen
+}
+
+func fastClient(t *testing.T, baseURL string) *APIClient {
+	t.Helper()
+	client := NewAPIClient(baseURL, 10*time.Second, nil)
+	client.retryBaseDelay = time.Millisecond // skip the real 1s/2s/4s ladder
+	return client
+}
+
+func sampleEnqueueRequest() EnqueueJobRequest {
+	return EnqueueJobRequest{
+		ModuleName: "bots.signal_handler",
+		FuncName:   "cleanup_state",
+		Kwargs:     map[string]any{"pod_name": "pod-1"},
+		SQSQueue:   "p0-fast-l1",
+	}
+}
+
+func TestEnqueueJobSendsIdempotencyKey(t *testing.T) {
+	server, seen := enqueueJobServer(t)
+	client := fastClient(t, server.URL)
+
+	if err := client.EnqueueJob(context.Background(), sampleEnqueueRequest()); err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("attempts = %d, want 1", len(*seen))
+	}
+	if (*seen)[0].IdempotencyKey == "" {
+		t.Fatal("Idempotency-Key header missing")
+	}
+	if _, ok := (*seen)[0].Body["idempotency_key"]; ok {
+		t.Fatalf("idempotency key leaked into the body: %+v", (*seen)[0].Body)
+	}
+}
+
+func TestEnqueueJobHonoursCallerSuppliedKey(t *testing.T) {
+	server, seen := enqueueJobServer(t)
+	client := fastClient(t, server.URL)
+
+	req := sampleEnqueueRequest()
+	req.IdempotencyKey = "pod-1-cleanup"
+	if err := client.EnqueueJob(context.Background(), req); err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if got := (*seen)[0].IdempotencyKey; got != "pod-1-cleanup" {
+		t.Fatalf("Idempotency-Key = %q, want pod-1-cleanup", got)
+	}
+}
+
+func TestEnqueueJobRetriesTransientWithOneKey(t *testing.T) {
+	// 503 then a connection-level style 502, then success on the third attempt.
+	server, seen := enqueueJobServer(t, http.StatusServiceUnavailable, http.StatusBadGateway)
+	client := fastClient(t, server.URL)
+
+	if err := client.EnqueueJob(context.Background(), sampleEnqueueRequest()); err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if len(*seen) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(*seen))
+	}
+	key := (*seen)[0].IdempotencyKey
+	if key == "" {
+		t.Fatal("Idempotency-Key header missing")
+	}
+	for i, req := range *seen {
+		if req.IdempotencyKey != key {
+			t.Fatalf("attempt %d key = %q, want %q on every retry", i+1, req.IdempotencyKey, key)
+		}
+	}
+}
+
+func TestEnqueueJobRetriesConflictUntilResolved(t *testing.T) {
+	// 409 means a concurrent attempt on the same key is still in flight; it may
+	// yet fail and release the key, so we keep asking rather than assume success.
+	server, seen := enqueueJobServer(t, http.StatusConflict)
+	client := fastClient(t, server.URL)
+
+	if err := client.EnqueueJob(context.Background(), sampleEnqueueRequest()); err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(*seen))
+	}
+}
+
+func TestEnqueueJobStopsOnPermanentStatus(t *testing.T) {
+	server, seen := enqueueJobServer(t, http.StatusBadRequest)
+	client := fastClient(t, server.URL)
+
+	err := client.EnqueueJob(context.Background(), sampleEnqueueRequest())
+	if err == nil {
+		t.Fatal("EnqueueJob = nil, want error")
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("attempts = %d, want 1 (400 is not retryable)", len(*seen))
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("error = %v, want the 400 status", err)
+	}
+}
+
+func TestEnqueueJobExhaustsRetries(t *testing.T) {
+	statuses := make([]int, enqueueMaxAttempts)
+	for i := range statuses {
+		statuses[i] = http.StatusServiceUnavailable
+	}
+	server, seen := enqueueJobServer(t, statuses...)
+	client := fastClient(t, server.URL)
+
+	err := client.EnqueueJob(context.Background(), sampleEnqueueRequest())
+	if err == nil {
+		t.Fatal("EnqueueJob = nil, want error after exhausting retries")
+	}
+	if len(*seen) != enqueueMaxAttempts {
+		t.Fatalf("attempts = %d, want %d", len(*seen), enqueueMaxAttempts)
+	}
+	if !strings.Contains(err.Error(), "503") || !strings.Contains(err.Error(), "4 attempt") {
+		t.Fatalf("error = %v, want the last status and the attempt count", err)
+	}
+}
+
+func TestEnqueueJobStopsRetryingWhenContextExpires(t *testing.T) {
+	server, seen := enqueueJobServer(t, http.StatusServiceUnavailable, http.StatusServiceUnavailable,
+		http.StatusServiceUnavailable, http.StatusServiceUnavailable)
+	client := NewAPIClient(server.URL, 10*time.Second, nil) // real 1s first backoff
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := client.EnqueueJob(ctx, sampleEnqueueRequest()); err == nil {
+		t.Fatal("EnqueueJob = nil, want error")
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("attempts = %d, want 1 — the budget expired during the first backoff", len(*seen))
+	}
+}
+
+func TestFallbackRetriesEnqueueWithOneKey(t *testing.T) {
+	var mu sync.Mutex
+	var seen []capturedAPIRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		mu.Lock()
+		seen = append(seen, capturedAPIRequest{
+			Method:         r.Method,
+			Path:           r.URL.Path,
+			IdempotencyKey: r.Header.Get(idempotencyKeyHeader),
+			Body:           body,
+		})
+		enqueueAttempts := 0
+		for _, req := range seen {
+			if req.Path == enqueueJobPath {
+				enqueueAttempts++
+			}
+		}
+		mu.Unlock()
+
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/bot/"):
+			w.WriteHeader(http.StatusBadGateway) // primary call fails
+		case enqueueAttempts == 1:
+			w.WriteHeader(http.StatusServiceUnavailable) // first fallback attempt fails
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := fastClient(t, server.URL)
+	if err := client.UpdateConversationWithFallback(context.Background(), UpdateConversationRequest{
+		ConversationID: "conv-1",
+	}); err != nil {
+		t.Fatalf("UpdateConversationWithFallback: %v", err)
+	}
+
+	if len(seen) != 3 {
+		t.Fatalf("requests = %d, want 3 (primary + 2 enqueue attempts)", len(seen))
+	}
+	if seen[0].Path != "/bot/update_conversation" || seen[0].IdempotencyKey != "" {
+		t.Fatalf("first request = %+v, want the primary call without an idempotency key", seen[0])
+	}
+	if seen[1].IdempotencyKey == "" || seen[1].IdempotencyKey != seen[2].IdempotencyKey {
+		t.Fatalf("fallback keys = %q, %q, want one shared non-empty key", seen[1].IdempotencyKey, seen[2].IdempotencyKey)
 	}
 }

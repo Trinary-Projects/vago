@@ -176,4 +176,10 @@ type EnqueueJobRequest struct {
 	Kwargs         map[string]any `json:"kwargs"`
 	SQSQueue       string         `json:"sqs_queue"`
 	MessageGroupID string         `json:"message_group_id,omitempty"`
+
+	// IdempotencyKey travels as the Idempotency-Key header, not in the body, so
+	// Disha can dedupe retries before it looks at the payload. Leave it empty to
+	// get a fresh key per call; set it to make a job idempotent across separate
+	// EnqueueJob calls that mean the same thing (e.g. keyed by pod UID).
+	IdempotencyKey string `json:"-"`
 }
