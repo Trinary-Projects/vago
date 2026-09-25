@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -148,19 +149,7 @@ func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error
 }
 
 func (c *APIClient) enqueueJob(ctx context.Context, req EnqueueJobRequest, primaryErr error) error {
-	key, err := req.IdempotencyKey()
-	if err != nil {
-		sentryutil.Capture(sentryutil.Event{
-			Err: err,
-			Tags: map[string]string{
-				"component": "disha_api",
-				"operation": "enqueue_job",
-				"module":    req.ModuleName,
-				"func":      req.FuncName,
-			},
-		})
-		return err
-	}
+	key := uuid.NewString()
 	headers := map[string]string{idempotencyKeyHeader: key}
 
 	var lastErr error

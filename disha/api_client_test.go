@@ -2,8 +2,6 @@ package disha
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -504,74 +502,22 @@ func TestEnqueueJobSendsIdempotencyKey(t *testing.T) {
 	}
 }
 
-func TestIdempotencyKeyIsTheSHA256OfTheJobIdentity(t *testing.T) {
-	req := sampleEnqueueRequest()
-	key, err := req.IdempotencyKey()
-	if err != nil {
-		t.Fatalf("IdempotencyKey: %v", err)
-	}
-
-	identity := `{"module_name":"bots.signal_handler","func_name":"cleanup_state","kwargs":{"pod_name":"pod-1"}}`
-	sum := sha256.Sum256([]byte(identity))
-	if want := hex.EncodeToString(sum[:]); key != want {
-		t.Fatalf("key = %q, want sha256 of %s = %q", key, identity, want)
-	}
-}
-
-func TestIdempotencyKeyIgnoresRoutingAndKwargOrder(t *testing.T) {
-	base := sampleEnqueueRequest()
-	base.Kwargs = map[string]any{"pod_name": "pod-1", "app_name": "worker"}
-	baseKey, err := base.IdempotencyKey()
-	if err != nil {
-		t.Fatalf("IdempotencyKey: %v", err)
-	}
-
-	// Same work, declared in a different order and routed elsewhere.
-	rerouted := sampleEnqueueRequest()
-	rerouted.Kwargs = map[string]any{"app_name": "worker", "pod_name": "pod-1"}
-	rerouted.SQSQueue = "p1-fast-l1"
-	rerouted.MessageGroupID = "group-9"
-	reroutedKey, err := rerouted.IdempotencyKey()
-	if err != nil {
-		t.Fatalf("IdempotencyKey: %v", err)
-	}
-	if reroutedKey != baseKey {
-		t.Fatalf("routing changed the key: %q vs %q", reroutedKey, baseKey)
-	}
-
-	for name, mutate := range map[string]func(*EnqueueJobRequest){
-		"different arg value": func(r *EnqueueJobRequest) { r.Kwargs["pod_name"] = "pod-2" },
-		"extra arg":           func(r *EnqueueJobRequest) { r.Kwargs["extra"] = true },
-		"different func":      func(r *EnqueueJobRequest) { r.FuncName = "other_func" },
-		"different module":    func(r *EnqueueJobRequest) { r.ModuleName = "bots.other" },
-	} {
-		other := sampleEnqueueRequest()
-		other.Kwargs = map[string]any{"pod_name": "pod-1", "app_name": "worker"}
-		mutate(&other)
-		otherKey, err := other.IdempotencyKey()
-		if err != nil {
-			t.Fatalf("IdempotencyKey (%s): %v", name, err)
-		}
-		if otherKey == baseKey {
-			t.Fatalf("%s produced the same key %q", name, otherKey)
-		}
-	}
-}
-
-func TestEnqueueJobSendsTheDerivedKey(t *testing.T) {
+func TestEnqueueJobKeyIsUniquePerCall(t *testing.T) {
 	server, seen := enqueueJobServer(t)
 	client := fastClient(t, server.URL)
 
-	req := sampleEnqueueRequest()
-	want, err := req.IdempotencyKey()
-	if err != nil {
-		t.Fatalf("IdempotencyKey: %v", err)
+	// The key guards one call's retries, so two separate enqueues of identical
+	// work must stay distinct and reach the backend as two jobs.
+	for i := 0; i < 2; i++ {
+		if err := client.EnqueueJob(context.Background(), sampleEnqueueRequest()); err != nil {
+			t.Fatalf("EnqueueJob %d: %v", i, err)
+		}
 	}
-	if err := client.EnqueueJob(context.Background(), req); err != nil {
-		t.Fatalf("EnqueueJob: %v", err)
+	if len(*seen) != 2 {
+		t.Fatalf("saw %d requests, want 2", len(*seen))
 	}
-	if got := (*seen)[0].IdempotencyKey; got != want {
-		t.Fatalf("Idempotency-Key = %q, want the derived %q", got, want)
+	if (*seen)[0].IdempotencyKey == (*seen)[1].IdempotencyKey {
+		t.Fatalf("identical requests shared key %q", (*seen)[0].IdempotencyKey)
 	}
 }
 

@@ -1,12 +1,6 @@
 package disha
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"time"
-)
+import "time"
 
 // ConversationData mirrors the Redis payload Disha stores at
 // conversation_data:{conversation_id}.
@@ -182,21 +176,4 @@ type EnqueueJobRequest struct {
 	Kwargs         map[string]any `json:"kwargs"`
 	SQSQueue       string         `json:"sqs_queue"`
 	MessageGroupID string         `json:"message_group_id,omitempty"`
-}
-
-func (r EnqueueJobRequest) IdempotencyKey() (string, error) {
-	identity, err := json.Marshal(struct {
-		ModuleName string         `json:"module_name"`
-		FuncName   string         `json:"func_name"`
-		Kwargs     map[string]any `json:"kwargs"`
-	}{
-		ModuleName: r.ModuleName,
-		FuncName:   r.FuncName,
-		Kwargs:     r.Kwargs,
-	})
-	if err != nil {
-		return "", fmt.Errorf("disha: hash job identity for %s.%s: %w", r.ModuleName, r.FuncName, err)
-	}
-	sum := sha256.Sum256(identity)
-	return hex.EncodeToString(sum[:]), nil
 }
