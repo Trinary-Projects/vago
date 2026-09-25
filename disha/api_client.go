@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jaideep329/talk-go/internal/sentryutil"
 )
 
@@ -176,9 +175,20 @@ func (c *APIClient) EnqueueJob(ctx context.Context, req EnqueueJobRequest) error
 // fallback, so the Sentry event raised on exhaustion names both failures
 // instead of only the queue one.
 func (c *APIClient) enqueueJob(ctx context.Context, req EnqueueJobRequest, primaryErr error) error {
-	key := strings.TrimSpace(req.IdempotencyKey)
-	if key == "" {
-		key = uuid.NewString()
+	key, err := req.IdempotencyKey()
+	if err != nil {
+		// The job can never be sent — do would fail to marshal the same payload —
+		// so this is dropped work and deserves the same alert as an exhausted retry.
+		sentryutil.Capture(sentryutil.Event{
+			Err: err,
+			Tags: map[string]string{
+				"component": "disha_api",
+				"operation": "enqueue_job",
+				"module":    req.ModuleName,
+				"func":      req.FuncName,
+			},
+		})
+		return err
 	}
 	headers := map[string]string{idempotencyKeyHeader: key}
 

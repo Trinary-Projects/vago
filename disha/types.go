@@ -1,6 +1,12 @@
 package disha
 
-import "time"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // ConversationData mirrors the Redis payload Disha stores at
 // conversation_data:{conversation_id}.
@@ -176,10 +182,34 @@ type EnqueueJobRequest struct {
 	Kwargs         map[string]any `json:"kwargs"`
 	SQSQueue       string         `json:"sqs_queue"`
 	MessageGroupID string         `json:"message_group_id,omitempty"`
+}
 
-	// IdempotencyKey travels as the Idempotency-Key header, not in the body, so
-	// Disha can dedupe retries before it looks at the payload. Leave it empty to
-	// get a fresh key per call; set it to make a job idempotent across separate
-	// EnqueueJob calls that mean the same thing (e.g. keyed by pod UID).
-	IdempotencyKey string `json:"-"`
+// IdempotencyKey is the SHA-256 of the job's identity — the function being
+// called and the arguments it is called with. Deriving it from the request
+// rather than storing it means every attempt at the same job computes the same
+// key without anyone having to thread one through, and two requests that would
+// do identical work are recognised as the same job by Disha.
+//
+// The consequence is that a job repeated on purpose with byte-identical
+// arguments looks like a retry, so it is deduped for as long as Disha keeps the
+// completed record. Give such a job something that varies (an event id, a
+// timestamp) in Kwargs to make it a distinct job.
+//
+// Routing fields (SQSQueue, MessageGroupID) are deliberately excluded: they say
+// how the work travels, not what the work is.
+func (r EnqueueJobRequest) IdempotencyKey() (string, error) {
+	identity, err := json.Marshal(struct {
+		ModuleName string         `json:"module_name"`
+		FuncName   string         `json:"func_name"`
+		Kwargs     map[string]any `json:"kwargs"`
+	}{
+		ModuleName: r.ModuleName,
+		FuncName:   r.FuncName,
+		Kwargs:     r.Kwargs,
+	})
+	if err != nil {
+		return "", fmt.Errorf("disha: hash job identity for %s.%s: %w", r.ModuleName, r.FuncName, err)
+	}
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:]), nil
 }
