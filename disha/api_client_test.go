@@ -60,12 +60,12 @@ func TestAPIClientUpdateConversation(t *testing.T) {
 	client := NewAPIClient(server.URL+"/", 0, nil)
 	at := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
 
-	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{
+	err := client.UpdateConversationWithFallback(context.Background(), UpdateConversationRequest{
 		ConversationID: "conv-1",
 		BotJoinedAt:    &at,
 	})
 	if err != nil {
-		t.Fatalf("UpdateConversation: %v", err)
+		t.Fatalf("UpdateConversationWithFallback: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPatch || got.Path != "/bot/update_conversation" {
@@ -90,7 +90,7 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
 	endedAt := time.Date(2026, 5, 22, 1, 2, 3, 0, time.UTC)
 
-	err := client.RunPostCallOperations(context.Background(), PostCallOperationsRequest{
+	err := client.RunPostCallOperationsWithFallback(context.Background(), PostCallOperationsRequest{
 		ConversationID:     "conv-1",
 		TotalUserDuration:  13,
 		EndedAt:            endedAt,
@@ -98,7 +98,7 @@ func TestAPIClientRunPostCallOperationsIncludesNulls(t *testing.T) {
 		OnboardingCallDone: false,
 	})
 	if err != nil {
-		t.Fatalf("RunPostCallOperations: %v", err)
+		t.Fatalf("RunPostCallOperationsWithFallback: %v", err)
 	}
 	got := <-requests
 	if got.Method != http.MethodPost || got.Path != "/bot/run_post_call_operations" {
@@ -287,7 +287,7 @@ func TestAPIClientNon2xxReturnsError(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := NewAPIClient(server.URL, 10*time.Second, nil)
 
-	err := client.UpdateConversation(context.Background(), UpdateConversationRequest{ConversationID: "conv-1"})
+	err := client.UpdateConversationWithFallback(context.Background(), UpdateConversationRequest{ConversationID: "conv-1"})
 	if err == nil || !strings.Contains(err.Error(), "418") || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("error = %v, want status/body", err)
 	}
@@ -302,9 +302,28 @@ func TestAPIClientContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := client.UpdateConversation(ctx, UpdateConversationRequest{ConversationID: "conv-1"})
+	err := client.send(ctx, http.MethodPatch, "/bot/update_conversation", UpdateConversationRequest{ConversationID: "conv-1"}, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAPIClientFallbackQueuesAfterCallerContextCancelled(t *testing.T) {
+	// Cleanup work must survive a cancelled call context: the primary request
+	// dies with it, while the fallback enqueue runs on its own budget.
+	server, seen := enqueueJobServer(t)
+	client := fastClient(t, server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := client.UpdateConversationWithFallback(ctx, UpdateConversationRequest{ConversationID: "conv-1"}); err != nil {
+		t.Fatalf("UpdateConversationWithFallback: %v", err)
+	}
+	if len(*seen) != 1 || (*seen)[0].Path != enqueueJobPath {
+		t.Fatalf("requests = %+v, want one enqueue_job fallback", *seen)
+	}
+	if (*seen)[0].IdempotencyKey == "" {
+		t.Fatal("Idempotency-Key header missing on the fallback")
 	}
 }
 
@@ -334,12 +353,12 @@ func TestAPIClientSetUserCareplanNullDetected(t *testing.T) {
 	server, requests := captureAPIRequest(t, http.StatusOK)
 	client := NewAPIClient(server.URL, 0, nil)
 
-	err := client.SetUserCareplan(context.Background(), SetUserCareplanRequest{
+	err := client.SetUserCareplanWithFallback(context.Background(), SetUserCareplanRequest{
 		UserID:             "user-1",
 		OnboardingCarePlan: "general",
 	})
 	if err != nil {
-		t.Fatalf("SetUserCareplan: %v", err)
+		t.Fatalf("SetUserCareplanWithFallback: %v", err)
 	}
 	got := <-requests
 	// Python sends detected_care_plan: null explicitly.

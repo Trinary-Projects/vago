@@ -60,8 +60,6 @@ func (e *apiError) transient() bool {
 		return true
 	case e.Status == http.StatusConflict, e.Status == http.StatusTooManyRequests:
 		return true
-	case e.Status >= 500:
-		return true
 	default:
 		return false
 	}
@@ -96,48 +94,32 @@ func NewAPIClient(baseURL string, timeout time.Duration, logger *log.Logger) *AP
 	}
 }
 
-func (c *APIClient) UpdateConversation(ctx context.Context, req UpdateConversationRequest) error {
-	return c.send(ctx, http.MethodPatch, "/bot/update_conversation", req)
-}
-
 func (c *APIClient) UpdateConversationWithFallback(ctx context.Context, req UpdateConversationRequest) error {
-	err := c.sendQuiet(ctx, http.MethodPatch, "/bot/update_conversation", req)
+	err := c.send(ctx, http.MethodPatch, "/bot/update_conversation", req, false)
 	if err == nil {
 		return nil
 	}
 	return c.enqueueAPIFallback("update_conversation", "bots.operations.voice_bot_operations", "update_conversation", req, err)
 }
 
-func (c *APIClient) RunPostCallOperations(ctx context.Context, req PostCallOperationsRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/run_post_call_operations", req)
-}
-
 func (c *APIClient) RunPostCallOperationsWithFallback(ctx context.Context, req PostCallOperationsRequest) error {
-	err := c.sendQuiet(ctx, http.MethodPost, "/bot/run_post_call_operations", req)
+	err := c.send(ctx, http.MethodPost, "/bot/run_post_call_operations", req, false)
 	if err == nil {
 		return nil
 	}
 	return c.enqueueAPIFallback("run_post_call_operations", "bots.operations.voice_bot_operations", "run_post_call_operations", req, err)
 }
 
-func (c *APIClient) SetUserCareplan(ctx context.Context, req SetUserCareplanRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/set_user_careplan", req)
-}
-
 func (c *APIClient) SetUserCareplanWithFallback(ctx context.Context, req SetUserCareplanRequest) error {
-	err := c.sendQuiet(ctx, http.MethodPost, "/bot/set_user_careplan", req)
+	err := c.send(ctx, http.MethodPost, "/bot/set_user_careplan", req, false)
 	if err == nil {
 		return nil
 	}
 	return c.enqueueAPIFallback("set_user_careplan", "bots.operations.voice_bot_operations", "set_user_careplan", req, err)
 }
 
-func (c *APIClient) AddTagToUser(ctx context.Context, req AddTagToUserRequest) error {
-	return c.send(ctx, http.MethodPost, "/bot/add_tag_to_user", req)
-}
-
 func (c *APIClient) AddTagToUserWithFallback(ctx context.Context, req AddTagToUserRequest) error {
-	err := c.sendQuiet(ctx, http.MethodPost, "/bot/add_tag_to_user", req)
+	err := c.send(ctx, http.MethodPost, "/bot/add_tag_to_user", req, false)
 	if err == nil {
 		return nil
 	}
@@ -182,6 +164,7 @@ func (c *APIClient) enqueueJob(ctx context.Context, req EnqueueJobRequest, prima
 		"module_name":     req.ModuleName,
 		"func_name":       req.FuncName,
 		"sqs_queue":       req.SQSQueue,
+		"kwargs":          req.Kwargs,
 		"last_status":     statusOf(lastErr),
 	}
 	if primaryErr != nil {
@@ -222,10 +205,13 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (c *APIClient) send(ctx context.Context, method, path string, body any) error {
+func (c *APIClient) send(ctx context.Context, method, path string, body any, reportErr ...bool) error {
 	err := c.do(ctx, method, path, body, nil)
 	if err == nil {
 		return nil
+	}
+	if len(reportErr) > 0 && !reportErr[0] {
+		return err
 	}
 	sentryutil.Capture(sentryutil.Event{
 		Err: err,
@@ -239,10 +225,6 @@ func (c *APIClient) send(ctx context.Context, method, path string, body any) err
 		},
 	})
 	return err
-}
-
-func (c *APIClient) sendQuiet(ctx context.Context, method, path string, body any) error {
-	return c.do(ctx, method, path, body, nil)
 }
 
 // do performs a single attempt and classifies the outcome; it never reports to
