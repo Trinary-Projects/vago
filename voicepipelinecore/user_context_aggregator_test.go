@@ -402,7 +402,7 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 	var users []string
 	var userPromptKeys []string
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string, merged bool) {
 			users = append(users, text)
 			userPromptKeys = append(userPromptKeys, promptKey)
 		},
@@ -423,9 +423,11 @@ func TestUserContextAggregator_EmitsUserCommittedTurnCallEvent(t *testing.T) {
 func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testing.T) {
 	fix := newTestFixture(t)
 	var users []string
+	var mergedFlags []bool
 	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
-		OnUserTurnCommitted: func(text string, at time.Time, promptKey string) {
+		OnUserTurnCommitted: func(text string, at time.Time, promptKey string, merged bool) {
 			users = append(users, text)
+			mergedFlags = append(mergedFlags, merged)
 		},
 	})
 	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
@@ -445,6 +447,9 @@ func TestUserContextAggregator_MergedUserTurnCallEventMatchesLLMContext(t *testi
 
 	if len(users) != 2 || users[0] != "first" || users[1] != "first second" {
 		t.Fatalf("user turn events = %v, want [\"first\" \"first second\"]", users)
+	}
+	if len(mergedFlags) != 2 || mergedFlags[0] || !mergedFlags[1] {
+		t.Fatalf("merged flags = %v, want [false true]", mergedFlags)
 	}
 
 	var llmFrames []LLMContextFrame

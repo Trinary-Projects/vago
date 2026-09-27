@@ -84,14 +84,16 @@ type CallStats struct {
 
 // CallEvents are integration callbacks for call lifecycle and committed LLM
 // context updates. The first five are one-shot timeline events; committed-turn
-// and tool-result events can fire many times.
+// and tool-result events can fire many times. OnUserTurnCommitted's merged
+// reports that text is the trailing user message with this utterance
+// concatenated onto it, rather than a new message.
 type CallEvents struct {
 	OnBotJoined              func(time.Time)
 	OnUserJoined             func(time.Time)
 	OnUserFirstSpeech        func(time.Time)
 	OnBotFirstSpeech         func(time.Time)
 	OnFirstUserAudio         func(time.Time)
-	OnUserTurnCommitted      func(text string, at time.Time, promptKey string)
+	OnUserTurnCommitted      func(text string, at time.Time, promptKey string, merged bool)
 	OnAssistantTurnCommitted func(text string, at time.Time, metrics TurnMetrics, promptKey string, turn AssistantTurnCompletion)
 	OnToolResultCommitted    func(assistantToolCall Message, toolResult Message, at time.Time)
 	// OnLLMCallCompleted fires when an LLM call finishes, with the

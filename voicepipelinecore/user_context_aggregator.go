@@ -87,11 +87,18 @@ func (a *UserContextAggregator) updateFinalTranscript(f TranscriptFrame) (string
 	return "", false
 }
 
+// Injected instructions (stage continuation, resume nudges) are user-role
+// too, but are not user speech: a new utterance must not merge into them.
+func isInjectedInstruction(content string) bool {
+	return strings.Contains(content, "<system_message>") || strings.Contains(content, "<system_instruction>")
+}
+
 func (a *UserContextAggregator) recordUserMessage(text string) (promptKey string, concatenated string) {
 	a.state.mu.Lock()
 	defer a.state.mu.Unlock()
 
-	if len(a.state.messages) > 0 && a.state.messages[len(a.state.messages)-1].Role == "user" {
+	if n := len(a.state.messages); n > 0 && a.state.messages[n-1].Role == "user" &&
+		!isInjectedInstruction(a.state.messages[n-1].Content) {
 		last := &a.state.messages[len(a.state.messages)-1]
 		last.Content += " " + text
 		concatenated = last.Content
@@ -112,7 +119,7 @@ func (a *UserContextAggregator) addUserMessage(text string) {
 	}
 	a.taskCtx.UIEvents.UserTranscription(text, true, at)
 	if a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireUserTurnCommitted(committed, at, promptKey)
+		a.taskCtx.callEvents.fireUserTurnCommitted(committed, at, promptKey, concatenated != "")
 	}
 }
 
@@ -130,7 +137,7 @@ func (a *UserContextAggregator) submitUserMessage(text string) {
 	}
 	a.taskCtx.UIEvents.UserTranscription(text, true, at)
 	if a.taskCtx.callEvents != nil {
-		a.taskCtx.callEvents.fireUserTurnCommitted(committed, at, promptKey)
+		a.taskCtx.callEvents.fireUserTurnCommitted(committed, at, promptKey, concatenated != "")
 	}
 	a.interruptSent = false
 	a.resetInterimTranscript()

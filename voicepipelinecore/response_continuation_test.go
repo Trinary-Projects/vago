@@ -57,16 +57,30 @@ func TestMessageAppendIsImmediateAndDoesNotDeduplicateRuns(t *testing.T) {
 	}
 }
 
-func TestContinuationInstructionUsesNormalUserMessageMerging(t *testing.T) {
-	fix := newTestFixture(t)
-	pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
-	instruction := "<system_message>continue</system_message>"
-	pair.User().ProcessFrame(fix.RootCtx, NewLLMMessagesAppendFrame([]Message{{Role: "user", Content: instruction}}, true), Downstream)
-	pair.User().ProcessFrame(fix.RootCtx, NewTranscriptFrame("my actual answer", true, 1, false), Downstream)
-	pair.User().ProcessFrame(fix.RootCtx, NewTranscriptFrame("<end>", true, 1, false), Downstream)
-	messages := pair.MessagesSnapshot()
-	if messages[len(messages)-1].Content != instruction+" my actual answer" {
-		t.Fatalf("messages=%+v", messages)
+func TestInjectedInstructionIsNotMergedWithUserSpeech(t *testing.T) {
+	for _, instruction := range []string{
+		"<system_message>continue</system_message>",
+		"<system_instruction>resume</system_instruction>",
+	} {
+		fix := newTestFixture(t)
+		var merged []bool
+		fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+			OnUserTurnCommitted: func(text string, at time.Time, promptKey string, m bool) {
+				merged = append(merged, m)
+			},
+		})
+		pair := NewContextAggregatorPair(fix.TaskCtx, testInitialMessages(), "")
+		pair.User().ProcessFrame(fix.RootCtx, NewLLMMessagesAppendFrame([]Message{{Role: "user", Content: instruction}}, true), Downstream)
+		pair.User().ProcessFrame(fix.RootCtx, NewTranscriptFrame("my actual answer", true, 1, false), Downstream)
+		pair.User().ProcessFrame(fix.RootCtx, NewTranscriptFrame("<end>", true, 1, false), Downstream)
+		fix.TaskCtx.callEvents.stopAndDrain()
+		messages := pair.MessagesSnapshot()
+		if messages[len(messages)-2].Content != instruction || messages[len(messages)-1].Content != "my actual answer" {
+			t.Fatalf("messages=%+v", messages)
+		}
+		if len(merged) != 1 || merged[0] {
+			t.Fatalf("%s: merged flags = %v, want [false]", instruction, merged)
+		}
 	}
 }
 

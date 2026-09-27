@@ -168,8 +168,10 @@ func (c *CallEventCallbacks) OnBotFirstSpeech(at time.Time) {
 
 func (c *CallEventCallbacks) OnFirstUserAudio(time.Time) {}
 
-func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string) {
-	if c.lastChunk.valid && c.lastChunk.role == "user" {
+func (c *CallEventCallbacks) OnUserTurnCommitted(text string, at time.Time, promptKey string, merged bool) {
+	// Rewrite only when the aggregator merged: a separate message after an
+	// injected instruction (which has no chunk) must not replace this chunk.
+	if merged && c.lastChunk.valid && c.lastChunk.role == "user" {
 		c.rewriteLastUserChunk(text, at, promptKey)
 		return
 	}
