@@ -149,3 +149,7 @@ Local test follow-up: all five new staging workers were ready with zero containe
 Production setup verification (2026-09-30): required SSM parameters and production targets checked without printing values; Kubernetes deployment permissions checked with user impersonation; GCP registry and federation grants inspected; AWS SSM policies simulated against production and staging parameter ARNs. Local cloud-token impersonation is not granted to the operator account, so this is configuration/authorization verification, not a hosted production execution. Existing production workload pod templates were not changed. The first production rollout remains untested.
 
 Inline cache staging experiment: this branch sets `DEPLOY_INLINE_CACHE=true` only for staging. Build imports cache from the same staging image repository’s `latest` tag and embeds `BUILDKIT_INLINE_CACHE=1`. Push publishes the unique deployment tag, then updates `latest` as the next run’s cache source. Kubernetes still uses the unique tag. Production and ordinary local invocations retain their previous behavior. Benchmark compares two manual hosted staging runs of the same commit; the first populates cache metadata and the second tests reuse.
+
+## Runner setup performance
+
+The workflow reuses the Ubuntu 24.04 runner’s preinstalled gcloud and kubectl, logs their versions, and installs only the GKE authentication plugin if missing. Cloud authentication and deployment phases are unchanged.

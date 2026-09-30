@@ -71,9 +71,19 @@ jobs:
           sudo apt-get install -y gettext-base jq
 
       - name: Set up gcloud and kubectl
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
-        with:
-          install_components: gke-gcloud-auth-plugin,kubectl
+        run: |
+          # Ubuntu 24.04 runners already provide gcloud and kubectl.
+          gcloud version
+          kubectl version --client=true
+          if ! command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+              | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-cloud-deploy.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/google-cloud-deploy.gpg] https://packages.cloud.google.com/apt cloud-sdk main' \
+              | sudo tee /etc/apt/sources.list.d/google-cloud-deploy.list >/dev/null
+            sudo apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/google-cloud-deploy.list -o Dir::Etc::sourceparts=-
+            sudo apt-get install -y --no-install-recommends google-cloud-cli-gke-gcloud-auth-plugin
+          fi
+          gke-gcloud-auth-plugin --version
 
       - name: Authenticate to AWS Parameter Store
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
