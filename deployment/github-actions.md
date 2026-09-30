@@ -1,6 +1,6 @@
 # GitHub Actions Kubernetes deployments
 
-Status: staging deployment passed on a GitHub-hosted Ubuntu 24.04 runner on 2026-09-30: [successful run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087). Cloud authentication, image build/push, Kubernetes rollout and independent HTTP health/readiness checks passed. The temporary branch push trigger was removed after the test; deployments are manual only. Changes remain on `codex/github-actions-staging-test`; merge the workflow to `main` to expose the normal web/Mobile Run workflow button. Production identities and environment are not configured.
+Status: staging deployment passed on a GitHub-hosted Ubuntu 24.04 runner on 2026-09-30: [successful run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087). Cloud authentication, image build/push, Kubernetes rollout and independent HTTP health/readiness checks passed. The temporary branch push trigger was removed after the test; deployments are manual only. Use `main` for the web/Mobile Run workflow button. Staging deployment access is restricted to `main`. Production identities and environment are not configured.
 
 ## Running a deployment once enabled
 
@@ -18,7 +18,7 @@ GitHub's default concurrency keeps one running and at most one pending run per g
 
 ## One-time setup (administrator)
 
-The staging configuration below has been applied. Production remains a setup reference and has not been applied. During the branch test, staging also permits the exact `codex/github-actions-staging-test` branch; the GCP provider is currently restricted to the staging subject. Use a separate identity for each repo/environment. Runtime application AWS credentials remain managed by the existing SSM paths; the Actions AWS role only fetches configuration.
+The staging configuration below has been applied. Production remains a setup reference and has not been applied. Staging permits only `main`; the GCP provider is restricted to the staging subject and this deployment workflow. Use a separate identity for each repo/environment. Runtime application AWS credentials remain managed by the existing SSM paths; the Actions AWS role only fetches configuration.
 
 ### 1. GitHub environments
 
@@ -76,12 +76,12 @@ Current staging provider attribute condition (numeric IDs resist organization/re
 ```text
 assertion.repository_owner_id == '72670721' &&
 assertion.repository_id == '1167931098' &&
-assertion.ref in ['refs/heads/main', 'refs/heads/codex/github-actions-staging-test'] &&
+assertion.ref == 'refs/heads/main' &&
 assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@' + assertion.ref &&
 assertion.sub == 'repo:Trinary-Projects/vago:environment:staging'
 ```
 
-When enabling production, explicitly add its subject to the provider condition, create its environment and role, and apply its registry/RBAC grants. After merging, remove the test branch from both the GitHub staging environment branch policies and provider condition.
+When enabling production, explicitly add its subject to the provider condition, create its environment and role, and apply its registry/RBAC grants.
 
 Create the two service accounts listed in the GitHub variables table. On **each service account**, grant `roles/iam.workloadIdentityUser` only to its exact matching subject:
 
@@ -123,7 +123,7 @@ The existing Vago rollout timeout remains 10 minutes. Its pod termination grace 
 
 Before calling this ready for emergencies, verify an actual hosted runner can reach the Kubernetes API endpoint. Credentials alone do not establish reachability. If existing firewall/private endpoint restrictions block hosted runners, use a runner in the existing trusted network (or an explicitly configured private connection), instead of opening the database to the internet.
 
-Review and merge the code to `main`, configure the identities/environments, and run a supervised first staging deployment. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. The subsequent [GitHub-hosted run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087) verified OIDC and the complete staging deployment. No production Kubernetes deployment was run. Phone UI dispatch remains to be checked after merging to main.
+The workflow on `main` uses the configured staging identities/environment. Select `staging` for normal manual deployments. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. The subsequent [GitHub-hosted run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087) verified OIDC and the complete staging deployment. No production Kubernetes deployment was run. Phone UI dispatch has not been independently tested.
 
 The local commands remain available for GitHub outages (`./deploy-staging.sh` and `./deploy-prod.sh`). This fallback needs a clean trusted checkout, local credentials/network access, and Docker. Actions is not an independent fallback during a GitHub outage, and a hosted run does not by itself prove emergency reliability.
 
