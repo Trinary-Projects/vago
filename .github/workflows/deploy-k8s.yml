@@ -102,6 +102,7 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
 
       - name: Configure registry and connect to Kubernetes
         id: cluster
@@ -123,6 +124,7 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
 
       - name: Push Docker image
         timeout-minutes: 30
@@ -139,6 +141,7 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
 
       - name: Update runtime configuration secret
         timeout-minutes: 5
