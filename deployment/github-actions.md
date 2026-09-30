@@ -1,10 +1,10 @@
 # GitHub Actions Kubernetes deployments
 
-Status: staging cloud identities, Kubernetes RBAC and GitHub environment configured on 2026-09-30. First GitHub-hosted test pending on `codex/github-actions-staging-test`. This branch temporarily deploys staging on push; remove that trigger after testing. Production setup is still pending.
+Status: staging deployment passed on a GitHub-hosted Ubuntu 24.04 runner on 2026-09-30: [successful run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087). Cloud authentication, image build/push, Kubernetes rollout and independent HTTP health/readiness checks passed. The temporary branch push trigger was removed after the test; deployments are manual only. Changes remain on `codex/github-actions-staging-test`; merge the workflow to `main` to expose the normal web/Mobile Run workflow button. Production identities and environment are not configured.
 
 ## Running a deployment once enabled
 
-In GitHub web or GitHub Mobile: open this repository → Actions → **Deploy to Kubernetes** → **Run workflow**, choose `main`, and select `staging` or `prod`. The workflow file must be on the default branch before manual dispatch appears. Mobile supports manual dispatch; use the web run page for live log streaming if the native app does not expose it.
+In GitHub web or GitHub Mobile: open this repository → Actions → **Deploy to Kubernetes** → **Run workflow**, choose `main`, and select `staging`. Select `prod` only after its separate setup below is completed. The workflow file must be on the default branch before manual dispatch appears. Mobile supports manual dispatch; use the web run page for live log streaming if the native app does not expose it.
 
 Each phase has its own status and logs. Docker uses plain BuildKit progress; migration errors remain in the migration step. After Kubernetes is connected, best-effort diagnostics run even on failure. Failed runs include the last 100 current/previous container log lines for unhealthy pods created by that attempt; fetched credential values are masked before these logs are read. The summary records the commit and image tag. Nothing posts to Slack in this first CI version.
 
@@ -71,15 +71,17 @@ attribute.ref=assertion.ref
 attribute.workflow_ref=assertion.workflow_ref
 ```
 
-Use this provider attribute condition (numeric IDs resist organization/repository name reuse):
+Current staging provider attribute condition (numeric IDs resist organization/repository name reuse):
 
 ```text
 assertion.repository_owner_id == '72670721' &&
 assertion.repository_id == '1167931098' &&
-assertion.ref == 'refs/heads/main' &&
-assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@refs/heads/main' &&
-assertion.sub in ['repo:Trinary-Projects/vago:environment:staging', 'repo:Trinary-Projects/vago:environment:prod']
+assertion.ref in ['refs/heads/main', 'refs/heads/codex/github-actions-staging-test'] &&
+assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@' + assertion.ref &&
+assertion.sub == 'repo:Trinary-Projects/vago:environment:staging'
 ```
+
+When enabling production, explicitly add its subject to the provider condition, create its environment and role, and apply its registry/RBAC grants. After merging, remove the test branch from both the GitHub staging environment branch policies and provider condition.
 
 Create the two service accounts listed in the GitHub variables table. On **each service account**, grant `roles/iam.workloadIdentityUser` only to its exact matching subject:
 
@@ -97,7 +99,7 @@ Enable IAM Service Account Credentials API (`iamcredentials.googleapis.com`) and
 | staging | `disha-voice-worker-staging` (`us-east1`) | `disha-voice-worker-staging` (`us-east1`) | `staging` |
 | prod | `disha-voice-worker-prod` (`us-east1`) | `disha-voice-worker-prod` (`us-east4`) | `prod` |
 
-The workflow obtains one-hour service-account access tokens immediately before push, and refreshes them before applying manifests. `CLOUDSDK_AUTH_ACCESS_TOKEN` is passed to gcloud and the GKE auth plugin, so a long Docker build does not consume the deployment token's lifetime. Generated `gha-creds-*.json` files are excluded from Git and Docker contexts.
+The workflow obtains one-hour service-account access tokens immediately before push, and refreshes them before applying manifests. `CLOUDSDK_AUTH_ACCESS_TOKEN` is passed to gcloud and the GKE auth plugin, so a long Docker build does not consume the deployment token's lifetime. Generated `gha-creds-*.json` files are excluded from Git and Docker contexts. Access tokens include `userinfo.email` as well as `cloud-platform`: without the email scope, GKE identifies the account by numeric ID and email-based RoleBindings reject it (caught and fixed by the first hosted test).
 
 ### 4. Kubernetes authorization and existing infrastructure
 
@@ -121,7 +123,7 @@ The existing Vago rollout timeout remains 10 minutes. Its pod termination grace 
 
 Before calling this ready for emergencies, verify an actual hosted runner can reach the Kubernetes API endpoint. Credentials alone do not establish reachability. If existing firewall/private endpoint restrictions block hosted runners, use a runner in the existing trusted network (or an explicitly configured private connection), instead of opening the database to the internet.
 
-Review and merge the code to `main`, configure the identities/environments, and run a supervised first staging deployment. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. This did not test GitHub-hosted runners or OIDC; no production deployment was run.
+Review and merge the code to `main`, configure the identities/environments, and run a supervised first staging deployment. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. The subsequent [GitHub-hosted run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087) verified OIDC and the complete staging deployment. No production Kubernetes deployment was run. Phone UI dispatch remains to be checked after merging to main.
 
 The local commands remain available for GitHub outages (`./deploy-staging.sh` and `./deploy-prod.sh`). This fallback needs a clean trusted checkout, local credentials/network access, and Docker. Actions is not an independent fallback during a GitHub outage, and a hosted run does not by itself prove emergency reliability.
 

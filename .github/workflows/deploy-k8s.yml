@@ -1,10 +1,7 @@
 name: Deploy to Kubernetes
-run-name: Deploy ${{ inputs.environment || 'staging' }} · ${{ github.ref_name }} · @${{ github.actor }}
+run-name: Deploy ${{ inputs.environment }} · ${{ github.ref_name }} · @${{ github.actor }}
 
 on:
-  # Temporary bootstrap trigger; remove after the hosted staging test.
-  push:
-    branches: [codex/github-actions-staging-test]
   workflow_dispatch:
     inputs:
       environment:
@@ -22,19 +19,19 @@ permissions:
 
 # An active deployment must finish before another can change the same target.
 concurrency:
-  group: k8s-vago-${{ inputs.environment || 'staging' }}
+  group: k8s-vago-${{ inputs.environment }}
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    environment: ${{ inputs.environment || 'staging' }}
+    environment: ${{ inputs.environment }}
     defaults:
       run:
         shell: bash
     env:
-      DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'staging' }}
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
       GCP_PROJECT_ID: curelinkai
       AWS_DEFAULT_REGION: ap-south-1
       AWS_RETRY_MODE: standard
