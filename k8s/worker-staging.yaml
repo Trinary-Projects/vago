@@ -67,7 +67,7 @@ spec:
             topologyKey: kubernetes.io/hostname
       containers:
       - name: talk-go-worker
-        image: us-east1-docker.pkg.dev/$GCP_PROJECT_ID/$ARTIFACT_REPOSITORY_NAME/talk-go-worker:latest
+        image: $IMAGE
         imagePullPolicy: Always
         lifecycle:
           preStop:
