@@ -194,7 +194,7 @@ func (b FollowUpBot) BuildTask(ctx context.Context, req BotTaskRequest, deps Dep
 	source := voicepipelinecore.NewPipelineSourceProcessor(taskCtx)
 	task.AttachSource(source)
 	audioSource := voicepipelinecore.NewAudioSourceProcessor(taskCtx)
-	stt := voicepipelinecore.NewSTTProcessor(taskCtx) // Soniox only, by design.
+	stt := newSTTProcessor(taskCtx, pl.Startup.Data.UserProfile.CartesiaCallSTTVariantFlag, taskCtx.Logger)
 
 	var room voicepipelinecore.RoomTransport
 	if isDailyRoomURL(req.RoomURL) {

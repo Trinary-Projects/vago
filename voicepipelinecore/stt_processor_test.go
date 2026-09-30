@@ -26,20 +26,26 @@ type sttWireMessage struct {
 	payload     string
 }
 
-func TestSTTConfigUsesSonioxV5EndpointDetectionDefaults(t *testing.T) {
+func TestSTTConfigUsesSonioxV5EndpointDetection(t *testing.T) {
 	payload := sttConfigPayload()
 
 	want := map[string]any{
 		"model":                             "stt-rt-v5",
 		"enable_endpoint_detection":         true,
+		"audio_format":                      "s16le",
+		"sample_rate":                       16000,
+		"num_channels":                      1,
 		"endpoint_latency_adjustment_level": 0,
-		"endpoint_sensitivity":              0.0,
+		"endpoint_sensitivity":              -0.3,
 		"max_endpoint_delay_ms":             2000,
 	}
 	for key, wantValue := range want {
 		if got := payload[key]; got != wantValue {
 			t.Errorf("config[%q] = %#v, want %#v", key, got, wantValue)
 		}
+	}
+	if hints, ok := payload["language_hints"].([]string); !ok || len(hints) != 1 || hints[0] != "hi" {
+		t.Errorf("config[\"language_hints\"] = %#v, want []string{\"hi\"}", payload["language_hints"])
 	}
 }
 
