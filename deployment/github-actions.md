@@ -1,10 +1,10 @@
 # GitHub Actions Kubernetes deployments
 
-Status: staging deployment passed on a GitHub-hosted Ubuntu 24.04 runner on 2026-09-30: [successful run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087). Cloud authentication, image build/push, Kubernetes rollout and independent HTTP health/readiness checks passed. The temporary branch push trigger was removed after the test; deployments are manual only. Use `main` for the web/Mobile Run workflow button. Staging deployment access is restricted to `main`. Production identities and environment are not configured.
+Status: staging deployment passed on a GitHub-hosted Ubuntu 24.04 runner on 2026-09-30: [successful run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087). Cloud authentication, image build/push, Kubernetes rollout and independent HTTP health/readiness checks passed. The temporary branch push trigger was removed after the test; deployments are manual only. Staging can be manually deployed from any repository branch containing the workflow; production is restricted to `main`. Both GitHub environment branch policies are configured. Production cloud identities, GitHub environment variables, application secret (Disha) and deployment RBAC are configured as of 2026-09-30. No production deployment was triggered during setup; the first production run will be started manually by Jaideep.
 
 ## Running a deployment once enabled
 
-In GitHub web or GitHub Mobile: open this repository → Actions → **Deploy to Kubernetes** → **Run workflow**, choose `main`, and select `staging`. Select `prod` only after its separate setup below is completed. The workflow file must be on the default branch before manual dispatch appears. Mobile supports manual dispatch; use the web run page for live log streaming if the native app does not expose it.
+In GitHub web or GitHub Mobile: open this repository → Actions → **Deploy to Kubernetes** → **Run workflow**, choose the branch to deploy and select `staging`. For `prod`, choose `main`; its credentials and permissions are configured. Older branches must first incorporate the deployment workflow and scripts from `main`. The workflow file must be on the default branch before manual dispatch appears. Mobile supports manual dispatch; use the web run page for live log streaming if the native app does not expose it.
 
 Each phase has its own status and logs. Docker uses plain BuildKit progress; migration errors remain in the migration step. After Kubernetes is connected, best-effort diagnostics run even on failure. Failed runs include the last 100 current/previous container log lines for unhealthy pods created by that attempt; fetched credential values are masked before these logs are read. The summary records the commit and image tag. Nothing posts to Slack in this first CI version.
 
@@ -18,11 +18,11 @@ GitHub's default concurrency keeps one running and at most one pending run per g
 
 ## One-time setup (administrator)
 
-The staging configuration below has been applied. Production remains a setup reference and has not been applied. Staging permits only `main`; the GCP provider is restricted to the staging subject and this deployment workflow. Use a separate identity for each repo/environment. Runtime application AWS credentials remain managed by the existing SSM paths; the Actions AWS role only fetches configuration.
+The configuration below has been applied for both staging and production. The production GitHub environment permits only `main`. Staging permits any branch, including names containing slashes, through the branch-only `**/*` environment pattern. The GCP provider permits only manual (`workflow_dispatch`) runs of this deployment workflow on branch refs in this repository, with the staging subject on any branch, or the production subject on `main` only. Use a separate identity for each repo/environment. Runtime application AWS credentials remain managed by the existing SSM paths; the Actions AWS role only fetches configuration.
 
 ### 1. GitHub environments
 
-Create `staging` and `prod` under repository Settings → Environments. Restrict **both** to the `main` branch (selected branches, not all protected branches). Staging inherits production SSM values, so it must also run only trusted code. Keep deployment approval optional according to the emergency access policy you want. A required reviewer adds a wait before cloud authentication.
+The `staging` and `prod` environments exist under repository Settings → Environments. Configure staging with a selected **branch** pattern of `**/*` (any branch, including nested names), and production with the selected **branch** `main` only. Do not add tag rules. Both workflows use only `workflow_dispatch`; no push, PR or scheduled deployment triggers are configured. Staging inherits production SSM values, so manually deploy trusted code only. Keep deployment approval optional according to the emergency access policy you want. A required reviewer adds a wait before cloud authentication.
 
 Set these environment variables (not repository secrets):
 
@@ -71,17 +71,19 @@ attribute.ref=assertion.ref
 attribute.workflow_ref=assertion.workflow_ref
 ```
 
-Current staging provider attribute condition (numeric IDs resist organization/repository name reuse):
+Current provider attribute condition (numeric IDs resist organization/repository name reuse):
 
 ```text
 assertion.repository_owner_id == '72670721' &&
 assertion.repository_id == '1167931098' &&
-assertion.ref == 'refs/heads/main' &&
+assertion.ref.startsWith('refs/heads/') &&
+assertion.event_name == 'workflow_dispatch' &&
 assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@' + assertion.ref &&
-assertion.sub == 'repo:Trinary-Projects/vago:environment:staging'
+((assertion.sub == 'repo:Trinary-Projects/vago:environment:staging' && assertion.ref.startsWith('refs/heads/')) ||
+ (assertion.sub == 'repo:Trinary-Projects/vago:environment:prod' && assertion.ref == 'refs/heads/main'))
 ```
 
-When enabling production, explicitly add its subject to the provider condition, create its environment and role, and apply its registry/RBAC grants.
+Production has its own subject-and-branch clause and its own service account and AWS role. Preserve the common repository, workflow path and manual-event checks. Never add the production subject to the staging any-branch clause.
 
 Create the two service accounts listed in the GitHub variables table. On **each service account**, grant `roles/iam.workloadIdentityUser` only to its exact matching subject:
 
@@ -123,7 +125,7 @@ The existing Vago rollout timeout remains 10 minutes. Its pod termination grace 
 
 Before calling this ready for emergencies, verify an actual hosted runner can reach the Kubernetes API endpoint. Credentials alone do not establish reachability. If existing firewall/private endpoint restrictions block hosted runners, use a runner in the existing trusted network (or an explicitly configured private connection), instead of opening the database to the internet.
 
-The workflow on `main` uses the configured staging identities/environment. Select `staging` for normal manual deployments. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. The subsequent [GitHub-hosted run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087) verified OIDC and the complete staging deployment. No production Kubernetes deployment was run. Phone UI dispatch has not been independently tested.
+The workflow uses the identities for the selected environment on the selected repository branch. Select `staging` for manual deployments from that branch; production accepts only `main`. This is a real staging deployment, not a dry run. Record the successful run URL and test that you can dispatch from your phone. On 2026-09-30, the staged phases were successfully run locally against this staging cluster, including rollout and HTTP health/readiness checks. The subsequent [GitHub-hosted run](https://github.com/Trinary-Projects/vago/actions/runs/36739103087) verified OIDC and the complete staging deployment. No production Kubernetes deployment was run. Phone UI dispatch has not been independently tested.
 
 The local commands remain available for GitHub outages (`./deploy-staging.sh` and `./deploy-prod.sh`). This fallback needs a clean trusted checkout, local credentials/network access, and Docker. Actions is not an independent fallback during a GitHub outage, and a hosted run does not by itself prove emergency reliability.
 
@@ -143,3 +145,11 @@ The regression tests use temporary directories and mocked cloud commands. They p
 Sources: [GitHub manual dispatch](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow), [GitHub Mobile dispatch](https://github.blog/changelog/2024-07-30-run-workflows-set-as-workflow_dispatch-manually/), [Google authentication action](https://github.com/google-github-actions/auth), [GKE authorization](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control).
 
 Local test follow-up: all five new staging workers were ready with zero container restarts at verification. Existing PodDisruptionBudgets `talk-go-worker-pdb` and `disha-go-voice-worker-staging-pdb` select the same pods; their overlap was recorded, not changed.
+
+Production setup verification (2026-09-30): required SSM parameters and production targets checked without printing values; Kubernetes deployment permissions checked with user impersonation; GCP registry and federation grants inspected; AWS SSM policies simulated against production and staging parameter ARNs. Local cloud-token impersonation is not granted to the operator account, so this is configuration/authorization verification, not a hosted production execution. Existing production workload pod templates were not changed. The first production rollout remains untested.
+
+Inline cache staging experiment: this branch sets `DEPLOY_INLINE_CACHE=true` only for staging. Build imports cache from the same staging image repository’s `latest` tag and embeds `BUILDKIT_INLINE_CACHE=1`. Push publishes the unique deployment tag, then updates `latest` as the next run’s cache source. Kubernetes still uses the unique tag. Production and ordinary local invocations retain their previous behavior. Benchmark compares two manual hosted staging runs of the same commit; the first populates cache metadata and the second tests reuse.
+
+## Runner setup performance
+
+The workflow reuses the Ubuntu 24.04 runner’s preinstalled gcloud and kubectl, logs their versions, and installs only the GKE authentication plugin if missing. Cloud authentication and deployment phases are unchanged.

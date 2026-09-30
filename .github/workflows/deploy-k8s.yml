@@ -32,6 +32,7 @@ jobs:
         shell: bash
     env:
       DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      DEPLOY_INLINE_CACHE: ${{ inputs.environment == 'staging' && 'true' || 'false' }}
       GCP_PROJECT_ID: curelinkai
       AWS_DEFAULT_REGION: ap-south-1
       AWS_RETRY_MODE: standard
@@ -70,9 +71,19 @@ jobs:
           sudo apt-get install -y gettext-base jq
 
       - name: Set up gcloud and kubectl
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
-        with:
-          install_components: gke-gcloud-auth-plugin,kubectl
+        run: |
+          # Ubuntu 24.04 runners already provide gcloud and kubectl.
+          gcloud version
+          kubectl version --client=true
+          if ! command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+              | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-cloud-deploy.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/google-cloud-deploy.gpg] https://packages.cloud.google.com/apt cloud-sdk main' \
+              | sudo tee /etc/apt/sources.list.d/google-cloud-deploy.list >/dev/null
+            sudo apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/google-cloud-deploy.list -o Dir::Etc::sourceparts=-
+            sudo apt-get install -y --no-install-recommends google-cloud-cli-gke-gcloud-auth-plugin
+          fi
+          gke-gcloud-auth-plugin --version
 
       - name: Authenticate to AWS Parameter Store
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
@@ -108,8 +119,21 @@ jobs:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cluster-auth.outputs.access_token }}
         run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" authenticate
 
+      - name: Authenticate to Google Cloud for build cache
+        id: build-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: curelinkai
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
+
       - name: Build Docker image
         timeout-minutes: 60
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.build-auth.outputs.access_token }}
         run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" build
 
       - name: Authenticate to Google Cloud for image push
@@ -164,7 +188,7 @@ jobs:
         timeout-minutes: 3
         env:
           DEPLOY_FAILED: ${{ job.status == 'failure' }}
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token || steps.push-auth.outputs.access_token || steps.cluster-auth.outputs.access_token }}
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token || steps.push-auth.outputs.access_token || steps.build-auth.outputs.access_token || steps.cluster-auth.outputs.access_token }}
         run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" diagnostics
 
       - name: Deployment summary

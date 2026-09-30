@@ -102,7 +102,38 @@ class DeployTests(unittest.TestCase):
         docker = [c for c in self.commands() if c[0] == 'docker']
         self.assertEqual(len(docker), 1)
         self.assertEqual(docker[0][1], 'build')
+        self.assertNotIn('--cache-from', docker[0])
         self.assertIn(':fixture-sha-123-1', ' '.join(docker[0]))
+
+    def test_inline_cache_build_reads_latest_and_exports_metadata(self):
+        result = self.run_phase('build', DEPLOY_INLINE_CACHE='true')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command = next(c for c in self.commands() if c[:2] == ['docker', 'build'])
+        self.assertIn('BUILDKIT_INLINE_CACHE=1', command)
+        self.assertTrue(command[command.index('--cache-from') + 1].endswith(':latest'))
+        self.assertTrue(command[command.index('-t') + 1].endswith(':fixture-sha-123-1'))
+
+    def test_inline_cache_push_publishes_unique_image_before_latest(self):
+        result = self.run_phase('push', DEPLOY_INLINE_CACHE='true')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docker = [c for c in self.commands() if c[0] == 'docker']
+        self.assertEqual([c[1] for c in docker], ['push', 'tag', 'push'])
+        self.assertTrue(docker[0][2].endswith(':fixture-sha-123-1'))
+        self.assertEqual(docker[1][2], docker[0][2])
+        self.assertEqual(docker[1][3], docker[2][2])
+        self.assertTrue(docker[2][2].endswith(':latest'))
+
+    def test_latest_cache_push_failure_is_not_success(self):
+        image = ('asia-south1-docker.pkg.dev/curelinkai/disha-backend-staging/app'
+                 if DISHA else 'us-east1-docker.pkg.dev/curelinkai/disha-voice-worker-staging/talk-go-worker')
+        result = self.run_phase('push', DEPLOY_INLINE_CACHE='true', FAIL_COMMAND='docker', FAIL_MATCH='push ' + image + ':latest')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_inline_cache_experiment_refuses_production_before_commands(self):
+        result = self.run_phase('build', environment='prod', DEPLOY_INLINE_CACHE='true')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('staging-only', result.stderr)
+        self.assertEqual(self.commands(), [])
 
     def test_build_failure_is_not_success(self):
         self.assertNotEqual(self.run_phase('build', FAIL_COMMAND='docker').returncode, 0)
@@ -134,7 +165,7 @@ class DeployTests(unittest.TestCase):
         self.assertNotEqual(self.run_phase(phase, FAIL_COMMAND='kubectl', FAIL_MATCH='apply').returncode, 0)
 
     def test_manifest_uses_exact_built_image(self):
-        result = self.run_phase('api' if DISHA else 'apply')
+        result = self.run_phase('api' if DISHA else 'apply', DEPLOY_INLINE_CACHE='true')
         self.assertEqual(result.returncode, 0, result.stderr)
         rendered = self.manifests.read_text()
         self.assertIn(':fixture-sha-123-1', rendered)

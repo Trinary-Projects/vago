@@ -11,6 +11,11 @@ case "$DEPLOY_ENVIRONMENT" in
     *) echo "Expected staging or prod" >&2; exit 2 ;;
 esac
 case "$DEPLOY_PHASE" in all|prepare|authenticate|build|push|secret|apply|rollout|diagnostics) ;; *) echo "Unknown deployment phase" >&2; exit 2 ;; esac
+# Opt-in staging experiment; production keeps its existing build/push behavior.
+if [[ "${DEPLOY_INLINE_CACHE:-false}" == "true" && "$DEPLOY_ENVIRONMENT" != "staging" ]]; then
+    echo "Inline cache experiment is staging-only" >&2
+    exit 2
+fi
 umask 077
 ENV_FILE="$ROOT_DIR/.temp-deploy.env"
 trap 'code=$?; echo "Deployment phase failed: $DEPLOY_PHASE (exit $code)" >&2; exit "$code"' ERR
@@ -91,11 +96,21 @@ authenticate() {
 }
 
 build() {
-    docker build --platform=linux/amd64 -t "$IMAGE" .
+    if [[ "${DEPLOY_INLINE_CACHE:-false}" == "true" ]]; then
+        docker build --platform=linux/amd64 \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from "$IMAGE_REPOSITORY:latest" -t "$IMAGE" .
+    else
+        docker build --platform=linux/amd64 -t "$IMAGE" .
+    fi
 }
 
 push() {
     docker push "$IMAGE"
+    if [[ "${DEPLOY_INLINE_CACHE:-false}" == "true" && "$IMAGE" != "$IMAGE_REPOSITORY:latest" ]]; then
+        docker tag "$IMAGE" "$IMAGE_REPOSITORY:latest"
+        docker push "$IMAGE_REPOSITORY:latest"
+    fi
 }
 
 update_secret() {
