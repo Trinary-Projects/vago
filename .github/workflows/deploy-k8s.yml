@@ -1,0 +1,186 @@
+name: Deploy to Kubernetes
+run-name: Deploy ${{ inputs.environment }} · ${{ github.ref_name }} · @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        type: choice
+        required: true
+        default: staging
+        options:
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+# An active deployment must finish before another can change the same target.
+concurrency:
+  group: k8s-vago-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      GCP_PROJECT_ID: curelinkai
+      AWS_DEFAULT_REGION: ap-south-1
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: '10'
+      DEPLOY_IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      DEPLOY_POD_VERSION: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      BUILDKIT_PROGRESS: plain
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check deployment configuration
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          case "$DEPLOY_ENVIRONMENT" in staging|prod) ;; *) exit 1 ;; esac
+          if [[ "$DEPLOY_ENVIRONMENT" == prod && "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Production deployments must use the main branch.'
+            exit 1
+          fi
+          for name in AWS_ROLE_ARN GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Set the $name variable in the selected GitHub environment."
+              exit 1
+            fi
+          done
+
+      - name: Check out the requested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install deployment tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gettext-base jq
+
+      - name: Set up gcloud and kubectl
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+        with:
+          install_components: gke-gcloud-auth-plugin,kubectl
+
+      - name: Authenticate to AWS Parameter Store
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+          role-session-name: deploy-${{ github.run_id }}
+          role-duration-seconds: 3600
+          allowed-account-ids: '730335316179'
+
+      - name: Fetch and mask deployment configuration
+        id: configuration
+        timeout-minutes: 5
+        run: |
+          bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" prepare
+          python3 deployment/mask-github-secrets.py .temp-deploy.env
+
+      - name: Authenticate to Google Cloud for preflight
+        id: cluster-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: curelinkai
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
+
+      - name: Configure registry and connect to Kubernetes
+        id: cluster
+        timeout-minutes: 5
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cluster-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" authenticate
+
+      - name: Build Docker image
+        timeout-minutes: 60
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" build
+
+      - name: Authenticate to Google Cloud for image push
+        id: push-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: curelinkai
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
+
+      - name: Push Docker image
+        timeout-minutes: 30
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.push-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" push
+
+      - name: Refresh Google Cloud authentication for deployment
+        id: deploy-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: curelinkai
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email
+
+      - name: Update runtime configuration secret
+        timeout-minutes: 5
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" secret
+
+      - name: Apply voice worker manifests
+        timeout-minutes: 5
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" apply
+
+      - name: Wait for voice worker rollout
+        timeout-minutes: 15
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" rollout
+
+      - name: Deployment diagnostics
+        if: ${{ always() && steps.cluster.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          DEPLOY_FAILED: ${{ job.status == 'failure' }}
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.deploy-auth.outputs.access_token || steps.push-auth.outputs.access_token || steps.cluster-auth.outputs.access_token }}
+        run: bash deploy-worker.sh "$DEPLOY_ENVIRONMENT" diagnostics
+
+      - name: Deployment summary
+        if: always()
+        env:
+          DEPLOY_RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Kubernetes deployment: $DEPLOY_RESULT"
+            echo "- Environment: $DEPLOY_ENVIRONMENT"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Image tag: $DEPLOY_IMAGE_TAG"
+            echo "- Triggered by: $GITHUB_ACTOR"
+            echo "- Open the failed step above for its error output."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary application secrets
+        if: always()
+        run: rm -f -- .temp-deploy.env

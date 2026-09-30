@@ -9,3 +9,7 @@ k8s/
 deploy.sh
 reports/
 llm_log_dumps_final/
+
+# GitHub Actions OIDC credentials must never enter images or commits.
+gha-creds-*.json
+.github
