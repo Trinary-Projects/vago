@@ -53,6 +53,18 @@ jobs:
             echo '::error::Production deployments must use the main branch.'
             exit 1
           fi
+          if [[ "$DEPLOY_ENVIRONMENT" == prod ]]; then
+            # Stable IDs authorize the original dispatcher; reruns also check
+            # the current initiator so another collaborator cannot replay a run.
+            case "${GITHUB_ACTOR_ID:-}" in
+              20072704|43138335|54813606) ;; # Jaideep, Manasvi, Anurag
+              *) echo '::error::Only jaideep329, ManasviPatidar, and Waheguru-Anurag may deploy production.'; exit 1 ;;
+            esac
+            case "${GITHUB_TRIGGERING_ACTOR:-}" in
+              jaideep329|ManasviPatidar|Waheguru-Anurag) ;;
+              *) echo '::error::Only jaideep329, ManasviPatidar, and Waheguru-Anurag may rerun production deployments.'; exit 1 ;;
+            esac
+          fi
           for name in AWS_ROLE_ARN GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Set the $name variable in the selected GitHub environment."
