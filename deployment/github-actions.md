@@ -74,13 +74,7 @@ attribute.workflow_ref=assertion.workflow_ref
 Current provider attribute condition (numeric IDs resist organization/repository name reuse):
 
 ```text
-assertion.repository_owner_id == '72670721' &&
-assertion.repository_id == '1167931098' &&
-assertion.ref.startsWith('refs/heads/') &&
-assertion.event_name == 'workflow_dispatch' &&
-assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@' + assertion.ref &&
-((assertion.sub == 'repo:Trinary-Projects/vago:environment:staging' && assertion.ref.startsWith('refs/heads/')) ||
- (assertion.sub == 'repo:Trinary-Projects/vago:environment:prod' && assertion.ref == 'refs/heads/main'))
+(assertion.repository_owner_id == '72670721' && assertion.repository_id == '1167931098' && assertion.event_name == 'workflow_dispatch' && assertion.workflow_ref == 'Trinary-Projects/vago/.github/workflows/deploy-k8s.yml@' + assertion.ref && ((assertion.sub == 'repo:Trinary-Projects/vago:environment:staging' && assertion.ref.startsWith('refs/heads/')) || (assertion.sub == 'repo:Trinary-Projects/vago:environment:prod' && assertion.ref == 'refs/heads/main'))) && (assertion.sub != "repo:Trinary-Projects/vago:environment:prod" || (assertion.actor_id in ["20072704", "43138335", "54813606"]))
 ```
 
 Production has its own subject-and-branch clause and its own service account and AWS role. Preserve the common repository, workflow path and manual-event checks. Never add the production subject to the staging any-branch clause.
@@ -159,3 +153,5 @@ The workflow reuses the Ubuntu 24.04 runner’s preinstalled gcloud and kubectl,
 Only `jaideep329` (ID `20072704`), `ManasviPatidar` (`43138335`), and `Waheguru-Anurag` (`54813606`) may initiate production deployments through this workflow. The first step checks the original dispatcher’s stable account ID and the current triggering username, including reruns, before cloud authentication or configuration fetch. Production still requires `main`. Staging has no account allowlist: all collaborators with GitHub Actions dispatch permission may deploy repository branches. Local deployment entrypoints are unchanged.
 
 GitHub still shows the Run workflow button to other collaborators; selecting prod fails immediately with an access error. Account renames require updating the triggering-actor username list. Administrators who can edit the workflow or cloud trust can change these controls.
+
+Google Cloud federation also enforces these three original dispatcher account IDs for production. The provider condition preserves the existing staging clause without an actor restriction. Cloud policy updates were applied and read back successfully on 2026-10-01; no deployment was triggered during this change.
