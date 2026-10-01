@@ -153,3 +153,9 @@ Inline cache staging experiment: this branch sets `DEPLOY_INLINE_CACHE=true` onl
 ## Runner setup performance
 
 The workflow reuses the Ubuntu 24.04 runner’s preinstalled gcloud and kubectl, logs their versions, and installs only the GKE authentication plugin if missing. Cloud authentication and deployment phases are unchanged.
+
+## Production deployment access (2026-10-01)
+
+Only `jaideep329` (ID `20072704`), `ManasviPatidar` (`43138335`), and `Waheguru-Anurag` (`54813606`) may initiate production deployments through this workflow. The first step checks the original dispatcher’s stable account ID and the current triggering username, including reruns, before cloud authentication or configuration fetch. Production still requires `main`. Staging has no account allowlist: all collaborators with GitHub Actions dispatch permission may deploy repository branches. Local deployment entrypoints are unchanged.
+
+GitHub still shows the Run workflow button to other collaborators; selecting prod fails immediately with an access error. Account renames require updating the triggering-actor username list. Administrators who can edit the workflow or cloud trust can change these controls.
