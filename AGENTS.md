@@ -24,7 +24,7 @@ Jaideep is an experienced Python backend engineer learning Go by building real p
 
 ## Deployment workflow decision (2026-09-30)
 
-- Production Actions deployments are restricted to jaideep329 (20072704), ManasviPatidar (43138335), and Waheguru-Anurag (54813606). Check both the original actor ID and triggering actor on reruns before credentials. Staging remains open to collaborators with dispatch permission; local commands are unchanged.
+- Production Actions deployments are restricted to jaideep329 (20072704), ManasviPatidar (43138335), and Waheguru-Anurag (54813606). Check both the original actor ID and triggering actor on reruns before credentials. Staging remains open to collaborators with dispatch permission; local commands are unchanged. Google Cloud federation also restricts production to these original actor IDs; the staging federation clause stays unrestricted by actor.
 
 - Runner setup reuses preinstalled gcloud/kubectl and installs only a missing GKE auth plugin through Google’s signed apt repository. Keep cloud authentication and manual deployment restrictions intact.
 
