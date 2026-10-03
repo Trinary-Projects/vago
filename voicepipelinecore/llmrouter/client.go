@@ -221,6 +221,7 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 		errType         string
 		finishReason    string
 		usage           tokenUsage
+		routedProvider  string
 	)
 	// Emit the per-call log on the way out (best-effort, off the hot path).
 	defer func() {
@@ -230,7 +231,7 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 		entry := CallLog{
 			Model:            cfg.Model,
 			ConfigKey:        cfg.Key,
-			Deployment:       deploymentName(cfg),
+			Deployment:       deploymentWithRoutedProvider(cfg, routedProvider),
 			Request:          llmReq,
 			ResponseContent:  responseContent.String(),
 			ToolCalls:        res.ToolCalls,
@@ -304,13 +305,16 @@ func (r *Router) Stream(ctx context.Context, llmReq vpc.LLMRequest, onToken func
 			res.Interrupted = true
 			return res, ctx.Err()
 		}
-		content, toolDeltas, fr, chunkUsage, hasUsage, done, ok := parseSSEChunk(scanner.Text())
+		content, toolDeltas, fr, chunkUsage, hasUsage, provider, done, ok := parseSSEChunk(scanner.Text())
 		if done {
 			sawDone = true
 			break
 		}
 		if !ok {
 			continue
+		}
+		if routedProvider == "" {
+			routedProvider = provider
 		}
 		if hasUsage {
 			usage = chunkUsage
@@ -389,6 +393,8 @@ func (r *Router) handleError(configKey string, statusCode int, errMsg string) {
 //     finish_reason when present ("stop", "length", "content_filter", …).
 //   - usage is present on the stream-options usage chunk, which usually has
 //     no choices and arrives just before [DONE].
+//   - provider is OpenRouter's upstream provider name ("BaseTen"), present
+//     on every OpenRouter chunk and "" for other backends.
 type tokenUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -400,16 +406,16 @@ type toolCallDelta struct {
 	call  vpc.ToolCall
 }
 
-func parseSSEChunk(line string) (content string, toolDeltas []toolCallDelta, finishReason string, usage tokenUsage, hasUsage, done, ok bool) {
+func parseSSEChunk(line string) (content string, toolDeltas []toolCallDelta, finishReason string, usage tokenUsage, hasUsage bool, provider string, done, ok bool) {
 	if !strings.HasPrefix(line, "data:") {
-		return "", nil, "", tokenUsage{}, false, false, false
+		return "", nil, "", tokenUsage{}, false, "", false, false
 	}
 	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 	if data == "" {
-		return "", nil, "", tokenUsage{}, false, false, false
+		return "", nil, "", tokenUsage{}, false, "", false, false
 	}
 	if data == "[DONE]" {
-		return "", nil, "", tokenUsage{}, false, true, true
+		return "", nil, "", tokenUsage{}, false, "", true, true
 	}
 	var chunk struct {
 		Choices []struct {
@@ -427,17 +433,18 @@ func parseSSEChunk(line string) (content string, toolDeltas []toolCallDelta, fin
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *tokenUsage `json:"usage"`
+		Usage    *tokenUsage `json:"usage"`
+		Provider string      `json:"provider"`
 	}
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-		return "", nil, "", tokenUsage{}, false, false, false
+		return "", nil, "", tokenUsage{}, false, "", false, false
 	}
 	if chunk.Usage != nil {
 		usage = *chunk.Usage
 		hasUsage = true
 	}
 	if len(chunk.Choices) == 0 {
-		return "", nil, "", usage, hasUsage, false, true
+		return "", nil, "", usage, hasUsage, chunk.Provider, false, true
 	}
 	if fr := chunk.Choices[0].FinishReason; fr != nil {
 		finishReason = *fr
@@ -460,5 +467,5 @@ func parseSSEChunk(line string) (content string, toolDeltas []toolCallDelta, fin
 			},
 		})
 	}
-	return delta.Content, toolDeltas, finishReason, usage, hasUsage, false, true
+	return delta.Content, toolDeltas, finishReason, usage, hasUsage, chunk.Provider, false, true
 }
