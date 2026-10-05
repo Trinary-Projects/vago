@@ -766,7 +766,7 @@ func TestParseSSEChunkToolCallFragments(t *testing.T) {
 
 	var finishReason string
 	for _, line := range lines {
-		content, deltas, fr, _, _, _, ok := parseSSEChunk(line)
+		content, deltas, fr, _, _, _, _, ok := parseSSEChunk(line)
 		if !ok {
 			t.Fatalf("parseSSEChunk(%s) returned ok=false", line)
 		}
