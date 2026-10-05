@@ -79,9 +79,14 @@ func gatedEndCallDefinition(t *testing.T) voicepipelinecore.ToolDefinition {
 
 func runEndCallHandler(t *testing.T, def voicepipelinecore.ToolDefinition, args map[string]any) (bool, voicepipelinecore.ToolCallResponse) {
 	t.Helper()
+	return runEndCallHandlerWithText(t, def, args, "ठीक है, bye!")
+}
+
+func runEndCallHandlerWithText(t *testing.T, def voicepipelinecore.ToolDefinition, args map[string]any, assistantText string) (bool, voicepipelinecore.ToolCallResponse) {
+	t.Helper()
 	ended := false
 	handler := newEndCallHandler(def, func() { ended = true }, nil)
-	resp, err := handler(context.Background(), voicepipelinecore.ToolCallRequest{FunctionName: endCallToolName, Arguments: args})
+	resp, err := handler(context.Background(), voicepipelinecore.ToolCallRequest{FunctionName: endCallToolName, Arguments: args, AssistantText: assistantText})
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -127,5 +132,22 @@ func TestEndCallGatedSchemaEndsOnlyOnYes(t *testing.T) {
 		if resp.Result.(map[string]any)["status"] != wantStatus || resp.RunLLM {
 			t.Fatalf("args %v: response = %+v, want status %s and RunLLM=false", tc.args, resp, wantStatus)
 		}
+		if resp.DropFromContext == tc.wantEnd || resp.SpeakText != "" {
+			t.Fatalf("args %v: response = %+v, want DropFromContext=%v and no SpeakText", tc.args, resp, !tc.wantEnd)
+		}
+	}
+}
+
+func TestEndCallGatedNoWithEmptyReplySpeaksIdlePrompt(t *testing.T) {
+	def := gatedEndCallDefinition(t)
+	for _, text := range []string{"", "  \n"} {
+		ended, resp := runEndCallHandlerWithText(t, def, map[string]any{"should_end_call": "no"}, text)
+		if ended || !resp.DropFromContext || resp.SpeakText != "Hello?" {
+			t.Fatalf("text %q: ended=%v response=%+v, want call kept, dropped, and Hello? spoken", text, ended, resp)
+		}
+	}
+	ended, resp := runEndCallHandlerWithText(t, def, map[string]any{"should_end_call": "yes"}, "")
+	if !ended || resp.SpeakText != "" || resp.DropFromContext {
+		t.Fatalf("gated yes with empty reply: ended=%v response=%+v, want call ended with no prompt", ended, resp)
 	}
 }

@@ -212,6 +212,49 @@ func TestLLM_LiveErrorClosesTurn(t *testing.T) {
 	}
 }
 
+func TestLLM_ToolResponseDropAndSpeakText(t *testing.T) {
+	fix := newTestFixture(t)
+	client := &stubLLMClient{
+		model:  "m",
+		tokens: []string{"aap ", "kahan se hain?"},
+		toolCalls: []ToolCall{{
+			ID:       "call_1",
+			Type:     "function",
+			Function: ToolCallFunction{Name: "end_call", Arguments: `{"should_end_call":"no"}`},
+		}},
+	}
+	p := NewLLMProcessorWithClient(fix.TaskCtx, client)
+	handlerCalls := make(chan ToolCallRequest, 1)
+	p.RegisterTool(ToolDefinition{Function: ToolFunction{Name: "end_call"}}, func(_ context.Context, req ToolCallRequest) (ToolCallResponse, error) {
+		handlerCalls <- req
+		return ToolCallResponse{Result: "ok", DropFromContext: true, SpeakText: "Hello?"}, nil
+	}, ToolOptions{})
+
+	down, _ := runProcessorTest(t, fix, runConfig{
+		processor:    p,
+		framesToSend: []Frame{LLMMessagesFrame{Messages: []Message{{Role: "user", Content: "hi"}}}},
+		settleDelay:  200 * time.Millisecond,
+		sendEndFrame: true,
+	})
+
+	select {
+	case req := <-handlerCalls:
+		if req.AssistantText != "aap kahan se hain?" {
+			t.Fatalf("AssistantText = %q, want the response text", req.AssistantText)
+		}
+	default:
+		t.Fatal("tool handler was not called")
+	}
+	result, ok := findFrame[FunctionCallResultFrame](down)
+	if !ok || !result.DropFromContext {
+		t.Fatalf("FunctionCallResultFrame = %+v (found=%v), want DropFromContext", result, ok)
+	}
+	speak, ok := findFrame[TTSSpeakFrame](down)
+	if !ok || speak.Text != "Hello?" {
+		t.Fatalf("TTSSpeakFrame = %+v (found=%v), want Hello?", speak, ok)
+	}
+}
+
 func TestLLM_NativeToolCallLoopUsesRegisteredToolAndContext(t *testing.T) {
 	fix := newTestFixture(t)
 	client := &stubLLMClient{

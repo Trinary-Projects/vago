@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	endCallToolName  = "end_call"
-	shouldEndCallArg = "should_end_call"
+	endCallToolName           = "end_call"
+	shouldEndCallArg          = "should_end_call"
+	endCallRejectedPromptText = "Hello?"
 )
 
 func buildCallToolDefinitionsFromConfig(promptConfig map[string]any) ([]voicepipelinecore.ToolDefinition, error) {
@@ -118,15 +119,22 @@ func registerEndCallTool(llm *voicepipelinecore.LLMProcessor, task *voicepipelin
 // newEndCallHandler ends the call on every invocation, unless the tool
 // definition declares should_end_call. Then it ends the call only when
 // the model sets should_end_call to "yes", because the model sometimes
-// calls end_call and still decides that the call should continue.
+// calls end_call and still decides that the call should continue. A
+// rejected call is dropped from the model context, and if the model said
+// nothing in that turn, the user hears the idle prompt instead of silence.
 func newEndCallHandler(def voicepipelinecore.ToolDefinition, endCall func(), logger *log.Logger) voicepipelinecore.ToolHandler {
 	gated := declaresShouldEndCall(def)
 	return func(_ context.Context, req voicepipelinecore.ToolCallRequest) (voicepipelinecore.ToolCallResponse, error) {
 		if gated && !shouldEndCallFromArgs(req.Arguments) {
+			emptyReply := strings.TrimSpace(req.AssistantText) == ""
 			if logger != nil {
-				logger.Printf("disha: end_call ignored should_end_call=%v reason=%q\n", req.Arguments[shouldEndCallArg], req.Arguments["reason"])
+				logger.Printf("disha: end_call ignored should_end_call=%v empty_reply=%v reason=%q\n", req.Arguments[shouldEndCallArg], emptyReply, req.Arguments["reason"])
 			}
-			return voicepipelinecore.ToolCallResponse{Result: map[string]any{"status": "call_continues"}, RunLLM: false}, nil
+			resp := voicepipelinecore.ToolCallResponse{Result: map[string]any{"status": "call_continues"}, RunLLM: false, DropFromContext: true}
+			if emptyReply {
+				resp.SpeakText = endCallRejectedPromptText
+			}
+			return resp, nil
 		}
 		if gated && logger != nil {
 			logger.Printf("disha: end_call accepted should_end_call=%v reason=%q\n", req.Arguments[shouldEndCallArg], req.Arguments["reason"])

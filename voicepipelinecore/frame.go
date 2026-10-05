@@ -414,6 +414,9 @@ type FunctionCallResultFrame struct {
 	RawArguments string
 	Result       string
 	RunLLM       bool
+	// DropFromContext asks the assistant aggregator to remove this call
+	// from the conversation history instead of committing its result.
+	DropFromContext bool
 }
 
 func NewFunctionCallResultFrame(functionName, toolCallID string, arguments map[string]any, rawArguments, result string, runLLM bool) FunctionCallResultFrame {
@@ -489,7 +492,9 @@ func (f FunctionCallInProgressFrame) Clone() Frame {
 	return NewFunctionCallInProgressFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments, f.CancelOnInterruption)
 }
 func (f FunctionCallResultFrame) Clone() Frame {
-	return NewFunctionCallResultFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments, f.Result, f.RunLLM)
+	clone := NewFunctionCallResultFrame(f.FunctionName, f.ToolCallID, f.Arguments, f.RawArguments, f.Result, f.RunLLM)
+	clone.DropFromContext = f.DropFromContext
+	return clone
 }
 
 // LLMAssistantPushAggregationFrame flushes standalone speech into context,
