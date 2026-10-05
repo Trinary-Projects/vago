@@ -349,6 +349,7 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 		deps.Documents, pl.Callbacks, newDeepThinkingClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),
 		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
 		pl.Startup.Data.Conversation.PatientInfo, pl.PromptKey,
+		pl.Compiler.profileVars,
 	)
 	careplanManager := NewOnboardingCarePlanManager(
 		pl.Config, deps.Documents, deps.API, newCarePlanClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),

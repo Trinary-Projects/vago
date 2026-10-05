@@ -58,6 +58,7 @@ type OnboardingDeepThinkingManager struct {
 	conversationID string
 	patientInfo    string
 	promptKey      string
+	profileVars    map[string]any
 
 	// Late-bound UI (Python's set_infrastructure pattern, mirroring the
 	// stage tracker): nil-safe, RTVI sends are skipped until wired. The
@@ -75,6 +76,7 @@ func NewOnboardingDeepThinkingManager(
 	newClient deepThinkingClientFactory,
 	logger *log.Logger,
 	userID, conversationID, patientInfo, promptKey string,
+	profileVars map[string]any,
 ) *OnboardingDeepThinkingManager {
 	return &OnboardingDeepThinkingManager{
 		docs:           docs,
@@ -85,6 +87,7 @@ func NewOnboardingDeepThinkingManager(
 		conversationID: conversationID,
 		patientInfo:    patientInfo,
 		promptKey:      promptKey,
+		profileVars:    profileVars,
 	}
 }
 
@@ -242,9 +245,12 @@ func (m *OnboardingDeepThinkingManager) executeSingle(ctx context.Context, dt De
 		return nil, errors.New("disha: deep thinking document store is not configured")
 	}
 
-	docVars := DocumentVariables(variables)
-	if docVars == nil {
-		docVars = DocumentVariables{}
+	docVars := make(DocumentVariables, len(m.profileVars)+len(variables))
+	for k, v := range m.profileVars {
+		docVars[k] = v
+	}
+	for k, v := range variables {
+		docVars[k] = v
 	}
 
 	sysText, version, err := m.docs.GetDocument(ctx, dt.Prompt.Name, dt.Prompt.Version, docVars)
