@@ -148,6 +148,45 @@ func TestAssistantContextAggregator_EmptyFunctionResultPushesError(t *testing.T)
 	}
 }
 
+func TestAssistantContextAggregator_DropFromContextRemovesToolCall(t *testing.T) {
+	fix := newTestFixture(t)
+	var committed int
+	fix.TaskCtx.callEvents = newCallEventDispatcher(fix.Logger, CallEvents{
+		OnToolResultCommitted: func(Message, Message, time.Time) { committed++ },
+	})
+	a := NewContextAggregatorPair(fix.TaskCtx, []Message{{Role: "system", Content: "prompt"}}, "").Assistant()
+
+	source := newQueueProcessor(fix.TaskCtx, "test-source", Upstream)
+	sink := newQueueProcessor(fix.TaskCtx, "test-sink", Downstream)
+	source.Link(a)
+	a.Link(sink)
+	source.Start(fix.RootCtx)
+	a.Start(fix.RootCtx)
+	sink.Start(fix.RootCtx)
+
+	source.QueueFrame(NewFunctionCallInProgressFrame("end_call", "call_1", nil, `{"should_end_call":"no"}`, false), Downstream)
+	time.Sleep(20 * time.Millisecond)
+	result := NewFunctionCallResultFrame("end_call", "call_1", nil, `{"should_end_call":"no"}`, `{"status":"call_continues"}`, false)
+	result.DropFromContext = true
+	source.QueueFrame(result, Downstream)
+	time.Sleep(30 * time.Millisecond)
+
+	source.QueueFrame(EndFrame{}, Downstream)
+	stopProcessorsAndWait(t, fix, 3*time.Second, source, a, sink)
+	fix.TaskCtx.callEvents.stopAndDrain()
+
+	messages := a.messagesForTest()
+	if len(messages) != 1 || messages[0].Role != "system" {
+		t.Fatalf("context messages = %+v, want only the prompt", messages)
+	}
+	if committed != 0 {
+		t.Fatalf("OnToolResultCommitted fired %d times for a dropped call", committed)
+	}
+	if _, ok := findFrame[LLMContextFrame](source.Captured()); ok {
+		t.Fatal("dropped call must not trigger an LLM run")
+	}
+}
+
 func TestAssistantContextAggregator_EmitsToolResultCallEvent(t *testing.T) {
 	fix := newTestFixture(t)
 	var assistantToolCalls []Message

@@ -107,6 +107,11 @@ func (a *AssistantContextAggregator) ProcessFrame(ctx context.Context, frame Fra
 			return
 		}
 		delete(a.functionCallsInProgress, f.ToolCallID)
+		if f.DropFromContext {
+			a.dropFunctionCall(f.ToolCallID)
+			a.mu.Unlock()
+			return
+		}
 		assistant, result := a.applyFunctionCallResult(f)
 		a.mu.Unlock()
 		if a.taskCtx.callEvents != nil {
@@ -192,6 +197,24 @@ func (a *AssistantContextAggregator) addFunctionCallInProgress(f FunctionCallInP
 	a.state.mu.Lock()
 	a.state.messages = append(a.state.messages, assistantToolCall, toolMessage)
 	a.state.mu.Unlock()
+}
+
+// dropFunctionCall removes the assistant tool_calls message and the tool
+// message that addFunctionCallInProgress appended for toolCallID.
+func (a *AssistantContextAggregator) dropFunctionCall(toolCallID string) {
+	a.state.mu.Lock()
+	defer a.state.mu.Unlock()
+	kept := make([]Message, 0, len(a.state.messages))
+	for _, msg := range a.state.messages {
+		if msg.Role == "tool" && msg.ToolCallID == toolCallID {
+			continue
+		}
+		if msg.Role == "assistant" && len(msg.ToolCalls) == 1 && msg.ToolCalls[0].ID == toolCallID {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	a.state.messages = kept
 }
 
 func (a *AssistantContextAggregator) applyFunctionCallResult(f FunctionCallResultFrame) (Message, Message) {

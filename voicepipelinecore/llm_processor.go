@@ -56,11 +56,20 @@ type ToolCallRequest struct {
 	ToolCallID   string
 	Arguments    map[string]any
 	RawArguments string
+	// AssistantText is the text the model generated in the same response
+	// as this tool call.
+	AssistantText string
 }
 
 type ToolCallResponse struct {
 	Result any
 	RunLLM bool
+	// DropFromContext removes the assistant tool_calls message and its tool
+	// result from the conversation history, so later LLM runs never see
+	// this call, and skips OnToolResultCommitted.
+	DropFromContext bool
+	// SpeakText, when set, is spoken as a TTSSpeakFrame after the result.
+	SpeakText string
 }
 
 type ToolHandler func(ctx context.Context, req ToolCallRequest) (ToolCallResponse, error)
@@ -202,15 +211,15 @@ func (p *LLMProcessor) processMessages(ctx context.Context, messages []Message) 
 			messages = enriched
 		}
 	}
-	calls := p.runLLM(ctx, messages)
+	calls, text := p.runLLM(ctx, messages)
 	if len(calls) > 0 {
-		p.executeToolCalls(ctx, calls)
+		p.executeToolCalls(ctx, calls, text)
 	}
 }
 
-func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) []ToolCall {
+func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) ([]ToolCall, string) {
 	if ctx.Err() != nil {
-		return nil
+		return nil, ""
 	}
 	p.metrics.Start(MetricTTFB)
 	p.metrics.Start(MetricProcessing)
@@ -254,7 +263,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) []ToolCal
 	if ctx.Err() != nil || (result.Interrupted && errors.Is(err, context.Canceled)) {
 		p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "interrupted")
 		p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), Interrupted: true})
-		return nil
+		return nil, ""
 	}
 	if err != nil {
 		_ = p.metrics.Stop(MetricTTFB)
@@ -301,7 +310,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) []ToolCal
 		// Python's skip, because the model usually generates past what
 		// the user actually heard.
 		p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), Interrupted: responseText.Len() == 0, HasToolCalls: len(result.ToolCalls) > 0})
-		return nil
+		return nil, ""
 	}
 
 	if mf := p.metrics.Stop(MetricProcessing); mf != nil {
@@ -311,7 +320,7 @@ func (p *LLMProcessor) runLLM(ctx context.Context, messages []Message) []ToolCal
 	p.pushGenerationFrame(ctx, NewLLMResponseEndFrame(), Downstream)
 	p.emitLLMCallResult(result.Model, ttfbMs, totalMs, "completed")
 	p.fireLLMCallCompleted(LLMCallCompletion{Text: responseText.String(), HasToolCalls: len(result.ToolCalls) > 0})
-	return result.ToolCalls
+	return result.ToolCalls, responseText.String()
 }
 
 func (p *LLMProcessor) pushGenerationFrame(ctx context.Context, frame Frame, dir Direction) {
@@ -320,7 +329,7 @@ func (p *LLMProcessor) pushGenerationFrame(ctx context.Context, frame Frame, dir
 	}
 }
 
-func (p *LLMProcessor) executeToolCalls(turnCtx context.Context, toolCalls []ToolCall) {
+func (p *LLMProcessor) executeToolCalls(turnCtx context.Context, toolCalls []ToolCall, assistantText string) {
 	p.Broadcast(NewFunctionCallsStartedFrame(toolCalls))
 	for _, call := range toolCalls {
 		tool, ok := p.toolMap[call.Function.Name]
@@ -335,11 +344,11 @@ func (p *LLMProcessor) executeToolCalls(turnCtx context.Context, toolCalls []Too
 			continue
 		}
 		p.Broadcast(NewFunctionCallInProgressFrame(call.Function.Name, call.ID, args, call.Function.Arguments, tool.options.CancelOnInterruption))
-		p.Go(func() { p.executeOneToolCall(turnCtx, call, tool, args) })
+		p.Go(func() { p.executeOneToolCall(turnCtx, call, tool, args, assistantText) })
 	}
 }
 
-func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall, tool registeredTool, args map[string]any) {
+func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall, tool registeredTool, args map[string]any, assistantText string) {
 	name := call.Function.Name
 	parent := turnCtx
 	if !tool.options.CancelOnInterruption && p.taskCtx != nil && p.taskCtx.Ctx != nil {
@@ -351,10 +360,11 @@ func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall
 		toolCtx, cancel = context.WithTimeout(parent, tool.options.Timeout)
 	}
 	resp, err := tool.handler(toolCtx, ToolCallRequest{
-		FunctionName: name,
-		ToolCallID:   call.ID,
-		Arguments:    args,
-		RawArguments: call.Function.Arguments,
+		FunctionName:  name,
+		ToolCallID:    call.ID,
+		Arguments:     args,
+		RawArguments:  call.Function.Arguments,
+		AssistantText: assistantText,
 	})
 	cancel()
 	if tool.options.CancelOnInterruption && turnCtx.Err() != nil {
@@ -372,7 +382,12 @@ func (p *LLMProcessor) executeOneToolCall(turnCtx context.Context, call ToolCall
 		result = toolErrorResultString(resultErr.Error())
 		resp.RunLLM = false
 	}
-	p.Broadcast(NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, result, resp.RunLLM))
+	resultFrame := NewFunctionCallResultFrame(name, call.ID, args, call.Function.Arguments, result, resp.RunLLM)
+	resultFrame.DropFromContext = resp.DropFromContext
+	p.Broadcast(resultFrame)
+	if resp.SpeakText != "" {
+		p.PushFrame(NewTTSSpeakFrame(resp.SpeakText), Downstream)
+	}
 }
 
 func parseToolArguments(raw string) (map[string]any, error) {
