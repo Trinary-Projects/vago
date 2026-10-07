@@ -335,6 +335,7 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"him_her":                   objectPronoun(gender),
 		"his_her":                   possessivePronoun(gender),
 		"call_flow":                 callFlowValue,
+		"onboarding_care_plan":      derefString(user.OnboardingCarePlan),
 
 		// Drive the open diet-chart / workout-plan task blocks at the end of
 		// followup_call/system_prompt. Resolved in bot_session_manager; a
