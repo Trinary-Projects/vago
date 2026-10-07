@@ -336,6 +336,14 @@ func followUpPromptVariables(data *ConversationData, callFlow string) DocumentVa
 		"his_her":                   possessivePronoun(gender),
 		"call_flow":                 callFlowValue,
 
+		// Drive the open diet-chart / workout-plan task blocks at the end of
+		// followup_call/system_prompt. Resolved in bot_session_manager; a
+		// checklist is null when the user has never run it.
+		"patient_active_task": user.PatientActiveTask,
+		"diet_plan_agents__information_checklist_system__information_checklist_sys": user.DietInformationChecklist,
+		"workout_plan_generation__deferred_information_checklist_sys":               user.WorkoutInformationChecklist,
+		"preferred_workout_time": user.PreferredWorkoutTime,
+
 		// Not referenced by any follow-up prompt today — these exist for
 		// retrieved protocol instruction texts, which are rendered against
 		// this same store. Python resolves them in

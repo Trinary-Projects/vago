@@ -211,7 +211,7 @@ func newStageMachineHarnessWithManagers(t *testing.T, classifier voicepipelineco
 	var dtManager *OnboardingDeepThinkingManager
 	if dtFactory != nil {
 		dtManager = NewOnboardingDeepThinkingManager(deps.Documents, callbacks, dtFactory, logger,
-			stageTestUserID, stageTestConversationID, stageTestPatientInfo, promptKey)
+			stageTestUserID, stageTestConversationID, stageTestPatientInfo, promptKey, nil)
 		dtManager.SetUI(ui)
 		dtManager.SetSentryHub(hub)
 	}

@@ -124,6 +124,7 @@ func newDTHarness(t *testing.T, byPrompt map[string]*dtStubClient) *dtHarness {
 	manager := NewOnboardingDeepThinkingManager(
 		docs, callbacks, factory.factory(), logger,
 		dtTestUserID, dtTestConversationID, dtTestPatientInfo, dtTestPromptKey,
+		nil,
 	)
 	manager.SetUI(ui)
 
@@ -496,6 +497,49 @@ func TestDeepThinkingPromptMetadataCarriesNameVersionAndVariables(t *testing.T) 
 	}
 	if _, hasUserFields := call.promptMetadata["user_prompt_name"]; hasUserFields {
 		t.Fatal("prompt metadata carries user_prompt_name, want prompt-identity-only fields")
+	}
+}
+// Ensures DT document render gets profileVars when the store is empty, and that store keys overlay them.
+func TestDeepThinkingExecuteSingleMergesProfileVarsIntoDocument(t *testing.T) {
+	h := newDTHarness(t, map[string]*dtStubClient{
+		"obtest/dt_name": {output: "ok"},
+	})
+	h.seedPrompt("obtest/dt_name", "USER: {{ patient_first_name }}")
+	h.manager.profileVars = map[string]any{"patient_first_name": "Riya"}
+
+	dt := DeepThinkingConfig{Prompt: PromptConfig{Name: "obtest/dt_name"}}
+	if _, err := h.manager.executeSingle(context.Background(), dt, "transcript", "solutions_offered", nil); err != nil {
+		t.Fatalf("executeSingle: %v", err)
+	}
+
+	calls := h.factory.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("factory calls = %d, want 1", len(calls))
+	}
+	gotVars, ok := calls[0].promptMetadata["system_prompt_variables"].(DocumentVariables)
+	if !ok {
+		t.Fatalf("system_prompt_variables type = %T", calls[0].promptMetadata["system_prompt_variables"])
+	}
+	if gotVars["patient_first_name"] != "Riya" {
+		t.Fatalf("system_prompt_variables = %v, want patient_first_name=Riya", gotVars)
+	}
+
+	h.manager.profileVars = map[string]any{"patient_first_name": "Riya"}
+	if _, err := h.manager.executeSingle(context.Background(), dt, "transcript", "solutions_offered", map[string]any{
+		"patient_first_name": "Store",
+	}); err != nil {
+		t.Fatalf("executeSingle overlay: %v", err)
+	}
+	overlay := h.factory.snapshot()
+	if len(overlay) != 2 {
+		t.Fatalf("factory calls after overlay = %d, want 2", len(overlay))
+	}
+	overlayVars, ok := overlay[1].promptMetadata["system_prompt_variables"].(DocumentVariables)
+	if !ok {
+		t.Fatalf("overlay system_prompt_variables type = %T", overlay[1].promptMetadata["system_prompt_variables"])
+	}
+	if overlayVars["patient_first_name"] != "Store" {
+		t.Fatalf("overlay system_prompt_variables = %v, want store value to win", overlayVars)
 	}
 }
 

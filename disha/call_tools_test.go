@@ -1,9 +1,12 @@
 package disha
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/jaideep329/talk-go/voicepipelinecore"
 )
 
 // A tool with an empty "required" list (e.g. the dynamic-checkin end_call
@@ -48,5 +51,103 @@ func TestToolDefinitionMissingRequiredMarshalsAsArray(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), `"required":null`) {
 		t.Fatalf("tool definition marshals required as null: %s", encoded)
+	}
+}
+
+func gatedEndCallDefinition(t *testing.T) voicepipelinecore.ToolDefinition {
+	t.Helper()
+	def, err := toolDefinitionFromConfig(map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "end_call",
+			"description": "Disconnect the phone call.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"reason":          map[string]any{"type": "string"},
+					"should_end_call": map[string]any{"type": "string", "enum": []any{"yes", "no"}},
+				},
+				"required": []any{"reason", "should_end_call"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("toolDefinitionFromConfig: %v", err)
+	}
+	return def
+}
+
+func runEndCallHandler(t *testing.T, def voicepipelinecore.ToolDefinition, args map[string]any) (bool, voicepipelinecore.ToolCallResponse) {
+	t.Helper()
+	return runEndCallHandlerWithText(t, def, args, "ठीक है, bye!")
+}
+
+func runEndCallHandlerWithText(t *testing.T, def voicepipelinecore.ToolDefinition, args map[string]any, assistantText string) (bool, voicepipelinecore.ToolCallResponse) {
+	t.Helper()
+	ended := false
+	handler := newEndCallHandler(def, func() { ended = true }, nil)
+	resp, err := handler(context.Background(), voicepipelinecore.ToolCallRequest{FunctionName: endCallToolName, Arguments: args, AssistantText: assistantText})
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	return ended, resp
+}
+
+func TestEndCallLegacySchemaAlwaysEnds(t *testing.T) {
+	def := onboardingEndCallTool()
+	for _, args := range []map[string]any{{}, {"should_end_call": "no"}} {
+		ended, resp := runEndCallHandler(t, def, args)
+		if !ended {
+			t.Fatalf("legacy end_call with args %v did not end the call", args)
+		}
+		if resp.Result.(map[string]any)["status"] != "call_ending" || resp.RunLLM {
+			t.Fatalf("legacy response = %+v", resp)
+		}
+	}
+}
+
+func TestEndCallGatedSchemaEndsOnlyOnYes(t *testing.T) {
+	def := gatedEndCallDefinition(t)
+	cases := []struct {
+		args    map[string]any
+		wantEnd bool
+	}{
+		{map[string]any{"reason": "User said bye.", "should_end_call": "yes"}, true},
+		{map[string]any{"should_end_call": " YES "}, true},
+		{map[string]any{"should_end_call": true}, true},
+		{map[string]any{"reason": "User did not confirm.", "should_end_call": "no"}, false},
+		{map[string]any{"should_end_call": false}, false},
+		{map[string]any{"reason": "User did not confirm."}, false},
+		{map[string]any{}, false},
+	}
+	for _, tc := range cases {
+		ended, resp := runEndCallHandler(t, def, tc.args)
+		if ended != tc.wantEnd {
+			t.Fatalf("args %v: ended = %v, want %v", tc.args, ended, tc.wantEnd)
+		}
+		wantStatus := "call_continues"
+		if tc.wantEnd {
+			wantStatus = "call_ending"
+		}
+		if resp.Result.(map[string]any)["status"] != wantStatus || resp.RunLLM {
+			t.Fatalf("args %v: response = %+v, want status %s and RunLLM=false", tc.args, resp, wantStatus)
+		}
+		if resp.DropFromContext == tc.wantEnd || resp.SpeakText != "" {
+			t.Fatalf("args %v: response = %+v, want DropFromContext=%v and no SpeakText", tc.args, resp, !tc.wantEnd)
+		}
+	}
+}
+
+func TestEndCallGatedNoWithEmptyReplySpeaksIdlePrompt(t *testing.T) {
+	def := gatedEndCallDefinition(t)
+	for _, text := range []string{"", "  \n"} {
+		ended, resp := runEndCallHandlerWithText(t, def, map[string]any{"should_end_call": "no"}, text)
+		if ended || !resp.DropFromContext || resp.SpeakText != "Hello?" {
+			t.Fatalf("text %q: ended=%v response=%+v, want call kept, dropped, and Hello? spoken", text, ended, resp)
+		}
+	}
+	ended, resp := runEndCallHandlerWithText(t, def, map[string]any{"should_end_call": "yes"}, "")
+	if !ended || resp.SpeakText != "" || resp.DropFromContext {
+		t.Fatalf("gated yes with empty reply: ended=%v response=%+v, want call ended with no prompt", ended, resp)
 	}
 }

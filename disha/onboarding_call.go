@@ -225,6 +225,10 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 	if err != nil {
 		return nil, err
 	}
+	tools, err := loadOnboardingTools(ctx, deps.Documents, config)
+	if err != nil {
+		return nil, err
+	}
 
 	callbacks := NewCallEventCallbacks(
 		startup,
@@ -246,7 +250,7 @@ func (b OnboardingCallBot) plan(ctx context.Context, conversationID string, deps
 		InitialMessages: buildInitialMessages(compiled.Text, startup.Data.Chunks, resumeMsg),
 		PromptKey:       PromptKey(config.MainSystemPrompt.Name, compiled.MainVersion),
 		PromptMetadata:  buildOnboardingPromptMetadata(config, stage, compiled),
-		Tools:           []voicepipelinecore.ToolDefinition{onboardingEndCallTool()},
+		Tools:           tools,
 		Callbacks:       callbacks,
 	}
 	if deps.PhoneticDict != nil {
@@ -349,6 +353,7 @@ func (b OnboardingCallBot) BuildTask(ctx context.Context, req BotTaskRequest, de
 		deps.Documents, pl.Callbacks, newDeepThinkingClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),
 		pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID,
 		pl.Startup.Data.Conversation.PatientInfo, pl.PromptKey,
+		pl.Compiler.profileVars,
 	)
 	careplanManager := NewOnboardingCarePlanManager(
 		pl.Config, deps.Documents, deps.API, newCarePlanClientFactory(deps, pl.Startup.Logger, pl.Startup.UserID, pl.Startup.ConversationID),
@@ -475,9 +480,27 @@ func buildOnboardingPromptMetadata(config *OnboardingConfig, stage *StageConfig,
 	return metadata
 }
 
+// loadOnboardingTools reads the tools from the main system prompt's
+// config_json.tools. Prompts without a tools block fall back to the
+// legacy code-built end_call tool.
+func loadOnboardingTools(ctx context.Context, docs *DocumentStore, config *OnboardingConfig) ([]voicepipelinecore.ToolDefinition, error) {
+	promptConfig, _, err := docs.GetDocumentConfig(ctx, config.MainSystemPrompt.Name, config.MainSystemPrompt.Version)
+	if err != nil {
+		return nil, fmt.Errorf("disha: load main system prompt config %q: %w", config.MainSystemPrompt.Name, err)
+	}
+	tools, err := buildCallToolDefinitionsFromConfig(promptConfig)
+	if err != nil {
+		return nil, err
+	}
+	if len(tools) == 0 {
+		return []voicepipelinecore.ToolDefinition{onboardingEndCallTool()}, nil
+	}
+	return tools, nil
+}
+
 // onboardingEndCallTool mirrors conversation_context_manager.
-// _build_end_call_tool_schema — onboarding builds its single tool in
-// code, not from prompt config_json.tools.
+// _build_end_call_tool_schema. It is the fallback when the main system
+// prompt's config_json has no tools.
 func onboardingEndCallTool() voicepipelinecore.ToolDefinition {
 	return voicepipelinecore.ToolDefinition{
 		Type: "function",

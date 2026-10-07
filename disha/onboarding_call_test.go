@@ -286,6 +286,9 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 	if len(pl.Tools) != 1 || pl.Tools[0].Function.Name != endCallToolName {
 		t.Fatalf("Tools = %+v, want single end_call", pl.Tools)
 	}
+	if pl.Tools[0].Function.Description != onboardingEndCallTool().Function.Description || declaresShouldEndCall(pl.Tools[0]) {
+		t.Fatalf("Tools[0] = %+v, want the fallback end_call tool", pl.Tools[0])
+	}
 
 	// Committed turns must persist current_agenda from the live stage.
 	events := pl.Callbacks.Events()
@@ -329,6 +332,64 @@ func TestOnboardingCallBotPlanBuildsFreshStartStageCall(t *testing.T) {
 	}
 	if advanced.CurrentAgenda == nil || *advanced.CurrentAgenda != pl.Config.CommonStages[0].Name {
 		t.Fatalf("advanced chunk current_agenda = %v, want %s", advanced.CurrentAgenda, pl.Config.CommonStages[0].Name)
+	}
+}
+
+func TestOnboardingCallBotPlanUsesMainPromptConfigTools(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "staging")
+	redisServer, redisClient := newRedisTestClient(t)
+	apiServer, _ := newCallAPIServer(t)
+	api := NewAPIClient(apiServer.URL, 10*time.Second, nil)
+	seedOnboardingFixtures(t, redisServer)
+
+	mainKey := "document:" + onboardingTestMainPrompt + ":v1"
+	raw, err := redisServer.Get(mainKey)
+	if err != nil {
+		t.Fatalf("Get main prompt fixture: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("Unmarshal main prompt fixture: %v", err)
+	}
+	configJSON, _ := doc["config_json"].(map[string]any)
+	if configJSON == nil {
+		configJSON = map[string]any{}
+	}
+	configJSON["tools"] = []any{map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "end_call",
+			"description": "Disconnect the phone call.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"reason":          map[string]any{"type": "string"},
+					"should_end_call": map[string]any{"type": "string", "enum": []any{"yes", "no"}},
+				},
+				"required": []any{"reason", "should_end_call"},
+			},
+		},
+	}}
+	doc["config_json"] = configJSON
+	updated, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal main prompt fixture: %v", err)
+	}
+	redisServer.Set(mainKey, string(updated))
+
+	variant := "student_test"
+	conversationID := "conv-ob-tools"
+	seedOnboardingConversation(t, redisServer, conversationID, &variant)
+
+	pl, err := OnboardingCallBot{}.plan(context.Background(), conversationID, testDeps(redisClient, api))
+	if err != nil {
+		t.Fatalf("OnboardingCallBot.plan: %v", err)
+	}
+	if len(pl.Tools) != 1 || pl.Tools[0].Function.Name != endCallToolName {
+		t.Fatalf("Tools = %+v, want single end_call", pl.Tools)
+	}
+	if pl.Tools[0].Function.Description != "Disconnect the phone call." || !declaresShouldEndCall(pl.Tools[0]) {
+		t.Fatalf("Tools[0] = %+v, want the config tool with should_end_call", pl.Tools[0])
 	}
 }
 

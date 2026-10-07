@@ -1,6 +1,7 @@
 package llmrouter
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -75,6 +76,28 @@ func deploymentName(cfg endpointConfig) string {
 		return strings.Join(parts, "_")
 	}
 	return string(cfg.Provider)
+}
+
+var nonAlphanumericRun = regexp.MustCompile(`[^A-Za-z0-9]+`)
+
+// deploymentWithRoutedProvider is the logged deployment for a call that
+// may have been routed by OpenRouter: OPENROUTER_<PROVIDER> from the
+// upstream provider OpenRouter reports in the stream (e.g. "BaseTen" ->
+// OPENROUTER_BASETEN), else deploymentName(cfg). Must match Python's
+// OpenAIConfigHandler.get_openrouter_routed_deployment.
+func deploymentWithRoutedProvider(cfg endpointConfig, routedProvider string) string {
+	if cfg.Provider == providerOpenRouter {
+		if token := normalizeProviderToken(routedProvider); token != "" {
+			return "OPENROUTER_" + token
+		}
+	}
+	return deploymentName(cfg)
+}
+
+// normalizeProviderToken turns an OpenRouter provider display name into
+// one flat uppercase token ("Google AI Studio" -> GOOGLE_AI_STUDIO).
+func normalizeProviderToken(name string) string {
+	return strings.ToUpper(strings.Trim(nonAlphanumericRun.ReplaceAllString(name, "_"), "_"))
 }
 
 // pinnedProviderSlug returns the base slug (e.g. "modelrun" from

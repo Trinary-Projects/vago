@@ -53,6 +53,10 @@ type UserProfileData struct {
 	NextPaymentDueDate                *string        `json:"next_payment_due_date"`
 	PaymentOverdue                    *bool          `json:"payment_overdue"`
 	IdealCallTimeSlots                map[string]any `json:"ideal_call_time_slots"`
+	PatientActiveTask                 []any          `json:"patient_active_task"`
+	DietInformationChecklist          map[string]any `json:"diet_plan_agents__information_checklist_system__information_checklist_sys"`
+	WorkoutInformationChecklist       map[string]any `json:"workout_plan_generation__deferred_information_checklist_sys"`
+	PreferredWorkoutTime              string         `json:"preferred_workout_time"`
 	DevanagariName                    string         `json:"devanagari_name"`
 	FirstName                         string         `json:"first_name"`
 	Name                              string         `json:"name"`
