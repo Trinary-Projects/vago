@@ -64,6 +64,9 @@ type LiveKitRoom struct {
 	perfDiag     bool
 	closed       atomic.Bool
 	reconnecting atomic.Bool
+	// disconnected is set when the server ends our session. Publishing to a
+	// gone room blocks ~15s in the SDK before failing, so data sends stop.
+	disconnected atomic.Bool
 	closedCh     chan struct{}
 	greetOnce    sync.Once
 
@@ -232,7 +235,7 @@ func (r *LiveKitRoom) OutputSampleRate() int {
 }
 
 func (r *LiveKitRoom) SendAppMessage(v interface{}) error {
-	if r == nil || r.room == nil || r.closed.Load() {
+	if r == nil || r.room == nil || r.closed.Load() || r.disconnected.Load() {
 		return nil
 	}
 	var raw []byte
@@ -470,6 +473,7 @@ func (r *LiveKitRoom) handleDisconnected(reason lksdk.DisconnectionReason) {
 		return
 	}
 	r.reconnecting.Store(false)
+	r.disconnected.Store(true)
 	err := fmt.Errorf("LiveKit room disconnected: %s", reason)
 	r.log("[%s] %v; requesting EndFrame", r.roomName, err)
 	if r.taskCtx != nil && r.taskCtx.UIEvents != nil {
@@ -478,6 +482,13 @@ func (r *LiveKitRoom) handleDisconnected(reason lksdk.DisconnectionReason) {
 			"transport_type": "livekit",
 			"reason":         string(reason),
 		}, time.Now())
+	}
+	// LiveKit closes the room once every Standard participant has left; the
+	// bot's agent identity does not keep it open. This is a normal user exit
+	// (often a hang-up before the bot saw the user join), not a transport fault.
+	if reason == lksdk.RoomClosed {
+		r.endTask(EndReasonClientDisconnect)
+		return
 	}
 	sentryutil.Capture(sentryutil.Event{
 		Hub:  r.taskCtx.SentryHub(),

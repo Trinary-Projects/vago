@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	sentry "github.com/getsentry/sentry-go"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/pion/webrtc/v4"
 	"gopkg.in/hraban/opus.v2"
@@ -29,9 +30,24 @@ func newLiveKitLifecycleTestRoom(endReasons chan EndReason) *LiveKitRoom {
 	}
 }
 
+func newLiveKitSentryTestHub(t *testing.T) (*captureSentryTransport, *sentry.Hub) {
+	t.Helper()
+	transport := &captureSentryTransport{}
+	client, err := sentry.NewClient(sentry.ClientOptions{
+		Dsn:       "https://public@example.com/1",
+		Transport: transport,
+	})
+	if err != nil {
+		t.Fatalf("sentry.NewClient: %v", err)
+	}
+	return transport, sentry.NewHub(client, sentry.NewScope())
+}
+
 func TestLiveKitUnexpectedTerminalDisconnectEndsTask(t *testing.T) {
 	endReasons := make(chan EndReason, 1)
 	room := newLiveKitLifecycleTestRoom(endReasons)
+	transport, hub := newLiveKitSentryTestHub(t)
+	room.taskCtx.sentryHub = hub
 
 	room.handleDisconnected(lksdk.Failed)
 
@@ -42,6 +58,40 @@ func TestLiveKitUnexpectedTerminalDisconnectEndsTask(t *testing.T) {
 		}
 	default:
 		t.Fatal("terminal disconnect did not request task end")
+	}
+	if got := len(transport.Events()); got != 1 {
+		t.Fatalf("captured %d Sentry events, want 1", got)
+	}
+	if !room.disconnected.Load() {
+		t.Fatal("terminal disconnect did not stop data publishing")
+	}
+}
+
+func TestLiveKitRoomClosedEndsTaskAsClientDisconnectWithoutSentry(t *testing.T) {
+	endReasons := make(chan EndReason, 1)
+	room := newLiveKitLifecycleTestRoom(endReasons)
+	transport, hub := newLiveKitSentryTestHub(t)
+	room.taskCtx.sentryHub = hub
+
+	room.handleDisconnected(lksdk.RoomClosed)
+
+	select {
+	case reason := <-endReasons:
+		if reason != EndReasonClientDisconnect {
+			t.Fatalf("end reason = %q, want %q", reason, EndReasonClientDisconnect)
+		}
+	default:
+		t.Fatal("room closed did not request task end")
+	}
+	if got := len(transport.Events()); got != 0 {
+		t.Fatalf("captured %d Sentry events, want 0", got)
+	}
+	if !room.disconnected.Load() {
+		t.Fatal("room closed did not stop data publishing")
+	}
+	entries := room.taskCtx.UIEvents.Snapshot()
+	if len(entries) != 1 || entries[0].Type != "server-message" {
+		t.Fatalf("debug-log entries = %+v, want one transport_disconnected server-message", entries)
 	}
 }
 
