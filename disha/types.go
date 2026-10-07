@@ -37,6 +37,7 @@ type UserProfileData struct {
 	CartesiaCallSTTVariantFlag        *string        `json:"cartesia_call_stt_variant_flag"`
 	PatientExecutiveProfile           *string        `json:"patient_executive_profile"`
 	OnboardingCallVariant             *string        `json:"onboarding_call_variant"`
+	OnboardingCarePlan                *string        `json:"onboarding_care_plan"`
 	EDPeRXVariant                     *string        `json:"ed_pe_rx_variant"`
 	PatientFirstName                  *string        `json:"patient_first_name"`
 	ActiveChatContext                 *string        `json:"active_chat_context"`
